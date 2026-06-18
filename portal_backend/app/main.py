@@ -122,18 +122,33 @@ app.include_router(cultfit.router,     prefix="/api/v1", tags=["CultFit"])
 if _AI_ENABLED:
     app.include_router(_ai_route.router, prefix="/api/v1", tags=["AI Engineer"])
 
-# ─── Health Check ─────────────────────────────────────────────────────────────
+# ─── Startup ──────────────────────────────────────────────────────────────────
 @app.on_event("startup")
 async def startup():
-    init_db()
+    try:
+        init_db()
+    except Exception as e:
+        # Log but don't crash — app still starts, DB issue visible in /ping
+        logger.error("init_db failed on startup: %s", e)
 
 
 @app.get("/ping", tags=["Health"])
 async def ping():
     """Quick health check — returns ok if the server is running."""
+    db_ok = True
+    db_error = None
+    try:
+        from app.db.portal_db import list_users
+        list_users()
+    except Exception as e:
+        db_ok = False
+        db_error = str(e)
+
     return {
         "status": "ok",
         "service": "InBody Portal Backend",
         "version": "1.0.0",
         "odoo_url": settings.ODOO_BASE_URL,
+        "db_ok": db_ok,
+        "db_error": db_error,
     }
