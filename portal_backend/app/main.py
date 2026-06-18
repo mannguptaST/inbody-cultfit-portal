@@ -20,7 +20,9 @@ Every request then flows:
 """
 
 import logging
+import os
 import time
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -49,9 +51,21 @@ logging.basicConfig(
 )
 logger = logging.getLogger("portal_backend")
 
-# ─── App Instance ─────────────────────────────────────────────────────────────
+# ─── Settings & Lifespan ──────────────────────────────────────────────────────
 settings = get_settings()
 
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    # Startup: only init SQLite locally — Supabase table already exists on Vercel
+    if not os.getenv("DATABASE_URL", "").strip():
+        try:
+            init_db()
+        except Exception as e:
+            logging.getLogger("portal_backend").error("init_db failed: %s", e)
+    yield
+    # Shutdown: nothing to clean up
+
+# ─── App Instance ─────────────────────────────────────────────────────────────
 app = FastAPI(
     title="InBody Customer Portal API",
     description=(
@@ -60,7 +74,7 @@ app = FastAPI(
         "isolation, FOFO price masking, and audit logging."
     ),
     version="1.0.0",
-    # Swagger/ReDoc disabled in production (DEBUG=false) to avoid exposing API schema.
+    lifespan=lifespan,
     docs_url="/docs" if settings.DEBUG else None,
     redoc_url="/redoc" if settings.DEBUG else None,
 )
@@ -121,19 +135,6 @@ app.include_router(admin.router,       prefix="/api/v1", tags=["Admin"])
 app.include_router(cultfit.router,     prefix="/api/v1", tags=["CultFit"])
 if _AI_ENABLED:
     app.include_router(_ai_route.router, prefix="/api/v1", tags=["AI Engineer"])
-
-# ─── Startup ──────────────────────────────────────────────────────────────────
-# Startup is skipped entirely on Vercel (DATABASE_URL set = Supabase table exists).
-# Only runs locally for SQLite auto-create.
-import os as _os
-if not _os.getenv("DATABASE_URL", "").strip():
-    @app.on_event("startup")
-    async def startup():
-        try:
-            init_db()
-        except Exception as e:
-            logger.error("init_db failed: %s", e)
-
 
 @app.get("/ping", tags=["Health"])
 async def ping():
