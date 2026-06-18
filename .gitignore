@@ -1,0 +1,37 @@
+# ── Large directories — NOT for GitHub ───────────────────────────────────────
+Odoo/
+Antigravity/
+ChatGPT_Training_Prompt.md
+
+# ── Secret files — NEVER commit these ────────────────────────────────────────
+.env
+.env.local
+portal_backend/.env
+portal_frontend/.env.local
+
+# ── Local databases ───────────────────────────────────────────────────────────
+portal_backend/portal_users.db
+
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyc
+*.pyo
+.venv/
+venv/
+env/
+chroma_data/
+portal_backend/chroma_data/
+
+# ── Node / Next.js ────────────────────────────────────────────────────────────
+portal_frontend/node_modules/
+portal_frontend/.next/
+portal_frontend/next_err.log
+portal_frontend/next_out.log
+
+# ── OS / IDE ──────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+.vscode/
+.idea/

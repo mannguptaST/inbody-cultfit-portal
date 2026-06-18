@@ -1,0 +1,11 @@
+# Full dev requirements — includes AI Engineer features.
+# Used for local development only (too large for Vercel).
+#
+# Install:  pip install -r requirements-dev.txt
+# This includes everything in requirements.txt plus the AI packages.
+
+-r requirements.txt
+
+# AI Engineer (large packages — do NOT include in Vercel deployment)
+anthropic>=0.40.0
+chromadb>=0.6.0
