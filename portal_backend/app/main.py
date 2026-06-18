@@ -123,13 +123,20 @@ if _AI_ENABLED:
     app.include_router(_ai_route.router, prefix="/api/v1", tags=["AI Engineer"])
 
 # ─── Startup ──────────────────────────────────────────────────────────────────
+# NOTE: On Vercel, each function invocation is stateless — init_db() is skipped
+# at startup since the Supabase table already exists (created via SQL editor).
+# init_db() still runs locally (SQLite) where DATABASE_URL is not set.
 @app.on_event("startup")
 async def startup():
-    try:
-        init_db()
-    except Exception as e:
-        # Log but don't crash — app still starts, DB issue visible in /ping
-        logger.error("init_db failed on startup: %s", e)
+    import os
+    if not os.getenv("DATABASE_URL", "").strip():
+        # Local dev only — create SQLite table if missing
+        try:
+            init_db()
+        except Exception as e:
+            logger.error("init_db failed: %s", e)
+    else:
+        logger.info("Skipping init_db on startup — using existing Supabase table")
 
 
 @app.get("/ping", tags=["Health"])
