@@ -9,15 +9,14 @@ import type { CultFitOrder } from '@/types';
 // ── Color maps ────────────────────────────────────────────────────────────────
 
 const STAGE_COLORS: Record<string, string> = {
-  stage_1_order_received:           'bg-gray-100 text-gray-600',
-  stage_2_pi_issued:                'bg-blue-100 text-blue-700',
-  stage_3_po_received:              'bg-indigo-100 text-indigo-700',
-  stage_4_md_approved:              'bg-purple-100 text-purple-700',
-  stage_5_dispatched:               'bg-yellow-100 text-yellow-700',
-  stage_6_installation_confirmed:   'bg-orange-100 text-orange-700',
-  stage_7_vendor_uploaded:          'bg-teal-100 text-teal-700',
-  stage_8_confirmation_sent:        'bg-cyan-100 text-cyan-700',
-  stage_9_payment_collected:        'bg-green-100 text-green-700',
+  new:                'bg-gray-100 text-gray-600',
+  po_received:        'bg-indigo-100 text-indigo-700',
+  pi_shared:          'bg-blue-100 text-blue-700',
+  dispatch_requested: 'bg-amber-100 text-amber-700',
+  dispatched:         'bg-yellow-100 text-yellow-700',
+  delivered:          'bg-orange-100 text-orange-700',
+  server_updated:     'bg-teal-100 text-teal-700',
+  deal_closed:        'bg-green-100 text-green-700',
 };
 
 const DELIVERY_COLORS: Record<string, string> = {
