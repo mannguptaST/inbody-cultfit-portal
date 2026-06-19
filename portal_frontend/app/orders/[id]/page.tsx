@@ -206,6 +206,10 @@ export default function OrderDetailPage() {
 
   async function handleSaveDealStatus() {
     if (!order) return;
+    if (!dealReason.trim()) {
+      setSaveMsg({ ok: false, text: 'Reason / Note is required before saving.' });
+      return;
+    }
     setSaving(true);
     setSaveMsg(null);
     try {
@@ -493,14 +497,20 @@ export default function OrderDetailPage() {
 
                   <div className="pt-1">
                     <label className="text-xs font-medium text-gray-500 uppercase tracking-wide block mb-1">
-                      Reason / Note <span className="normal-case text-gray-400">(logged in Odoo)</span>
+                      Reason / Note{' '}
+                      <span className="text-red-500">*</span>
+                      <span className="normal-case text-gray-400 ml-1">(required · logged in Odoo)</span>
                     </label>
                     <textarea
                       rows={3}
                       value={dealReason}
                       onChange={e => setDealReason(e.target.value)}
                       placeholder="e.g. Payment received via NEFT on 16 Jun 2026"
-                      className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+                      className={`w-full text-sm border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 resize-none ${
+                        !dealReason.trim()
+                          ? 'border-red-300 focus:ring-red-400'
+                          : 'border-gray-300 focus:ring-blue-500'
+                      }`}
                     />
                   </div>
 
