@@ -186,7 +186,7 @@ export default function OrderDetailPage() {
     try {
       const token = getToken();
       const resp = await fetch(
-        `${API_BASE}/api/v1/portal/cultfit/orders/${orderId}/attachments/${attachmentId}`,
+        `${API_BASE}/portal/cultfit/orders/${orderId}/attachments/${attachmentId}`,
         { headers: { Authorization: `Bearer ${token}` } },
       );
       if (!resp.ok) throw new Error('Download failed');
