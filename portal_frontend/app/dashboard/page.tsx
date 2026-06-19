@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import Image from 'next/image';
 import { useRouter } from 'next/navigation';
 import { getCultFitOrders } from '@/lib/api';
 import { isLoggedIn, getUser, clearSession } from '@/lib/auth';
@@ -120,10 +121,9 @@ export default function DashboardPage() {
       <nav className="bg-blue-700 text-white px-6 py-4 shadow-md">
         <div className="max-w-full mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-white/20 rounded-lg flex items-center justify-center">
-              <span className="text-sm font-bold">iB</span>
+            <div className="bg-white rounded-lg px-2 py-1">
+              <Image src="/inbody-logo.webp" alt="InBody" width={80} height={24} className="object-contain" />
             </div>
-            <span className="font-bold text-lg">InBody Portal</span>
           </div>
           <div className="flex items-center gap-4">
             <span className="text-sm text-blue-200 hidden sm:block">

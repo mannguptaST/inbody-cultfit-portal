@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState } from 'react';
+import Image from 'next/image';
 import { useRouter, useParams } from 'next/navigation';
 import { getCultFitOrderDetail, getDocuments, getOdooAttachments, updateDealStatus, type DealStatusUpdate, type OdooAttachment } from '@/lib/api';
 import { isLoggedIn, getToken, isInBodyStaff } from '@/lib/auth';
@@ -273,12 +274,16 @@ export default function OrderDetailPage() {
 
       {/* Nav */}
       <nav className="bg-blue-700 text-white px-6 py-4 shadow-md">
-        <div className="max-w-5xl mx-auto flex items-center gap-3">
+        <div className="max-w-5xl mx-auto flex items-center gap-4">
+          <div className="bg-white rounded-lg px-2 py-1 flex-shrink-0">
+            <Image src="/inbody-logo.webp" alt="InBody" width={80} height={24} className="object-contain" />
+          </div>
+          <span className="text-blue-400">/</span>
           <button
             onClick={() => router.push(backHref)}
             className="text-blue-200 hover:text-white text-sm transition"
           >
-            ← {isStaff ? 'Admin' : 'My Orders'}
+            {isStaff ? 'Admin' : 'My Orders'}
           </button>
           <span className="text-blue-400">/</span>
           <span className="font-semibold font-mono">{order.order_no}</span>

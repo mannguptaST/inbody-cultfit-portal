@@ -1,6 +1,7 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
+import Image from 'next/image';
 import { useRouter } from 'next/navigation';
 import { getCultFitOrders } from '@/lib/api';
 import { isLoggedIn, getUser, clearSession, isInBodyStaff } from '@/lib/auth';
@@ -137,15 +138,12 @@ export default function AdminPage() {
       <nav className="bg-gray-900 text-white px-6 py-4 shadow-md">
         <div className="max-w-full mx-auto flex items-center justify-between">
           <div className="flex items-center gap-3">
-            <div className="w-8 h-8 bg-white/20 rounded-lg flex items-center justify-center">
-              <span className="text-sm font-bold">iB</span>
+            <div className="bg-white rounded-lg px-2 py-1">
+              <Image src="/inbody-logo.webp" alt="InBody" width={80} height={24} className="object-contain" />
             </div>
-            <div>
-              <span className="font-bold text-lg">InBody Admin</span>
-              <span className="ml-2 text-xs bg-amber-500 text-white px-2 py-0.5 rounded-full font-semibold">
-                STAFF
-              </span>
-            </div>
+            <span className="text-xs bg-amber-500 text-white px-2 py-0.5 rounded-full font-semibold">
+              STAFF
+            </span>
           </div>
           <div className="flex items-center gap-4">
             <span className="text-sm text-gray-400 hidden sm:block">{user?.name}</span>

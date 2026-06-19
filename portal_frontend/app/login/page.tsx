@@ -1,6 +1,7 @@
 'use client';
 
 import { useState, useEffect } from 'react';
+import Image from 'next/image';
 import { useRouter } from 'next/navigation';
 import { portalLogin } from '@/lib/api';
 import { saveSession, isLoggedIn, getUserRole } from '@/lib/auth';
@@ -42,10 +43,17 @@ export default function LoginPage() {
 
         {/* Logo / Brand */}
         <div className="text-center mb-8">
-          <div className="inline-flex items-center justify-center w-16 h-16 bg-blue-700 rounded-2xl mb-4 shadow-lg">
-            <span className="text-white text-2xl font-bold">iB</span>
+          <div className="flex justify-center mb-4">
+            <Image
+              src="/inbody-logo.webp"
+              alt="InBody"
+              width={160}
+              height={48}
+              className="object-contain"
+              priority
+            />
           </div>
-          <h1 className="text-2xl font-bold text-gray-900">InBody Customer Portal</h1>
+          <h1 className="text-2xl font-bold text-gray-900">Customer Portal</h1>
           <p className="text-gray-500 text-sm mt-1">Sign in to track your orders</p>
         </div>
 
