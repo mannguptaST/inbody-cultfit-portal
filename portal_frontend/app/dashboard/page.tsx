@@ -210,7 +210,7 @@ export default function DashboardPage() {
         {!loading && !error && filtered.length > 0 && (
           <div className="bg-white rounded-xl border border-gray-200 overflow-hidden shadow-sm">
             <div className="overflow-x-auto">
-              <table className="w-full text-sm" style={{ minWidth: '920px' }}>
+              <table className="w-full text-sm" style={{ minWidth: '1100px' }}>
                 <thead>
                   <tr className="bg-gray-50 border-b border-gray-200 text-left">
                     <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Order No</th>
@@ -262,8 +262,10 @@ export default function DashboardPage() {
                       </td>
 
                       {/* Portal Stage */}
-                      <td className="px-4 py-3">
-                        <Badge label={order.portal_stage_label} colorMap={STAGE_COLORS} />
+                      <td className="px-4 py-3 whitespace-nowrap">
+                        <span className={`inline-block text-xs px-2.5 py-1 rounded-full font-semibold whitespace-nowrap ${STAGE_COLORS[order.portal_stage] ?? 'bg-gray-100 text-gray-600'}`}>
+                          {order.portal_stage_label}
+                        </span>
                       </td>
 
                       {/* Delivery */}
