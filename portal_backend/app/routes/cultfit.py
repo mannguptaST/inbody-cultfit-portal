@@ -13,12 +13,15 @@ import logging
 from typing import Optional
 
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 from pydantic import BaseModel
 
 from app.auth.token_extractor import TokenData, get_token_data
 from app.services.odoo_xmlrpc import (
+    fetch_attachment_data,
     fetch_cultfit_order_by_id,
     fetch_cultfit_orders,
+    fetch_order_attachments,
     update_cultfit_deal_fields,
     update_cultfit_stage,
 )
@@ -200,3 +203,48 @@ async def admin_update_cultfit_deal_status(
 
     logger.info("Deal fields %s updated for order %d by %s", list(updates), order_id, changed_by)
     return result
+
+
+# ── Document download endpoints ───────────────────────────────────────────────
+
+@router.get(
+    "/portal/cultfit/orders/{lead_id}/attachments",
+    summary="List Odoo PDF attachments for a CultFit order",
+    tags=["CultFit"],
+)
+async def list_cultfit_attachments(
+    lead_id: int,
+    token_data: TokenData = Depends(get_token_data),
+):
+    try:
+        docs = await fetch_order_attachments(lead_id)
+        return {"attachments": docs, "count": len(docs)}
+    except Exception as e:
+        logger.error("list_cultfit_attachments(%d) failed: %s", lead_id, e)
+        raise HTTPException(status_code=503, detail=f"Could not fetch attachments: {e}")
+
+
+@router.get(
+    "/portal/cultfit/orders/{lead_id}/attachments/{attachment_id}",
+    summary="Download a PDF attachment from Odoo",
+    tags=["CultFit"],
+)
+async def download_cultfit_attachment(
+    lead_id: int,
+    attachment_id: int,
+    token_data: TokenData = Depends(get_token_data),
+):
+    try:
+        data, mimetype, filename = await fetch_attachment_data(attachment_id)
+    except ValueError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except Exception as e:
+        logger.error("download_cultfit_attachment(%d/%d) failed: %s", lead_id, attachment_id, e)
+        raise HTTPException(status_code=503, detail=f"Could not download attachment: {e}")
+
+    safe_name = filename.replace('"', '')
+    return Response(
+        content=data,
+        media_type=mimetype,
+        headers={"Content-Disposition": f'attachment; filename="{safe_name}"'},
+    )

@@ -2,7 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter, useParams } from 'next/navigation';
-import { getCultFitOrderDetail, getDocuments, updateDealStatus, type DealStatusUpdate } from '@/lib/api';
+import { getCultFitOrderDetail, getDocuments, getOdooAttachments, updateDealStatus, type DealStatusUpdate, type OdooAttachment } from '@/lib/api';
 import { isLoggedIn, getToken, isInBodyStaff } from '@/lib/auth';
 import OrderTimeline from '@/components/OrderTimeline';
 import PaymentCountdown from '@/components/PaymentCountdown';
@@ -114,6 +114,7 @@ export default function OrderDetailPage() {
 
   const [order, setOrder]     = useState<CultFitOrder | null>(null);
   const [docs, setDocs]       = useState<DocumentsResponse | null>(null);
+  const [odooDocs, setOdooDocs] = useState<OdooAttachment[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState('');
   const [downloading, setDownloading] = useState<number | null>(null);
@@ -133,10 +134,12 @@ export default function OrderDetailPage() {
     Promise.all([
       getCultFitOrderDetail(orderId),
       getDocuments(orderId).catch(() => null),
+      getOdooAttachments(orderId).catch(() => ({ attachments: [], count: 0 })),
     ])
-      .then(([o, d]) => {
+      .then(([o, d, odoo]) => {
         setOrder(o);
         setDocs(d);
+        setOdooDocs(odoo?.attachments ?? []);
         // Map human-readable labels back to Odoo raw keys for the form
         const instMap: Record<string, string> = {
           'Not Started': 'not_started', 'In Progress': 'in_progress', 'Confirmed': 'confirmed',
@@ -163,6 +166,29 @@ export default function OrderDetailPage() {
       const resp = await fetch(`${API_BASE}/api/v1/portal/documents/${docId}`, {
         headers: { Authorization: `Bearer ${token}` },
       });
+      if (!resp.ok) throw new Error('Download failed');
+      const blob = await resp.blob();
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = filename;
+      a.click();
+      URL.revokeObjectURL(url);
+    } catch {
+      alert('Download failed. Please try again.');
+    } finally {
+      setDownloading(null);
+    }
+  }
+
+  async function handleOdooDownload(attachmentId: number, filename: string) {
+    setDownloading(attachmentId);
+    try {
+      const token = getToken();
+      const resp = await fetch(
+        `${API_BASE}/api/v1/portal/cultfit/orders/${orderId}/attachments/${attachmentId}`,
+        { headers: { Authorization: `Bearer ${token}` } },
+      );
       if (!resp.ok) throw new Error('Download failed');
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
@@ -512,55 +538,96 @@ export default function OrderDetailPage() {
 
         {/* Documents */}
         <div className="mt-6 bg-white rounded-2xl border border-gray-200 p-6 shadow-sm">
-          <div className="flex items-center justify-between mb-4">
-            <h2 className="font-bold text-gray-900">Documents</h2>
-            {docs && docs.count > 0 && (
-              <span className="text-xs bg-gray-100 text-gray-600 px-2.5 py-1 rounded-full font-medium">
-                {docs.count} file{docs.count !== 1 ? 's' : ''}
-              </span>
-            )}
-          </div>
+          <h2 className="font-bold text-gray-900 mb-4">Documents</h2>
 
-          {!docs || docs.count === 0 ? (
+          {/* Odoo-sourced documents (quotation, invoice) */}
+          {odooDocs.length > 0 && (
+            <div className="mb-5">
+              <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">
+                From Odoo
+              </p>
+              <div className="divide-y divide-gray-100 border border-gray-100 rounded-xl overflow-hidden">
+                {odooDocs.map(doc => (
+                  <div key={doc.id} className="flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-blue-50 transition-colors">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <span className="text-xl flex-shrink-0">📄</span>
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-gray-800 truncate">{doc.label}</p>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          {doc.type === 'quotation' ? 'Quotation PDF' : 'Tax Invoice PDF'}
+                          {doc.size ? ` · ${formatBytes(doc.size)}` : ''}
+                          {doc.date ? ` · ${new Date(doc.date).toLocaleDateString('en-IN')}` : ''}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => handleOdooDownload(doc.id, doc.name)}
+                      disabled={downloading === doc.id}
+                      className="ml-4 flex-shrink-0 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition flex items-center gap-1.5"
+                    >
+                      {downloading === doc.id ? (
+                        <>
+                          <span className="animate-spin w-3 h-3 border-2 border-white border-t-transparent rounded-full inline-block" />
+                          Downloading...
+                        </>
+                      ) : (
+                        <>⬇ Download</>
+                      )}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
+
+          {/* Manually uploaded documents */}
+          {docs && docs.count > 0 ? (
+            <div>
+              {odooDocs.length > 0 && (
+                <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">
+                  Uploaded by InBody
+                </p>
+              )}
+              <div className="divide-y divide-gray-100">
+                {docs.documents.map(doc => (
+                  <div key={doc.id} className="flex items-center justify-between py-3 first:pt-0 last:pb-0">
+                    <div className="flex items-center gap-3 min-w-0">
+                      <span className="text-xl flex-shrink-0">{fileIcon(doc.mimetype)}</span>
+                      <div className="min-w-0">
+                        <p className="text-sm font-medium text-gray-800 truncate">{doc.name}</p>
+                        <p className="text-xs text-gray-400 mt-0.5">
+                          {formatBytes(doc.size)}
+                          {doc.date && ` · ${new Date(doc.date).toLocaleDateString('en-IN')}`}
+                        </p>
+                      </div>
+                    </div>
+                    <button
+                      onClick={() => handleDownload(doc.id, doc.name)}
+                      disabled={downloading === doc.id}
+                      className="ml-4 flex-shrink-0 text-sm text-blue-600 hover:text-blue-800 font-medium disabled:text-gray-400 flex items-center gap-1.5 transition"
+                    >
+                      {downloading === doc.id ? (
+                        <>
+                          <span className="animate-spin w-3.5 h-3.5 border-2 border-blue-400 border-t-transparent rounded-full inline-block" />
+                          Downloading...
+                        </>
+                      ) : (
+                        <>⬇ Download</>
+                      )}
+                    </button>
+                  </div>
+                ))}
+              </div>
+            </div>
+          ) : odooDocs.length === 0 ? (
             <div className="text-center py-8 text-gray-400">
               <p className="text-3xl mb-2">📂</p>
-              <p className="text-sm">No documents uploaded yet.</p>
+              <p className="text-sm">No documents available yet.</p>
               <p className="text-xs mt-1 text-gray-300">
                 Documents will appear here once InBody uploads them.
               </p>
             </div>
-          ) : (
-            <div className="divide-y divide-gray-100">
-              {docs.documents.map(doc => (
-                <div key={doc.id} className="flex items-center justify-between py-3 first:pt-0 last:pb-0">
-                  <div className="flex items-center gap-3 min-w-0">
-                    <span className="text-xl flex-shrink-0">{fileIcon(doc.mimetype)}</span>
-                    <div className="min-w-0">
-                      <p className="text-sm font-medium text-gray-800 truncate">{doc.name}</p>
-                      <p className="text-xs text-gray-400 mt-0.5">
-                        {formatBytes(doc.size)}
-                        {doc.date && ` · ${new Date(doc.date).toLocaleDateString('en-IN')}`}
-                      </p>
-                    </div>
-                  </div>
-                  <button
-                    onClick={() => handleDownload(doc.id, doc.name)}
-                    disabled={downloading === doc.id}
-                    className="ml-4 flex-shrink-0 text-sm text-blue-600 hover:text-blue-800 font-medium disabled:text-gray-400 flex items-center gap-1.5 transition"
-                  >
-                    {downloading === doc.id ? (
-                      <>
-                        <span className="animate-spin w-3.5 h-3.5 border-2 border-blue-400 border-t-transparent rounded-full inline-block" />
-                        Downloading...
-                      </>
-                    ) : (
-                      <>⬇ Download</>
-                    )}
-                  </button>
-                </div>
-              ))}
-            </div>
-          )}
+          ) : null}
         </div>
 
       </div>

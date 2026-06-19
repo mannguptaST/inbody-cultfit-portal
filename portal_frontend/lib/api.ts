@@ -136,6 +136,24 @@ export async function updateDealStatus(
   });
 }
 
+// ── CultFit Odoo Attachments ──────────────────────────────────────────────────
+
+export interface OdooAttachment {
+  id: number;
+  name: string;
+  type: 'quotation' | 'invoice';
+  label: string;
+  size: number;
+  date: string | null;
+  mimetype: string;
+}
+
+export async function getOdooAttachments(
+  orderId: number,
+): Promise<{ attachments: OdooAttachment[]; count: number }> {
+  return apiFetch(`/portal/cultfit/orders/${orderId}/attachments`);
+}
+
 // ── Admin ─────────────────────────────────────────────────────────────────────
 
 export async function updateStage(

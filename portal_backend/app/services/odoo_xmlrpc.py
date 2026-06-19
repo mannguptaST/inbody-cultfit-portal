@@ -301,3 +301,100 @@ async def update_cultfit_deal_fields(
 ) -> dict:
     """Stub — deal field write-back not yet mapped for live Odoo."""
     return {'order_id': order_id, 'updated': []}
+
+
+# ── Odoo attachment download ───────────────────────────────────────────────────
+
+def _sync_fetch_order_attachments(lead_id: int) -> list[dict]:
+    """Return PDF attachments for the sale orders and invoices linked to a CRM lead."""
+    import base64 as _b64
+    uid, models = _connect()
+
+    leads = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS, 'crm.lead', 'read',
+        [[lead_id]], {'fields': ['order_ids', 'name']},
+    )
+    if not leads:
+        return []
+
+    so_ids = leads[0].get('order_ids') or []
+    if not so_ids:
+        return []
+
+    sos = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS, 'sale.order', 'read',
+        [so_ids], {'fields': ['id', 'name', 'invoice_ids']},
+    )
+
+    result = []
+
+    so_atts = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS, 'ir.attachment', 'search_read',
+        [[['res_model', '=', 'sale.order'], ['res_id', 'in', so_ids],
+          ['mimetype', '=', 'application/pdf']]],
+        {'fields': ['id', 'name', 'file_size', 'create_date', 'res_id']},
+    )
+    for a in so_atts:
+        so_name = next((s['name'] for s in sos if s['id'] == a['res_id']), '')
+        result.append({
+            'id':       a['id'],
+            'name':     a['name'],
+            'type':     'quotation',
+            'label':    f"Quotation – {so_name}",
+            'size':     a.get('file_size', 0),
+            'date':     str(a['create_date'])[:10] if a.get('create_date') else None,
+            'mimetype': 'application/pdf',
+        })
+
+    all_inv_ids = []
+    for s in sos:
+        all_inv_ids.extend(s.get('invoice_ids') or [])
+
+    if all_inv_ids:
+        invoices = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASS, 'account.move', 'read',
+            [all_inv_ids], {'fields': ['id', 'name']},
+        )
+        inv_atts = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASS, 'ir.attachment', 'search_read',
+            [[['res_model', '=', 'account.move'], ['res_id', 'in', all_inv_ids],
+              ['mimetype', '=', 'application/pdf']]],
+            {'fields': ['id', 'name', 'file_size', 'create_date', 'res_id']},
+        )
+        for a in inv_atts:
+            inv = next((i for i in invoices if i['id'] == a['res_id']), None)
+            inv_name = inv['name'] if inv else ''
+            result.append({
+                'id':       a['id'],
+                'name':     a['name'],
+                'type':     'invoice',
+                'label':    f"Invoice – {inv_name}",
+                'size':     a.get('file_size', 0),
+                'date':     str(a['create_date'])[:10] if a.get('create_date') else None,
+                'mimetype': 'application/pdf',
+            })
+
+    return result
+
+
+async def fetch_order_attachments(lead_id: int) -> list[dict]:
+    return await asyncio.to_thread(_sync_fetch_order_attachments, lead_id)
+
+
+def _sync_fetch_attachment_data(attachment_id: int) -> tuple:
+    """Returns (bytes, mimetype, filename) for an ir.attachment."""
+    import base64 as _b64
+    uid, models = _connect()
+    records = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS, 'ir.attachment', 'read',
+        [[attachment_id]], {'fields': ['name', 'mimetype', 'datas']},
+    )
+    if not records or not records[0].get('datas'):
+        raise ValueError(f"Attachment {attachment_id} not found or has no data")
+    rec = records[0]
+    data = _b64.b64decode(rec['datas'])
+    return data, rec['mimetype'], rec['name']
+
+
+async def fetch_attachment_data(attachment_id: int) -> tuple:
+    return await asyncio.to_thread(_sync_fetch_attachment_data, attachment_id)
