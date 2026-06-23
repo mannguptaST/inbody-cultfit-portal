@@ -3,7 +3,7 @@
 import { useEffect, useState } from 'react';
 import Image from 'next/image';
 import { useRouter, useParams } from 'next/navigation';
-import { getCultFitOrderDetail, getDocuments, getOdooAttachments, updateDealStatus, type DealStatusUpdate, type OdooAttachment } from '@/lib/api';
+import { getCultFitOrderDetail, getDocuments, getOdooAttachments, updateDealStatus, setCultFitPortalStage, type DealStatusUpdate, type OdooAttachment } from '@/lib/api';
 import { isLoggedIn, getToken, isInBodyStaff } from '@/lib/auth';
 import OrderTimeline from '@/components/OrderTimeline';
 import PaymentCountdown from '@/components/PaymentCountdown';
@@ -141,6 +141,12 @@ export default function OrderDetailPage() {
   const [saving, setSaving]     = useState(false);
   const [saveMsg, setSaveMsg]   = useState<{ ok: boolean; text: string } | null>(null);
 
+  // Portal stage update (staff only)
+  const [stageKey, setStageKey]       = useState('');
+  const [stageReason, setStageReason] = useState('');
+  const [stageSaving, setStageSaving] = useState(false);
+  const [stageSaveMsg, setStageSaveMsg] = useState<{ ok: boolean; text: string } | null>(null);
+
   useEffect(() => {
     if (!isLoggedIn()) { router.replace('/login'); return; }
     setIsStaff(isInBodyStaff());
@@ -169,6 +175,7 @@ export default function OrderDetailPage() {
           confirmation_mail_sent: o.confirmation_mail_sent,
           md_approval_status:     o.md_approval_status,
         });
+        setStageKey(o.portal_stage || 'new');
       })
       .catch(err => setError(err.message ?? 'Failed to load order.'))
       .finally(() => setLoading(false));
@@ -252,6 +259,29 @@ export default function OrderDetailPage() {
       setSaveMsg({ ok: false, text: msg });
     } finally {
       setSaving(false);
+    }
+  }
+
+  async function handleSavePortalStage() {
+    if (!order) return;
+    if (!stageReason.trim()) {
+      setStageSaveMsg({ ok: false, text: 'Reason / Note is required before updating stage.' });
+      return;
+    }
+    setStageSaving(true);
+    setStageSaveMsg(null);
+    try {
+      await setCultFitPortalStage(order.id, stageKey, stageReason);
+      const updated = await getCultFitOrderDetail(order.id);
+      setOrder(updated);
+      setStageKey(updated.portal_stage || 'new');
+      setStageReason('');
+      setStageSaveMsg({ ok: true, text: `Stage updated to "${updated.portal_stage_label}".` });
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : 'Stage update failed.';
+      setStageSaveMsg({ ok: false, text: msg });
+    } finally {
+      setStageSaving(false);
     }
   }
 
@@ -435,6 +465,63 @@ export default function OrderDetailPage() {
                 ))}
               </div>
             </div>
+
+            {/* Portal Stage Update — staff only */}
+            {isStaff && (
+              <div className="bg-white rounded-2xl border border-gray-200 p-6 shadow-sm">
+                <h2 className="font-bold text-gray-900 mb-4">Update Portal Stage</h2>
+                <div className="space-y-3">
+                  <div>
+                    <label className="text-xs font-medium text-gray-500 uppercase tracking-wide block mb-1">
+                      Portal Stage
+                    </label>
+                    <select
+                      value={stageKey}
+                      onChange={e => setStageKey(e.target.value)}
+                      className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
+                    >
+                      <option value="new">New</option>
+                      <option value="pi_shared">PI Shared</option>
+                      <option value="po_received">PO Received</option>
+                      <option value="dispatch_requested">Dispatch Requested</option>
+                      <option value="dispatched">Dispatched</option>
+                      <option value="delivered">Delivered (Not Installed)</option>
+                      <option value="server_updated">Server Updated</option>
+                      <option value="deal_closed">Deal Closed</option>
+                    </select>
+                  </div>
+                  <div>
+                    <label className="text-xs font-medium text-gray-500 uppercase tracking-wide block mb-1">
+                      Reason / Note <span className="text-red-500">*</span>
+                      <span className="normal-case text-gray-400 ml-1">(required · logged in Odoo)</span>
+                    </label>
+                    <textarea
+                      rows={2}
+                      value={stageReason}
+                      onChange={e => setStageReason(e.target.value)}
+                      placeholder="e.g. Units dispatched via Blue Dart on 23 Jun 2026"
+                      className={`w-full text-sm border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 resize-none ${
+                        !stageReason.trim()
+                          ? 'border-red-300 focus:ring-red-400'
+                          : 'border-gray-300 focus:ring-indigo-500'
+                      }`}
+                    />
+                  </div>
+                  {stageSaveMsg && (
+                    <p className={`text-xs font-medium ${stageSaveMsg.ok ? 'text-green-600' : 'text-red-600'}`}>
+                      {stageSaveMsg.ok ? '✅' : '⚠️'} {stageSaveMsg.text}
+                    </p>
+                  )}
+                  <button
+                    onClick={handleSavePortalStage}
+                    disabled={stageSaving}
+                    className="w-full mt-1 bg-indigo-700 hover:bg-indigo-800 disabled:bg-indigo-400 text-white text-sm font-semibold py-2.5 rounded-xl transition-colors"
+                  >
+                    {stageSaving ? 'Updating...' : 'Update Stage'}
+                  </button>
+                </div>
+              </div>
+            )}
 
             {/* Deal Status Update — staff only */}
             {isStaff && (

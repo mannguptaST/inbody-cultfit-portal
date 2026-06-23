@@ -106,6 +106,17 @@ export async function getCultFitOrderDetail(orderId: number): Promise<CultFitOrd
   return apiFetch<CultFitOrder>(`/portal/cultfit/orders/${orderId}`);
 }
 
+export async function setCultFitPortalStage(
+  orderId: number,
+  stage: string,
+  reason = '',
+): Promise<{ order_id: number; new_stage: string; new_stage_label: string }> {
+  return apiFetch(`/admin/cultfit/orders/${orderId}/set_stage`, {
+    method: 'POST',
+    body: JSON.stringify({ stage, reason }),
+  });
+}
+
 export async function updateCultFitStage(
   orderId: number,
   action: 'next' | 'prev',
