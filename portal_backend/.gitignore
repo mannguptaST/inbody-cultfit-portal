@@ -1,6 +1,5 @@
 # Secrets and local data — never commit these
 .env
-portal_users.db
 chroma_data/
 
 # Python cache

@@ -1,0 +1,20 @@
+services:
+  - type: web
+    name: inbody-portal-api
+    runtime: python
+    rootDir: portal_backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    envVars:
+      - key: ODOO_BASE_URL
+        value: https://inbody-india.closyss.com
+      - key: ODOO_API_USER
+        value: sdaindia@inbody.com
+      - key: ODOO_DB
+        value: inbody-india
+      - key: ODOO_API_PASS
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: DEBUG
+        value: false
