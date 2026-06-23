@@ -98,6 +98,27 @@ def init_db() -> None:
             )
         """)
         conn.commit()
+
+        # Auto-seed default users when DB is empty and PORTAL_SEED_PASSWORD is set.
+        # On cloud deployments (Render/Railway) with ephemeral filesystems, the DB
+        # resets on every restart — this ensures users are always recreated.
+        seed_pass = os.getenv("PORTAL_SEED_PASSWORD", "").strip()
+        if seed_pass:
+            count = conn.execute("SELECT COUNT(*) FROM portal_users").fetchone()[0]
+            if count == 0:
+                defaults = [
+                    ("admin@inbody.com",     "InBody Admin", "admin",    0),
+                    ("guru@cultfittest.in",  "Guru",         "customer", 0),
+                    ("vijay@cultfittest.in", "Vijay",        "customer", 0),
+                ]
+                for email, name, role, partner_id in defaults:
+                    conn.execute(
+                        "INSERT OR IGNORE INTO portal_users (email, password_hash, name, role, partner_id) VALUES (?,?,?,?,?)",
+                        (email, hash_password(seed_pass), name, role, partner_id),
+                    )
+                conn.commit()
+                logger.info("portal_users: auto-seeded %d users from PORTAL_SEED_PASSWORD", len(defaults))
+
     logger.info("portal_users SQLite table ready")
 
 
