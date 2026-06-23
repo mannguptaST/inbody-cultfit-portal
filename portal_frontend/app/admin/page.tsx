@@ -121,7 +121,8 @@ export default function AdminPage() {
       o.order_no.toLowerCase().includes(q) ||
       (o.location ?? '').toLowerCase().includes(q) ||
       (o.customer ?? '').toLowerCase().includes(q) ||
-      o.model_names.some(m => m.toLowerCase().includes(q));
+      o.model_names.some(m => m.toLowerCase().includes(q)) ||
+      (o.portal_stage_label ?? '').toLowerCase().includes(q);
     const matchStage = !stageFilter || o.portal_stage === stageFilter;
     return matchSearch && matchStage;
   });

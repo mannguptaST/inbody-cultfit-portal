@@ -9,6 +9,19 @@ import type { CultFitOrder } from '@/types';
 
 // ── Color maps ────────────────────────────────────────────────────────────────
 
+const STAGE_LABELS: Record<string, string> = {
+  new:                'New',
+  po_received:        'PO Received',
+  pi_shared:          'PI Shared',
+  dispatch_requested: 'Dispatch Requested',
+  dispatched:         'Dispatched',
+  delivered:          'Delivered (Not Installed)',
+  server_updated:     'Server Updated',
+  deal_closed:        'Deal Closed',
+};
+
+const STAGE_KEYS = Object.keys(STAGE_LABELS);
+
 const STAGE_COLORS: Record<string, string> = {
   new:                'bg-gray-100 text-gray-600',
   po_received:        'bg-indigo-100 text-indigo-700',
@@ -66,8 +79,9 @@ export default function DashboardPage() {
   const [orders, setOrders]   = useState<CultFitOrder[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError]     = useState('');
-  const [search, setSearch]   = useState('');
-  const [user, setUser]       = useState<ReturnType<typeof getUser>>(null);
+  const [search, setSearch]         = useState('');
+  const [stageFilter, setStageFilter] = useState('');
+  const [user, setUser]             = useState<ReturnType<typeof getUser>>(null);
 
   // Auth guard + role redirect
   useEffect(() => {
@@ -101,13 +115,15 @@ export default function DashboardPage() {
 
   const filtered = orders.filter(o => {
     const q = search.toLowerCase();
-    return (
+    const matchSearch =
       !q ||
       o.order_no.toLowerCase().includes(q) ||
       (o.location ?? '').toLowerCase().includes(q) ||
       (o.customer ?? '').toLowerCase().includes(q) ||
-      o.model_names.some(m => m.toLowerCase().includes(q))
-    );
+      o.model_names.some(m => m.toLowerCase().includes(q)) ||
+      (o.portal_stage_label ?? '').toLowerCase().includes(q);
+    const matchStage = !stageFilter || o.portal_stage === stageFilter;
+    return matchSearch && matchStage;
   });
 
   const overdue   = orders.filter(o => o.payment_overdue).length;
@@ -164,15 +180,25 @@ export default function DashboardPage() {
           ))}
         </div>
 
-        {/* Search */}
-        <div className="mb-5">
+        {/* Search + Stage filter */}
+        <div className="flex flex-col sm:flex-row gap-3 mb-5">
           <input
             type="text"
-            placeholder="Search by order number, centre, or model name..."
+            placeholder="Search by order, centre, model, or stage..."
             value={search}
             onChange={e => setSearch(e.target.value)}
-            className="w-full max-w-lg px-4 py-2.5 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
+            className="flex-1 px-4 py-2.5 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
           />
+          <select
+            value={stageFilter}
+            onChange={e => setStageFilter(e.target.value)}
+            className="px-4 py-2.5 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white min-w-[200px]"
+          >
+            <option value="">All Stages</option>
+            {STAGE_KEYS.map(k => (
+              <option key={k} value={k}>{STAGE_LABELS[k]}</option>
+            ))}
+          </select>
         </div>
 
         {/* Loading */}
