@@ -25,10 +25,24 @@ const STAGE_DEFS: Array<{ key: string; label: string; icon: string }> = [
   { key: 'stage_9_payment_collected',      label: 'Payment Collected',        icon: 'check-circle' },
 ];
 
+// CultFit CRM deal-stage keys → timeline step (CRM uses a different stage system)
+const CULTFIT_STAGE_MAP: Record<string, number> = {
+  new:                1,
+  pi_shared:          2,
+  po_received:        3,
+  dispatch_requested: 4,
+  dispatched:         5,
+  delivered:          6,
+  server_updated:     7,
+  deal_closed:        9,
+};
+
 // Dates we can map to specific stages
 function buildTimeline(order: CultFitOrder): { stages: TimelineStage[]; currentStage: number } {
-  const currentIdx = STAGE_DEFS.findIndex(s => s.key === order.portal_stage);
-  const currentStage = currentIdx >= 0 ? currentIdx + 1 : 1;
+  const stageDefIdx = STAGE_DEFS.findIndex(s => s.key === order.portal_stage);
+  const currentStage = stageDefIdx >= 0
+    ? stageDefIdx + 1
+    : (CULTFIT_STAGE_MAP[order.portal_stage] ?? 1);
 
   const stageDates: Record<number, string | null> = {
     1: order.order_date,
