@@ -22,6 +22,7 @@ from app.services.odoo_xmlrpc import (
     fetch_cultfit_order_by_id,
     fetch_cultfit_orders,
     fetch_order_attachments,
+    set_cultfit_stage,
     update_cultfit_deal_fields,
     update_cultfit_stage,
 )
@@ -31,9 +32,7 @@ router = APIRouter()
 
 _STAFF_ROLES = frozenset({'admin', 'inbody_manager', 'inbody_user'})
 
-# Phase 10 gate — portal stage override is not yet enabled for production.
-# Set to True only after CRM-stage-update requirements are confirmed and tested.
-_STAGE_WRITEBACK_ENABLED = False
+_STAGE_WRITEBACK_ENABLED = True
 
 
 # ── Request models ────────────────────────────────────────────────────────────
@@ -44,6 +43,14 @@ class StageActionRequest(BaseModel):
 
     class Config:
         json_schema_extra = {"example": {"action": "next", "reason": "PO received from CultFit"}}
+
+
+class SetStageRequest(BaseModel):
+    stage: str
+    reason: str = ""
+
+    class Config:
+        json_schema_extra = {"example": {"stage": "dispatched", "reason": "Units shipped via Blue Dart"}}
 
 
 class DealStatusRequest(BaseModel):
@@ -154,6 +161,33 @@ async def admin_update_cultfit_stage(
         logger.error("admin_update_cultfit_stage(%d) failed: %s", order_id, e)
         raise HTTPException(status_code=503, detail=f"Could not update stage: {e}")
     logger.info("Stage %s for CultFit order %d by %s", body.action, order_id, changed_by)
+    return result
+
+
+@router.post(
+    "/admin/cultfit/orders/{order_id}/set_stage",
+    summary="Set CultFit portal stage directly",
+    description="Set the portal stage of a CultFit order to any valid stage key. **Staff only.**",
+    tags=["CultFit Admin"],
+)
+async def admin_set_cultfit_stage(
+    order_id: int,
+    body: SetStageRequest,
+    token_data: TokenData = Depends(get_token_data),
+):
+    if token_data.role not in _STAFF_ROLES:
+        raise HTTPException(status_code=403, detail="InBody staff only.")
+    changed_by = token_data.payload.get("name") or token_data.payload.get("email") or ""
+    try:
+        result = await set_cultfit_stage(
+            order_id, body.stage, changed_by=changed_by, reason=body.reason
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        logger.error("admin_set_cultfit_stage(%d) failed: %s", order_id, e)
+        raise HTTPException(status_code=503, detail=f"Could not set stage: {e}")
+    logger.info("Stage set to %s for CultFit order %d by %s", body.stage, order_id, changed_by)
     return result
 
 

@@ -296,6 +296,56 @@ async def update_cultfit_stage(
     )
 
 
+def _sync_set_cultfit_stage(
+    order_id: int, stage_key: str, changed_by: str = '', reason: str = ''
+) -> dict:
+    """Set portal stage directly by key via XML-RPC."""
+    if stage_key not in STAGE_LABELS:
+        raise ValueError(f"Unknown stage key: {stage_key!r}")
+
+    uid, models = _connect()
+    reverse_map = {v: k for k, v in DEAL_STATUS_MAP.items()}
+
+    if stage_key == 'deal_closed':
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_PASS, 'crm.lead', 'write',
+            [[order_id], {'stage_id': _COLLECTED_STAGE_ID}],
+        )
+    elif stage_key == 'new':
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_PASS, 'crm.lead', 'write',
+            [[order_id], {'deal_status_id': False}],
+        )
+    else:
+        status_name = reverse_map.get(stage_key)
+        if not status_name:
+            raise ValueError(f"No Odoo deal.status mapping for stage {stage_key!r}")
+        statuses = models.execute_kw(
+            ODOO_DB, uid, ODOO_PASS, 'deal.status', 'search_read',
+            [[['name', '=', status_name]]], {'fields': ['id']},
+        )
+        if not statuses:
+            raise ValueError(f"deal.status '{status_name}' not found in Odoo")
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_PASS, 'crm.lead', 'write',
+            [[order_id], {'deal_status_id': statuses[0]['id']}],
+        )
+
+    return {
+        'order_id':        order_id,
+        'new_stage':       stage_key,
+        'new_stage_label': STAGE_LABELS.get(stage_key, stage_key),
+    }
+
+
+async def set_cultfit_stage(
+    order_id: int, stage_key: str, changed_by: str = '', reason: str = ''
+) -> dict:
+    return await asyncio.to_thread(
+        _sync_set_cultfit_stage, order_id, stage_key, changed_by, reason
+    )
+
+
 async def update_cultfit_deal_fields(
     order_id: int, updates: dict, changed_by: str = '', reason: str = ''
 ) -> dict:
