@@ -1,31 +1,35 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import Image from 'next/image';
 import { useRouter, useParams } from 'next/navigation';
-import { getCultFitOrderDetail, getDocuments, getOdooAttachments, updateDealStatus, setCultFitPortalStage, type DealStatusUpdate, type OdooAttachment } from '@/lib/api';
-import { isLoggedIn, getToken, isInBodyStaff } from '@/lib/auth';
+import {
+  getCultFitOrderDetail, getDocuments, getOdooAttachments,
+  updateDealStatus, setCultFitPortalStage,
+  type DealStatusUpdate, type OdooAttachment,
+} from '@/lib/api';
+import { isLoggedIn, getToken, isInBodyStaff, getUser, clearSession } from '@/lib/auth';
 import OrderTimeline from '@/components/OrderTimeline';
 import PaymentCountdown from '@/components/PaymentCountdown';
+import PortalHeader from '@/components/PortalHeader';
+import StatusChip from '@/components/StatusChip';
 import type { CultFitOrder, DocumentsResponse, TimelineStage } from '@/types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
 
-// ── Stage config (same order as backend) ─────────────────────────────────────
+// ── Stage definitions ─────────────────────────────────────────────────────────
 
 const STAGE_DEFS: Array<{ key: string; label: string; icon: string }> = [
-  { key: 'stage_1_order_received',         label: 'Order Received',           icon: 'shopping-cart' },
-  { key: 'stage_2_pi_issued',              label: 'PI Issued',                icon: 'file-text' },
-  { key: 'stage_3_po_received',            label: 'PO Received',              icon: 'inbox' },
-  { key: 'stage_4_md_approved',            label: 'MD Approved',              icon: 'check-square' },
-  { key: 'stage_5_dispatched',             label: 'Dispatched',               icon: 'truck' },
-  { key: 'stage_6_installation_confirmed', label: 'Installation Confirmed',   icon: 'tool' },
-  { key: 'stage_7_vendor_uploaded',        label: 'Vendor Portal Uploaded',   icon: 'upload-cloud' },
-  { key: 'stage_8_confirmation_sent',      label: 'Confirmation Mail Sent',   icon: 'mail' },
-  { key: 'stage_9_payment_collected',      label: 'Payment Collected',        icon: 'check-circle' },
+  { key: 'stage_1_order_received',         label: 'Order Received',           icon: 'shopping-cart'  },
+  { key: 'stage_2_pi_issued',              label: 'PI Issued',                icon: 'file-text'      },
+  { key: 'stage_3_po_received',            label: 'PO Received',              icon: 'inbox'          },
+  { key: 'stage_4_md_approved',            label: 'MD Approved',              icon: 'check-square'   },
+  { key: 'stage_5_dispatched',             label: 'Dispatched',               icon: 'truck'          },
+  { key: 'stage_6_installation_confirmed', label: 'Installation Confirmed',   icon: 'tool'           },
+  { key: 'stage_7_vendor_uploaded',        label: 'Vendor Portal Uploaded',   icon: 'upload-cloud'   },
+  { key: 'stage_8_confirmation_sent',      label: 'Confirmation Mail Sent',   icon: 'mail'           },
+  { key: 'stage_9_payment_collected',      label: 'Payment Collected',        icon: 'check-circle'   },
 ];
 
-// CultFit CRM deal-stage keys → timeline step (CRM uses a different stage system)
 const CULTFIT_STAGE_MAP: Record<string, number> = {
   new:                1,
   pi_shared:          2,
@@ -37,7 +41,6 @@ const CULTFIT_STAGE_MAP: Record<string, number> = {
   deal_closed:        9,
 };
 
-// Dates we can map to specific stages
 function buildTimeline(order: CultFitOrder): { stages: TimelineStage[]; currentStage: number } {
   const stageDefIdx = STAGE_DEFS.findIndex(s => s.key === order.portal_stage);
   const currentStage = stageDefIdx >= 0
@@ -66,21 +69,41 @@ function buildTimeline(order: CultFitOrder): { stages: TimelineStage[]; currentS
   return { stages, currentStage };
 }
 
-// ── Badge colors ──────────────────────────────────────────────────────────────
+// ── Label normalizers (handles both raw Odoo strings and human-readable) ──────
 
-const DELIVERY_COLORS: Record<string, string> = {
-  'No Delivery':          'bg-gray-100 text-gray-500',
-  'Pending':              'bg-amber-100 text-amber-700',
-  'Ready to Dispatch':    'bg-blue-100 text-blue-700',
-  'Partially Dispatched': 'bg-orange-100 text-orange-700',
-  'Delivered':            'bg-green-100 text-green-700',
+const INSTALL_LABELS: Record<string, string> = {
+  not_started:   'Not Started',
+  in_progress:   'In Progress',
+  confirmed:     'Confirmed',
+  'Not Started': 'Not Started',
+  'In Progress': 'In Progress',
+  'Confirmed':   'Confirmed',
 };
 
-const INVOICE_COLORS: Record<string, string> = {
-  'Nothing to Invoice':    'bg-gray-100 text-gray-500',
-  'To Invoice':            'bg-blue-100 text-blue-700',
-  'Invoiced':              'bg-green-100 text-green-700',
-  'Upselling Opportunity': 'bg-purple-100 text-purple-700',
+const VENDOR_LABELS: Record<string, string> = {
+  not_uploaded:   'Not Uploaded',
+  uploaded:       'Uploaded',
+  'Not Uploaded': 'Not Uploaded',
+  'Uploaded':     'Uploaded',
+};
+
+// ── Badge variant maps ────────────────────────────────────────────────────────
+
+type ChipVariant = 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'teal' | 'indigo' | 'orange' | 'purple';
+
+const DELIVERY_VARIANT: Record<string, ChipVariant> = {
+  'No Delivery':          'neutral',
+  'Pending':              'warning',
+  'Ready to Dispatch':    'info',
+  'Partially Dispatched': 'orange',
+  'Delivered':            'success',
+};
+
+const INVOICE_VARIANT: Record<string, ChipVariant> = {
+  'Nothing to Invoice':    'neutral',
+  'To Invoice':            'info',
+  'Invoiced':              'success',
+  'Upselling Opportunity': 'purple',
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -97,27 +120,34 @@ function fmtAmount(amount: number | null | undefined): string {
   return '₹' + amount.toLocaleString('en-IN');
 }
 
-function Badge({ label, colorMap }: { label: string; colorMap: Record<string, string> }) {
-  const cls = colorMap[label] ?? 'bg-gray-100 text-gray-600';
-  return (
-    <span className={`inline-block text-xs px-2.5 py-1 rounded-full font-semibold ${cls}`}>
-      {label}
-    </span>
-  );
-}
-
 function formatBytes(bytes: number): string {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} KB`;
   return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-function fileIcon(mimetype: string): string {
-  if (mimetype.includes('pdf')) return '📄';
-  if (mimetype.includes('image')) return '🖼️';
-  if (mimetype.includes('spreadsheet') || mimetype.includes('excel')) return '📊';
-  if (mimetype.includes('word') || mimetype.includes('document')) return '📝';
-  return '📎';
+function FiletypeIcon({ mimetype }: { mimetype: string }) {
+  if (mimetype.includes('pdf'))
+    return (
+      <span className="w-8 h-8 rounded-lg bg-red-50 border border-red-100 flex items-center justify-center text-xs font-bold text-red-500 flex-shrink-0">
+        PDF
+      </span>
+    );
+  if (mimetype.includes('image'))
+    return (
+      <span className="w-8 h-8 rounded-lg bg-blue-50 border border-blue-100 flex items-center justify-center flex-shrink-0">
+        <svg className="w-4 h-4 text-blue-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16l4.586-4.586a2 2 0 012.828 0L16 16m-2-2l1.586-1.586a2 2 0 012.828 0L20 14m-6-6h.01M6 20h12a2 2 0 002-2V6a2 2 0 00-2-2H6a2 2 0 00-2 2v12a2 2 0 002 2z" />
+        </svg>
+      </span>
+    );
+  return (
+    <span className="w-8 h-8 rounded-lg bg-slate-50 border border-slate-200 flex items-center justify-center flex-shrink-0">
+      <svg className="w-4 h-4 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 12h6m-6 4h6m2 5H7a2 2 0 01-2-2V5a2 2 0 012-2h5.586a1 1 0 01.707.293l5.414 5.414a1 1 0 01.293.707V19a2 2 0 01-2 2z" />
+      </svg>
+    </span>
+  );
 }
 
 // ── Page ──────────────────────────────────────────────────────────────────────
@@ -127,29 +157,33 @@ export default function OrderDetailPage() {
   const params  = useParams();
   const orderId = Number(params.id);
 
-  const [order, setOrder]     = useState<CultFitOrder | null>(null);
-  const [docs, setDocs]       = useState<DocumentsResponse | null>(null);
+  const [order, setOrder]       = useState<CultFitOrder | null>(null);
+  const [docs, setDocs]         = useState<DocumentsResponse | null>(null);
   const [odooDocs, setOdooDocs] = useState<OdooAttachment[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError]     = useState('');
+  const [loading, setLoading]   = useState(true);
+  const [error, setError]       = useState('');
   const [downloading, setDownloading] = useState<number | null>(null);
-  const [isStaff, setIsStaff] = useState(false);
+  const [isStaff, setIsStaff]   = useState(false);
+  const [userName, setUserName] = useState('');
 
   // Deal status form (staff only)
-  const [dealForm, setDealForm] = useState<DealStatusUpdate>({});
+  const [dealForm, setDealForm]   = useState<DealStatusUpdate>({});
   const [dealReason, setDealReason] = useState('');
-  const [saving, setSaving]     = useState(false);
-  const [saveMsg, setSaveMsg]   = useState<{ ok: boolean; text: string } | null>(null);
+  const [saving, setSaving]       = useState(false);
+  const [saveMsg, setSaveMsg]     = useState<{ ok: boolean; text: string } | null>(null);
 
   // Portal stage update (staff only)
-  const [stageKey, setStageKey]       = useState('');
-  const [stageReason, setStageReason] = useState('');
-  const [stageSaving, setStageSaving] = useState(false);
+  const [stageKey, setStageKey]         = useState('');
+  const [stageReason, setStageReason]   = useState('');
+  const [stageSaving, setStageSaving]   = useState(false);
   const [stageSaveMsg, setStageSaveMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
     if (!isLoggedIn()) { router.replace('/login'); return; }
-    setIsStaff(isInBodyStaff());
+    const staff = isInBodyStaff();
+    setIsStaff(staff);
+    const u = getUser();
+    setUserName(u?.name ?? '');
     if (!orderId) return;
 
     Promise.all([
@@ -161,7 +195,6 @@ export default function OrderDetailPage() {
         setOrder(o);
         setDocs(d);
         setOdooDocs(odoo?.attachments ?? []);
-        // Map human-readable labels back to Odoo raw keys for the form
         const instMap: Record<string, string> = {
           'Not Started': 'not_started', 'In Progress': 'in_progress', 'Confirmed': 'confirmed',
         };
@@ -192,15 +225,10 @@ export default function OrderDetailPage() {
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.click();
+      a.href = url; a.download = filename; a.click();
       URL.revokeObjectURL(url);
-    } catch {
-      alert('Download failed. Please try again.');
-    } finally {
-      setDownloading(null);
-    }
+    } catch { alert('Download failed. Please try again.'); }
+    finally { setDownloading(null); }
   }
 
   async function handleOdooDownload(attachmentId: number, filename: string) {
@@ -215,15 +243,10 @@ export default function OrderDetailPage() {
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
-      a.href = url;
-      a.download = filename;
-      a.click();
+      a.href = url; a.download = filename; a.click();
       URL.revokeObjectURL(url);
-    } catch {
-      alert('Download failed. Please try again.');
-    } finally {
-      setDownloading(null);
-    }
+    } catch { alert('Download failed. Please try again.'); }
+    finally { setDownloading(null); }
   }
 
   async function handleSaveDealStatus() {
@@ -236,7 +259,6 @@ export default function OrderDetailPage() {
     setSaveMsg(null);
     try {
       await updateDealStatus(order.id, { ...dealForm, reason: dealReason });
-      // Refresh order data to show updated values
       const updated = await getCultFitOrderDetail(order.id);
       setOrder(updated);
       const instMap: Record<string, string> = {
@@ -255,11 +277,8 @@ export default function OrderDetailPage() {
       setDealReason('');
       setSaveMsg({ ok: true, text: 'Deal status updated and logged.' });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Save failed.';
-      setSaveMsg({ ok: false, text: msg });
-    } finally {
-      setSaving(false);
-    }
+      setSaveMsg({ ok: false, text: err instanceof Error ? err.message : 'Save failed.' });
+    } finally { setSaving(false); }
   }
 
   async function handleSavePortalStage() {
@@ -278,32 +297,59 @@ export default function OrderDetailPage() {
       setStageReason('');
       setStageSaveMsg({ ok: true, text: `Stage updated to "${updated.portal_stage_label}".` });
     } catch (err: unknown) {
-      const msg = err instanceof Error ? err.message : 'Stage update failed.';
-      setStageSaveMsg({ ok: false, text: msg });
-    } finally {
-      setStageSaving(false);
-    }
+      setStageSaveMsg({ ok: false, text: err instanceof Error ? err.message : 'Stage update failed.' });
+    } finally { setStageSaving(false); }
   }
 
+  function handleLogout() {
+    clearSession();
+    router.replace('/login');
+  }
+
+  const backHref  = isStaff ? '/admin' : '/dashboard';
+  const backLabel = isStaff ? 'Admin' : 'My Orders';
+
+  // Loading state
   if (loading) return (
-    <div className="min-h-screen flex items-center justify-center">
-      <div className="text-center">
-        <div className="animate-spin w-8 h-8 border-4 border-blue-600 border-t-transparent rounded-full mx-auto mb-3" />
-        <p className="text-gray-500 text-sm">Loading order details...</p>
+    <div className="min-h-screen bg-slate-50">
+      <PortalHeader
+        role={isStaff ? 'STAFF' : 'CUSTOMER'}
+        userName={userName}
+        onLogout={handleLogout}
+        backHref={backHref}
+        backLabel={backLabel}
+      />
+      <div className="flex items-center justify-center py-32">
+        <div className="text-center">
+          <div className="animate-spin w-8 h-8 border-2 border-blue-600 border-t-transparent rounded-full mx-auto mb-3" />
+          <p className="text-sm text-slate-500">Loading order details...</p>
+        </div>
       </div>
     </div>
   );
 
+  // Error state
   if (error) return (
-    <div className="min-h-screen flex items-center justify-center p-4">
-      <div className="text-center">
-        <p className="text-red-600 font-medium mb-4">⚠️ {error}</p>
-        <button
-          onClick={() => router.back()}
-          className="text-blue-600 text-sm hover:underline"
-        >
-          ← Go Back
-        </button>
+    <div className="min-h-screen bg-slate-50">
+      <PortalHeader
+        role={isStaff ? 'STAFF' : 'CUSTOMER'}
+        userName={userName}
+        onLogout={handleLogout}
+        backHref={backHref}
+        backLabel={backLabel}
+      />
+      <div className="flex items-center justify-center py-32 px-4">
+        <div className="bg-white border border-red-200 rounded-xl p-8 text-center max-w-sm">
+          <div className="w-12 h-12 bg-red-50 rounded-full flex items-center justify-center mx-auto mb-4">
+            <svg className="w-6 h-6 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+            </svg>
+          </div>
+          <p className="text-red-700 font-medium mb-4">{error}</p>
+          <button onClick={() => router.back()} className="text-blue-600 text-sm hover:underline">
+            Go back
+          </button>
+        </div>
       </div>
     </div>
   );
@@ -311,91 +357,82 @@ export default function OrderDetailPage() {
   if (!order) return null;
 
   const { stages, currentStage } = buildTimeline(order);
-  const backHref = isStaff ? '/admin' : '/dashboard';
+
+  const installLabel = INSTALL_LABELS[order.installation_status] ?? order.installation_status;
+  const vendorLabel  = VENDOR_LABELS[order.vendor_portal_status]  ?? order.vendor_portal_status;
+  const isInstallDone = order.installation_status === 'confirmed' || order.installation_status === 'Confirmed';
+  const isVendorDone  = order.vendor_portal_status === 'uploaded' || order.vendor_portal_status === 'Uploaded';
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-slate-50">
 
-      {/* Nav */}
-      <nav className="bg-blue-700 text-white px-6 py-4 shadow-md">
-        <div className="max-w-5xl mx-auto flex items-center gap-4">
-          <div className="bg-white rounded-lg px-2 py-1 flex-shrink-0">
-            <Image src="/inbody-logo.webp" alt="InBody" width={80} height={24} className="object-contain" />
-          </div>
-          <span className="text-blue-400">/</span>
-          <button
-            onClick={() => router.push(backHref)}
-            className="text-blue-200 hover:text-white text-sm transition"
-          >
-            {isStaff ? 'Admin' : 'My Orders'}
-          </button>
-          <span className="text-blue-400">/</span>
-          <span className="font-semibold font-mono">{order.order_no}</span>
-          {order.order_status && (
-            <span className="text-xs text-blue-300">({order.order_status})</span>
-          )}
-        </div>
-      </nav>
+      <PortalHeader
+        role={isStaff ? 'STAFF' : 'CUSTOMER'}
+        userName={userName}
+        onLogout={handleLogout}
+        backHref={backHref}
+        backLabel={backLabel}
+        crumb={order.order_no}
+      />
 
-      <div className="max-w-5xl mx-auto px-4 sm:px-6 py-8">
+      <div className="max-w-screen-xl mx-auto px-4 sm:px-6 py-8">
 
-        {/* Header card */}
-        <div className="bg-white rounded-2xl border border-gray-200 p-6 mb-6 shadow-sm">
-          <div className="flex flex-wrap items-start justify-between gap-4">
-            <div>
-              <h1 className="text-2xl font-bold text-gray-900 font-mono">{order.order_no}</h1>
+        {/* ── Hero card ────────────────────────────────────────────── */}
+        <div className="bg-white border border-slate-200 rounded-xl p-6 mb-6 shadow-sm">
+          <div className="flex flex-wrap items-start justify-between gap-6">
+
+            <div className="min-w-0">
+              <div className="flex items-center gap-3 flex-wrap">
+                <h1 className="text-2xl font-bold text-slate-900 font-mono">{order.order_no}</h1>
+                <span className="text-xs font-medium bg-blue-50 text-blue-700 border border-blue-100 px-2.5 py-1 rounded-md">
+                  Stage {currentStage} of 9
+                </span>
+                {order.payment_overdue && (
+                  <span className="text-xs font-semibold bg-red-50 text-red-700 border border-red-200 px-2.5 py-1 rounded-md">
+                    Payment Overdue
+                  </span>
+                )}
+              </div>
+
               {order.customer && (
-                <p className="text-gray-600 mt-1 font-medium">{order.customer}</p>
+                <p className="text-slate-700 font-medium mt-2">{order.customer}</p>
               )}
               {order.location && (
-                <p className="text-gray-500 mt-0.5">📍 {order.location}</p>
-              )}
-              {order.order_date && (
-                <p className="text-gray-400 text-sm mt-1">
-                  Ordered: {fmtDate(order.order_date)}
-                </p>
+                <p className="text-slate-500 text-sm mt-0.5">{order.location}</p>
               )}
               {order.model_names.length > 0 && (
-                <p className="text-gray-500 text-sm mt-1">
-                  <span className="font-medium text-gray-600">Models:</span>{' '}
+                <p className="text-slate-500 text-sm mt-1">
+                  <span className="font-medium text-slate-600">Models: </span>
                   {order.model_names.join(', ')}
                 </p>
               )}
+
+              <div className="flex flex-wrap gap-2 mt-4">
+                <StatusChip label={order.delivery_status} variant={DELIVERY_VARIANT[order.delivery_status] ?? 'neutral'} />
+                <StatusChip label={order.invoice_status}  variant={INVOICE_VARIANT[order.invoice_status]  ?? 'neutral'} />
+              </div>
             </div>
 
-            <div className="text-right space-y-2">
-              <div>
-                <span className="inline-block bg-blue-100 text-blue-700 text-sm font-semibold px-4 py-2 rounded-full">
-                  Stage {currentStage} of 9
-                </span>
-              </div>
-              <p className="text-2xl font-bold text-gray-900">{fmtAmount(order.amount_total)}</p>
+            <div className="text-right flex-shrink-0">
+              <p className="text-3xl font-bold text-slate-900">{fmtAmount(order.amount_total)}</p>
               {order.amount_untaxed > 0 && order.amount_tax > 0 && (
-                <p className="text-xs text-gray-400">
-                  {fmtAmount(order.amount_untaxed)} + {fmtAmount(order.amount_tax)} tax
+                <p className="text-xs text-slate-400 mt-1">
+                  {fmtAmount(order.amount_untaxed)} + {fmtAmount(order.amount_tax)} GST
                 </p>
               )}
               {order.payment_terms && (
-                <p className="text-xs text-gray-400">{order.payment_terms}</p>
+                <p className="text-xs text-slate-400 mt-0.5">{order.payment_terms}</p>
+              )}
+              {order.order_date && (
+                <p className="text-xs text-slate-400 mt-2">Ordered {fmtDate(order.order_date)}</p>
               )}
             </div>
           </div>
 
-          {/* Status badges row */}
-          <div className="flex flex-wrap gap-2 mt-4 pt-4 border-t border-gray-100">
-            <Badge label={order.delivery_status} colorMap={DELIVERY_COLORS} />
-            <Badge label={order.invoice_status}  colorMap={INVOICE_COLORS} />
-            {order.payment_overdue && (
-              <span className="text-xs px-2.5 py-1 rounded-full font-semibold bg-red-100 text-red-700">
-                🔴 Payment Overdue
-              </span>
-            )}
-          </div>
-
-          {/* PO / PI / MD row */}
-          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-5 pt-5 border-t border-gray-100">
+          {/* PO / PI / MD grid */}
+          <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mt-5 pt-5 border-t border-slate-100">
             {[
-              { label: 'PO Number',  value: order.po_number || '—' },
+              { label: 'PO Number',   value: order.po_number || '—' },
               { label: 'PO Received', value: fmtDate(order.po_received_date) },
               { label: 'PI Issued',   value: fmtDate(order.pi_issued_date) },
               {
@@ -406,28 +443,30 @@ export default function OrderDetailPage() {
               },
             ].map(item => (
               <div key={item.label}>
-                <p className="text-xs text-gray-400 font-medium uppercase tracking-wide">{item.label}</p>
-                <p className="text-sm font-semibold text-gray-700 mt-0.5">{item.value}</p>
+                <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">{item.label}</p>
+                <p className="text-sm font-semibold text-slate-700 mt-0.5">{item.value}</p>
               </div>
             ))}
           </div>
         </div>
 
-        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6">
+        {/* ── Two-column layout ─────────────────────────────────────── */}
+        <div className="grid grid-cols-1 lg:grid-cols-3 gap-6 items-start">
 
           {/* Left: Timeline */}
           <div className="lg:col-span-2">
-            <div className="bg-white rounded-2xl border border-gray-200 p-6 shadow-sm">
-              <h2 className="font-bold text-gray-900 mb-6">Order Timeline</h2>
+            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+              <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-6">Order Timeline</h2>
               <OrderTimeline stages={stages} currentStage={currentStage} />
             </div>
           </div>
 
-          {/* Right: Payment + Quick Status */}
-          <div className="space-y-5">
+          {/* Right: sidebar — sticky on desktop */}
+          <div className="space-y-5 lg:sticky lg:top-20">
 
-            <div className="bg-white rounded-2xl border border-gray-200 p-6 shadow-sm">
-              <h2 className="font-bold text-gray-900 mb-4">Payment Status</h2>
+            {/* Payment */}
+            <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+              <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Payment</h2>
               <PaymentCountdown
                 dueDate={order.payment_due_date}
                 daysToPayment={order.days_to_payment}
@@ -436,19 +475,20 @@ export default function OrderDetailPage() {
               />
             </div>
 
-            <div className="bg-white rounded-2xl border border-gray-200 p-6 shadow-sm">
-              <h2 className="font-bold text-gray-900 mb-4">Quick Status</h2>
+            {/* Quick status */}
+            <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+              <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Quick Status</h2>
               <div className="space-y-3">
                 {[
                   {
                     label: 'Installation',
-                    value: order.installation_status,
-                    done:  order.installation_status === 'Confirmed',
+                    value: installLabel,
+                    done:  isInstallDone,
                   },
                   {
                     label: 'Vendor Portal',
-                    value: order.vendor_portal_status,
-                    done:  order.vendor_portal_status === 'Uploaded',
+                    value: vendorLabel,
+                    done:  isVendorDone,
                   },
                   {
                     label: 'Confirmation Mail',
@@ -456,66 +496,64 @@ export default function OrderDetailPage() {
                     done:  order.confirmation_mail_sent,
                   },
                 ].map(item => (
-                  <div key={item.label} className="flex items-center justify-between">
-                    <span className="text-sm text-gray-600">{item.label}</span>
-                    <span className={`text-sm font-medium ${item.done ? 'text-green-600' : 'text-gray-400'}`}>
-                      {item.done ? '✅ ' : ''}{item.value}
+                  <div key={item.label} className="flex items-center justify-between gap-3">
+                    <span className="text-sm text-slate-500">{item.label}</span>
+                    <span className={`text-sm font-medium ${item.done ? 'text-green-600' : 'text-slate-400'}`}>
+                      {item.value}
                     </span>
                   </div>
                 ))}
               </div>
             </div>
 
-            {/* Portal Stage Update — staff only */}
+            {/* Update Portal Stage — staff only */}
             {isStaff && (
-              <div className="bg-white rounded-2xl border border-gray-200 p-6 shadow-sm">
-                <h2 className="font-bold text-gray-900 mb-4">Update Portal Stage</h2>
+              <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+                <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Update Portal Stage</h2>
                 <div className="space-y-3">
+                  <select
+                    value={stageKey}
+                    onChange={e => setStageKey(e.target.value)}
+                    className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
+                  >
+                    <option value="new">New</option>
+                    <option value="pi_shared">PI Shared</option>
+                    <option value="po_received">PO Received</option>
+                    <option value="dispatch_requested">Dispatch Requested</option>
+                    <option value="dispatched">Dispatched</option>
+                    <option value="delivered">Delivered (Not Installed)</option>
+                    <option value="server_updated">Server Updated</option>
+                    <option value="deal_closed">Deal Closed</option>
+                  </select>
+
                   <div>
-                    <label className="text-xs font-medium text-gray-500 uppercase tracking-wide block mb-1">
-                      Portal Stage
-                    </label>
-                    <select
-                      value={stageKey}
-                      onChange={e => setStageKey(e.target.value)}
-                      className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500"
-                    >
-                      <option value="new">New</option>
-                      <option value="pi_shared">PI Shared</option>
-                      <option value="po_received">PO Received</option>
-                      <option value="dispatch_requested">Dispatch Requested</option>
-                      <option value="dispatched">Dispatched</option>
-                      <option value="delivered">Delivered (Not Installed)</option>
-                      <option value="server_updated">Server Updated</option>
-                      <option value="deal_closed">Deal Closed</option>
-                    </select>
-                  </div>
-                  <div>
-                    <label className="text-xs font-medium text-gray-500 uppercase tracking-wide block mb-1">
+                    <label className="text-xs font-medium text-slate-500 block mb-1">
                       Reason / Note <span className="text-red-500">*</span>
-                      <span className="normal-case text-gray-400 ml-1">(required · logged in Odoo)</span>
+                      <span className="font-normal text-slate-400 ml-1">— logged in Odoo</span>
                     </label>
                     <textarea
                       rows={2}
                       value={stageReason}
                       onChange={e => setStageReason(e.target.value)}
-                      placeholder="e.g. Units dispatched via Blue Dart on 23 Jun 2026"
+                      placeholder="e.g. Units dispatched via Blue Dart on 23 Jun"
                       className={`w-full text-sm border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 resize-none ${
                         !stageReason.trim()
                           ? 'border-red-300 focus:ring-red-400'
-                          : 'border-gray-300 focus:ring-indigo-500'
+                          : 'border-slate-300 focus:ring-indigo-500'
                       }`}
                     />
                   </div>
+
                   {stageSaveMsg && (
                     <p className={`text-xs font-medium ${stageSaveMsg.ok ? 'text-green-600' : 'text-red-600'}`}>
-                      {stageSaveMsg.ok ? '✅' : '⚠️'} {stageSaveMsg.text}
+                      {stageSaveMsg.text}
                     </p>
                   )}
+
                   <button
                     onClick={handleSavePortalStage}
                     disabled={stageSaving}
-                    className="w-full mt-1 bg-indigo-700 hover:bg-indigo-800 disabled:bg-indigo-400 text-white text-sm font-semibold py-2.5 rounded-xl transition-colors"
+                    className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white text-sm font-semibold py-2.5 rounded-lg transition-colors"
                   >
                     {stageSaving ? 'Updating...' : 'Update Stage'}
                   </button>
@@ -523,20 +561,18 @@ export default function OrderDetailPage() {
               </div>
             )}
 
-            {/* Deal Status Update — staff only */}
+            {/* Update Deal Status — staff only */}
             {isStaff && (
-              <div className="bg-white rounded-2xl border border-gray-200 p-6 shadow-sm">
-                <h2 className="font-bold text-gray-900 mb-4">Update Deal Status</h2>
+              <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+                <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Update Deal Status</h2>
                 <div className="space-y-3">
 
                   <div>
-                    <label className="text-xs font-medium text-gray-500 uppercase tracking-wide block mb-1">
-                      Payment Status
-                    </label>
+                    <label className="text-xs font-medium text-slate-500 block mb-1">Payment Status</label>
                     <select
                       value={dealForm.payment_status ?? ''}
                       onChange={e => setDealForm(f => ({ ...f, payment_status: e.target.value }))}
-                      className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
                     >
                       <option value="pending">Pending</option>
                       <option value="overdue">Overdue</option>
@@ -545,13 +581,11 @@ export default function OrderDetailPage() {
                   </div>
 
                   <div>
-                    <label className="text-xs font-medium text-gray-500 uppercase tracking-wide block mb-1">
-                      Installation Status
-                    </label>
+                    <label className="text-xs font-medium text-slate-500 block mb-1">Installation Status</label>
                     <select
                       value={dealForm.installation_status ?? ''}
                       onChange={e => setDealForm(f => ({ ...f, installation_status: e.target.value }))}
-                      className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
                     >
                       <option value="not_started">Not Started</option>
                       <option value="in_progress">In Progress</option>
@@ -560,13 +594,11 @@ export default function OrderDetailPage() {
                   </div>
 
                   <div>
-                    <label className="text-xs font-medium text-gray-500 uppercase tracking-wide block mb-1">
-                      Vendor Portal Status
-                    </label>
+                    <label className="text-xs font-medium text-slate-500 block mb-1">Vendor Portal Status</label>
                     <select
                       value={dealForm.vendor_portal_status ?? ''}
                       onChange={e => setDealForm(f => ({ ...f, vendor_portal_status: e.target.value }))}
-                      className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
                     >
                       <option value="not_uploaded">Not Uploaded</option>
                       <option value="uploaded">Uploaded</option>
@@ -574,13 +606,11 @@ export default function OrderDetailPage() {
                   </div>
 
                   <div>
-                    <label className="text-xs font-medium text-gray-500 uppercase tracking-wide block mb-1">
-                      MD Approval
-                    </label>
+                    <label className="text-xs font-medium text-slate-500 block mb-1">MD Approval</label>
                     <select
                       value={dealForm.md_approval_status ?? ''}
                       onChange={e => setDealForm(f => ({ ...f, md_approval_status: e.target.value }))}
-                      className="w-full text-sm border border-gray-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                      className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
                     >
                       <option value="pending">Pending</option>
                       <option value="approved">Approved</option>
@@ -588,24 +618,21 @@ export default function OrderDetailPage() {
                     </select>
                   </div>
 
-                  <div className="flex items-center gap-3 pt-1">
+                  <div className="flex items-center gap-2.5 pt-0.5">
                     <input
                       type="checkbox"
                       id="conf-mail"
                       checked={dealForm.confirmation_mail_sent ?? false}
                       onChange={e => setDealForm(f => ({ ...f, confirmation_mail_sent: e.target.checked }))}
-                      className="w-4 h-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                      className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
                     />
-                    <label htmlFor="conf-mail" className="text-sm text-gray-700">
-                      Confirmation Mail Sent
-                    </label>
+                    <label htmlFor="conf-mail" className="text-sm text-slate-700">Confirmation Mail Sent</label>
                   </div>
 
-                  <div className="pt-1">
-                    <label className="text-xs font-medium text-gray-500 uppercase tracking-wide block mb-1">
-                      Reason / Note{' '}
-                      <span className="text-red-500">*</span>
-                      <span className="normal-case text-gray-400 ml-1">(required · logged in Odoo)</span>
+                  <div>
+                    <label className="text-xs font-medium text-slate-500 block mb-1">
+                      Reason / Note <span className="text-red-500">*</span>
+                      <span className="font-normal text-slate-400 ml-1">— logged in Odoo</span>
                     </label>
                     <textarea
                       rows={3}
@@ -615,21 +642,21 @@ export default function OrderDetailPage() {
                       className={`w-full text-sm border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 resize-none ${
                         !dealReason.trim()
                           ? 'border-red-300 focus:ring-red-400'
-                          : 'border-gray-300 focus:ring-blue-500'
+                          : 'border-slate-300 focus:ring-blue-500'
                       }`}
                     />
                   </div>
 
                   {saveMsg && (
                     <p className={`text-xs font-medium ${saveMsg.ok ? 'text-green-600' : 'text-red-600'}`}>
-                      {saveMsg.ok ? '✅' : '⚠️'} {saveMsg.text}
+                      {saveMsg.text}
                     </p>
                   )}
 
                   <button
                     onClick={handleSaveDealStatus}
                     disabled={saving}
-                    className="w-full mt-1 bg-blue-700 hover:bg-blue-800 disabled:bg-blue-400 text-white text-sm font-semibold py-2.5 rounded-xl transition-colors"
+                    className="w-full bg-blue-700 hover:bg-blue-800 disabled:bg-blue-300 text-white text-sm font-semibold py-2.5 rounded-lg transition-colors"
                   >
                     {saving ? 'Saving...' : 'Save Changes'}
                   </button>
@@ -637,39 +664,38 @@ export default function OrderDetailPage() {
               </div>
             )}
 
+            {/* Notes */}
             {order.portal_notes && (
-              <div className="bg-blue-50 border border-blue-200 rounded-2xl p-5">
-                <h2 className="font-semibold text-blue-800 text-sm mb-2">📌 Notes from InBody</h2>
+              <div className="bg-blue-50 border border-blue-100 rounded-xl p-4">
+                <p className="text-xs font-semibold text-blue-700 uppercase tracking-wide mb-1.5">Notes from InBody</p>
                 <p className="text-sm text-blue-700">{order.portal_notes}</p>
               </div>
             )}
 
             {order.last_updated && (
-              <p className="text-xs text-gray-400 text-right">
+              <p className="text-xs text-slate-400 text-right">
                 Last updated: {fmtDate(order.last_updated)}
               </p>
             )}
           </div>
         </div>
 
-        {/* Documents */}
-        <div className="mt-6 bg-white rounded-2xl border border-gray-200 p-6 shadow-sm">
-          <h2 className="font-bold text-gray-900 mb-4">Documents</h2>
+        {/* ── Documents ────────────────────────────────────────────── */}
+        <div className="mt-6 bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+          <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-5">Documents</h2>
 
-          {/* Odoo-sourced documents (quotation, invoice) */}
+          {/* Odoo-sourced documents */}
           {odooDocs.length > 0 && (
             <div className="mb-5">
-              <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">
-                From Odoo
-              </p>
-              <div className="divide-y divide-gray-100 border border-gray-100 rounded-xl overflow-hidden">
+              <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-3">From Odoo</p>
+              <div className="divide-y divide-slate-100 border border-slate-100 rounded-lg overflow-hidden">
                 {odooDocs.map(doc => (
-                  <div key={doc.id} className="flex items-center justify-between px-4 py-3 bg-gray-50 hover:bg-blue-50 transition-colors">
+                  <div key={doc.id} className="flex items-center justify-between px-4 py-3 bg-slate-50 hover:bg-blue-50 transition-colors">
                     <div className="flex items-center gap-3 min-w-0">
-                      <span className="text-xl flex-shrink-0">📄</span>
+                      <FiletypeIcon mimetype="pdf" />
                       <div className="min-w-0">
-                        <p className="text-sm font-medium text-gray-800 truncate">{doc.label}</p>
-                        <p className="text-xs text-gray-400 mt-0.5">
+                        <p className="text-sm font-medium text-slate-800 truncate">{doc.label}</p>
+                        <p className="text-xs text-slate-400 mt-0.5">
                           {doc.type === 'quotation' ? 'Quotation PDF' : 'Tax Invoice PDF'}
                           {doc.size ? ` · ${formatBytes(doc.size)}` : ''}
                           {doc.date ? ` · ${new Date(doc.date).toLocaleDateString('en-IN')}` : ''}
@@ -679,15 +705,20 @@ export default function OrderDetailPage() {
                     <button
                       onClick={() => handleOdooDownload(doc.id, doc.name)}
                       disabled={downloading === doc.id}
-                      className="ml-4 flex-shrink-0 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition flex items-center gap-1.5"
+                      className="ml-4 flex-shrink-0 inline-flex items-center gap-1.5 bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-xs font-semibold px-3 py-1.5 rounded-lg transition"
                     >
                       {downloading === doc.id ? (
                         <>
-                          <span className="animate-spin w-3 h-3 border-2 border-white border-t-transparent rounded-full inline-block" />
+                          <span className="animate-spin w-3 h-3 border-2 border-white border-t-transparent rounded-full" />
                           Downloading...
                         </>
                       ) : (
-                        <>⬇ Download</>
+                        <>
+                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                          </svg>
+                          Download
+                        </>
                       )}
                     </button>
                   </div>
@@ -700,18 +731,16 @@ export default function OrderDetailPage() {
           {docs && docs.count > 0 ? (
             <div>
               {odooDocs.length > 0 && (
-                <p className="text-xs font-semibold text-gray-400 uppercase tracking-wide mb-3">
-                  Uploaded by InBody
-                </p>
+                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-3">Uploaded by InBody</p>
               )}
-              <div className="divide-y divide-gray-100">
+              <div className="divide-y divide-slate-100">
                 {docs.documents.map(doc => (
                   <div key={doc.id} className="flex items-center justify-between py-3 first:pt-0 last:pb-0">
                     <div className="flex items-center gap-3 min-w-0">
-                      <span className="text-xl flex-shrink-0">{fileIcon(doc.mimetype)}</span>
+                      <FiletypeIcon mimetype={doc.mimetype} />
                       <div className="min-w-0">
-                        <p className="text-sm font-medium text-gray-800 truncate">{doc.name}</p>
-                        <p className="text-xs text-gray-400 mt-0.5">
+                        <p className="text-sm font-medium text-slate-800 truncate">{doc.name}</p>
+                        <p className="text-xs text-slate-400 mt-0.5">
                           {formatBytes(doc.size)}
                           {doc.date && ` · ${new Date(doc.date).toLocaleDateString('en-IN')}`}
                         </p>
@@ -720,15 +749,20 @@ export default function OrderDetailPage() {
                     <button
                       onClick={() => handleDownload(doc.id, doc.name)}
                       disabled={downloading === doc.id}
-                      className="ml-4 flex-shrink-0 text-sm text-blue-600 hover:text-blue-800 font-medium disabled:text-gray-400 flex items-center gap-1.5 transition"
+                      className="ml-4 flex-shrink-0 inline-flex items-center gap-1.5 text-sm text-blue-600 hover:text-blue-800 font-medium disabled:text-slate-400 transition"
                     >
                       {downloading === doc.id ? (
                         <>
-                          <span className="animate-spin w-3.5 h-3.5 border-2 border-blue-400 border-t-transparent rounded-full inline-block" />
+                          <span className="animate-spin w-3.5 h-3.5 border-2 border-blue-400 border-t-transparent rounded-full" />
                           Downloading...
                         </>
                       ) : (
-                        <>⬇ Download</>
+                        <>
+                          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                          </svg>
+                          Download
+                        </>
                       )}
                     </button>
                   </div>
@@ -736,12 +770,14 @@ export default function OrderDetailPage() {
               </div>
             </div>
           ) : odooDocs.length === 0 ? (
-            <div className="text-center py-8 text-gray-400">
-              <p className="text-3xl mb-2">📂</p>
-              <p className="text-sm">No documents available yet.</p>
-              <p className="text-xs mt-1 text-gray-300">
-                Documents will appear here once InBody uploads them.
-              </p>
+            <div className="text-center py-10">
+              <div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-3">
+                <svg className="w-6 h-6 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+                </svg>
+              </div>
+              <p className="text-sm text-slate-500">No documents yet</p>
+              <p className="text-xs text-slate-300 mt-1">Documents will appear here once uploaded by InBody</p>
             </div>
           ) : null}
         </div>

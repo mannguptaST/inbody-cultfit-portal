@@ -1,62 +1,61 @@
 'use client';
 
 import { useEffect, useState, useCallback } from 'react';
-import Image from 'next/image';
 import { useRouter } from 'next/navigation';
 import { getCultFitOrders } from '@/lib/api';
 import { isLoggedIn, getUser, clearSession, isInBodyStaff } from '@/lib/auth';
+import PortalHeader from '@/components/PortalHeader';
+import StatusChip from '@/components/StatusChip';
 import type { CultFitOrder } from '@/types';
 
 // ── Stage config ──────────────────────────────────────────────────────────────
 
 const STAGE_LABELS: Record<string, string> = {
-  new:               'New',
-  po_received:       'PO Received',
-  pi_shared:         'PI Shared',
+  new:                'New',
+  po_received:        'PO Received',
+  pi_shared:          'PI Shared',
   dispatch_requested: 'Dispatch Requested',
-  dispatched:        'Dispatched',
-  delivered:         'Delivered (Not Installed)',
-  server_updated:    'Server Updated',
-  deal_closed:       'Deal Closed',
-};
-
-const STAGE_COLORS: Record<string, string> = {
-  new:               'bg-gray-100 text-gray-600',
-  po_received:       'bg-indigo-100 text-indigo-700',
-  pi_shared:         'bg-blue-100 text-blue-700',
-  dispatch_requested: 'bg-amber-100 text-amber-700',
-  dispatched:        'bg-yellow-100 text-yellow-700',
-  delivered:         'bg-orange-100 text-orange-700',
-  server_updated:    'bg-teal-100 text-teal-700',
-  deal_closed:       'bg-green-100 text-green-700',
+  dispatched:         'Dispatched',
+  delivered:          'Delivered (Not Installed)',
+  server_updated:     'Server Updated',
+  deal_closed:        'Deal Closed',
 };
 
 const STAGE_KEYS = Object.keys(STAGE_LABELS);
 
-// ── Status color maps ─────────────────────────────────────────────────────────
+type ChipVariant = 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'teal' | 'indigo' | 'orange' | 'purple';
 
-const DELIVERY_COLORS: Record<string, string> = {
-  'No Delivery':          'bg-gray-100 text-gray-500',
-  'Pending':              'bg-amber-100 text-amber-700',
-  'Ready to Dispatch':    'bg-blue-100 text-blue-700',
-  'Partially Dispatched': 'bg-orange-100 text-orange-700',
-  'Delivered':            'bg-green-100 text-green-700',
+const STAGE_VARIANT: Record<string, ChipVariant> = {
+  new:                'neutral',
+  po_received:        'indigo',
+  pi_shared:          'info',
+  dispatch_requested: 'warning',
+  dispatched:         'warning',
+  delivered:          'orange',
+  server_updated:     'teal',
+  deal_closed:        'success',
 };
 
-const INVOICE_COLORS: Record<string, string> = {
-  'Nothing to Invoice':    'bg-gray-100 text-gray-500',
-  'To Invoice':            'bg-blue-100 text-blue-700',
-  'Invoiced':              'bg-green-100 text-green-700',
-  'Upselling Opportunity': 'bg-purple-100 text-purple-700',
+const DELIVERY_VARIANT: Record<string, ChipVariant> = {
+  'No Delivery':          'neutral',
+  'Pending':              'warning',
+  'Ready to Dispatch':    'info',
+  'Partially Dispatched': 'orange',
+  'Delivered':            'success',
+};
+
+const INVOICE_VARIANT: Record<string, ChipVariant> = {
+  'Nothing to Invoice':    'neutral',
+  'To Invoice':            'info',
+  'Invoiced':              'success',
+  'Upselling Opportunity': 'purple',
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
 function fmtDate(d: string | null | undefined): string {
   if (!d) return '—';
-  return new Date(d).toLocaleDateString('en-IN', {
-    day: 'numeric', month: 'short', year: 'numeric',
-  });
+  return new Date(d).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' });
 }
 
 function fmtAmount(amount: number | null | undefined): string {
@@ -64,14 +63,14 @@ function fmtAmount(amount: number | null | undefined): string {
   return '₹' + amount.toLocaleString('en-IN');
 }
 
-interface BadgeProps { label: string; colorMap: Record<string, string> }
-function Badge({ label, colorMap }: BadgeProps) {
-  const cls = colorMap[label] ?? 'bg-gray-100 text-gray-600';
-  return (
-    <span className={`inline-block text-xs px-2.5 py-1 rounded-full font-semibold whitespace-nowrap ${cls}`}>
-      {label}
-    </span>
-  );
+function PaymentCell({ order }: { order: CultFitOrder }) {
+  if (order.payment_overdue)
+    return <span className="text-xs font-semibold text-red-600">Overdue</span>;
+  if (order.payment_status === 'collected')
+    return <span className="text-xs font-semibold text-green-600">Collected</span>;
+  if (order.days_to_payment > 0)
+    return <span className="text-xs font-medium text-amber-600">{order.days_to_payment}d left</span>;
+  return <span className="text-xs text-slate-400">Pending</span>;
 }
 
 // ── Page ──────────────────────────────────────────────────────────────────────
@@ -85,7 +84,6 @@ export default function AdminPage() {
   const [stageFilter, setStageFilter] = useState('');
   const [user, setUser]               = useState<ReturnType<typeof getUser>>(null);
 
-  // Auth guard — staff only
   useEffect(() => {
     if (!isLoggedIn()) { router.replace('/login'); return; }
     const u = getUser();
@@ -113,7 +111,6 @@ export default function AdminPage() {
     router.replace('/login');
   }
 
-  // Client-side filters
   const filtered = orders.filter(o => {
     const q = search.toLowerCase();
     const matchSearch =
@@ -127,101 +124,133 @@ export default function AdminPage() {
     return matchSearch && matchStage;
   });
 
-  // Stats
   const overdue   = orders.filter(o => o.payment_overdue).length;
   const collected = orders.filter(o => o.payment_status === 'collected').length;
-  const pending   = orders.filter(o => o.payment_status === 'pending').length;
+  const pending   = orders.filter(o => o.payment_status !== 'collected').length;
+
+  const stats = [
+    {
+      label: 'Total Orders',
+      value: orders.length,
+      sub: 'All CultFit orders',
+      valueColor: 'text-slate-900',
+      icon: (
+        <svg className="w-5 h-5 text-blue-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+        </svg>
+      ),
+    },
+    {
+      label: 'Payment Pending',
+      value: pending,
+      sub: 'Awaiting collection',
+      valueColor: 'text-amber-600',
+      icon: (
+        <svg className="w-5 h-5 text-amber-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+      ),
+    },
+    {
+      label: 'Overdue',
+      value: overdue,
+      sub: 'Past payment due date',
+      valueColor: overdue > 0 ? 'text-red-600' : 'text-slate-900',
+      icon: (
+        <svg className="w-5 h-5 text-red-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M12 9v2m0 4h.01m-6.938 4h13.856c1.54 0 2.502-1.667 1.732-3L13.732 4c-.77-1.333-2.694-1.333-3.464 0L3.34 16c-.77 1.333.192 3 1.732 3z" />
+        </svg>
+      ),
+    },
+    {
+      label: 'Collected',
+      value: collected,
+      sub: 'Payment received',
+      valueColor: 'text-green-600',
+      icon: (
+        <svg className="w-5 h-5 text-green-500" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 12l2 2 4-4m6 2a9 9 0 11-18 0 9 9 0 0118 0z" />
+        </svg>
+      ),
+    },
+  ];
 
   return (
-    <div className="min-h-screen bg-gray-50">
+    <div className="min-h-screen bg-slate-50">
 
-      {/* Nav */}
-      <nav className="bg-gray-900 text-white px-6 py-4 shadow-md">
-        <div className="max-w-full mx-auto flex items-center justify-between">
-          <div className="flex items-center gap-3">
-            <div className="bg-white rounded-lg px-2 py-1">
-              <Image src="/inbody-logo.webp" alt="InBody" width={80} height={24} className="object-contain" />
-            </div>
-            <span className="text-xs bg-amber-500 text-white px-2 py-0.5 rounded-full font-semibold">
-              STAFF
-            </span>
-          </div>
-          <div className="flex items-center gap-4">
-            <span className="text-sm text-gray-400 hidden sm:block">{user?.name}</span>
-            <button
-              onClick={fetchOrders}
-              className="text-sm bg-white/10 hover:bg-white/20 px-3 py-1.5 rounded-lg transition"
-            >
-              Refresh
-            </button>
-            <button
-              onClick={handleLogout}
-              className="text-sm bg-red-600/80 hover:bg-red-600 px-3 py-1.5 rounded-lg transition"
-            >
-              Logout
-            </button>
-          </div>
-        </div>
-      </nav>
+      <PortalHeader
+        role="STAFF"
+        userName={user?.name}
+        search={search}
+        onSearchChange={setSearch}
+        onRefresh={fetchOrders}
+        onLogout={handleLogout}
+      />
 
-      <div className="max-w-full px-4 sm:px-6 py-8">
+      <div className="max-w-screen-2xl mx-auto px-6 py-8">
 
-        {/* Header */}
-        <div className="mb-6">
-          <h1 className="text-2xl font-bold text-gray-900">CultFit Orders</h1>
-          <p className="text-gray-500 text-sm mt-1">
-            All CultFit / Curefit orders — live from Odoo.
-          </p>
+        {/* Page title */}
+        <div className="mb-7">
+          <h1 className="text-xl font-semibold text-slate-900">CultFit Orders</h1>
+          <p className="text-sm text-slate-500 mt-0.5">All CultFit / Curefit orders — live from Odoo</p>
         </div>
 
-        {/* Stats */}
-        <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 mb-6">
-          {[
-            { label: 'Total Orders',    value: orders.length, color: 'text-blue-700',  bg: 'bg-blue-50 border-blue-200' },
-            { label: 'Overdue',         value: overdue,        color: 'text-red-700',   bg: 'bg-red-50 border-red-200' },
-            { label: 'Collected',       value: collected,      color: 'text-green-700', bg: 'bg-green-50 border-green-200' },
-            { label: 'Payment Pending', value: pending,        color: 'text-amber-700', bg: 'bg-amber-50 border-amber-200' },
-          ].map(s => (
-            <div key={s.label} className={`rounded-xl border p-4 ${s.bg}`}>
-              <p className="text-xs text-gray-500 font-medium">{s.label}</p>
-              <p className={`text-3xl font-bold mt-1 ${s.color}`}>{s.value}</p>
+        {/* Stat cards */}
+        <div className="grid grid-cols-2 lg:grid-cols-4 gap-4 mb-7">
+          {stats.map(s => (
+            <div key={s.label} className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+              <div className="flex items-start justify-between mb-3">
+                <p className="text-xs font-medium text-slate-500 uppercase tracking-wide">{s.label}</p>
+                <span className="p-1.5 bg-slate-50 rounded-lg">{s.icon}</span>
+              </div>
+              <p className={`text-3xl font-bold ${s.valueColor}`}>{s.value}</p>
+              <p className="text-xs text-slate-400 mt-1">{s.sub}</p>
             </div>
           ))}
         </div>
 
-        {/* Filters */}
-        <div className="flex flex-col sm:flex-row gap-3 mb-6">
-          <input
-            type="text"
-            placeholder="Search by order, centre, model, or customer..."
-            value={search}
-            onChange={e => setSearch(e.target.value)}
-            className="flex-1 px-4 py-2.5 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-gray-500 bg-white"
-          />
+        {/* Controls row: stage filter + result count */}
+        <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 mb-5">
           <select
             value={stageFilter}
             onChange={e => setStageFilter(e.target.value)}
-            className="px-4 py-2.5 border border-gray-300 rounded-xl text-sm focus:outline-none focus:ring-2 focus:ring-gray-500 bg-white min-w-[200px]"
+            className="text-sm border border-slate-200 rounded-lg px-3 py-2 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 min-w-[180px]"
           >
             <option value="">All Stages</option>
             {STAGE_KEYS.map(k => (
               <option key={k} value={k}>{STAGE_LABELS[k]}</option>
             ))}
           </select>
+          {(search || stageFilter) && (
+            <button
+              onClick={() => { setSearch(''); setStageFilter(''); }}
+              className="text-xs text-blue-600 hover:text-blue-700 underline"
+            >
+              Clear filters
+            </button>
+          )}
+          {!loading && (
+            <p className="text-xs text-slate-400 sm:ml-auto">
+              {filtered.length} of {orders.length} orders
+            </p>
+          )}
         </div>
 
         {/* Loading */}
         {loading && (
           <div className="flex items-center justify-center py-24">
-            <div className="animate-spin w-8 h-8 border-4 border-gray-800 border-t-transparent rounded-full" />
+            <div className="text-center">
+              <div className="animate-spin w-7 h-7 border-2 border-blue-600 border-t-transparent rounded-full mx-auto mb-3" />
+              <p className="text-sm text-slate-500">Loading orders...</p>
+            </div>
           </div>
         )}
 
         {/* Error */}
         {error && (
           <div className="bg-red-50 border border-red-200 rounded-xl p-6 text-center">
-            <p className="text-red-700 font-medium">{error}</p>
-            <button onClick={fetchOrders} className="mt-3 text-sm text-blue-600 hover:underline">
+            <p className="text-sm text-red-700 font-medium mb-2">{error}</p>
+            <button onClick={fetchOrders} className="text-sm text-blue-600 hover:underline">
               Try again
             </button>
           </div>
@@ -229,144 +258,129 @@ export default function AdminPage() {
 
         {/* Empty */}
         {!loading && !error && filtered.length === 0 && (
-          <div className="text-center py-16">
-            <p className="text-gray-400 text-4xl mb-4">📋</p>
-            <p className="text-gray-600 font-medium">No orders found</p>
+          <div className="bg-white border border-slate-200 rounded-xl p-16 text-center shadow-sm">
+            <div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-4">
+              <svg className="w-6 h-6 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.5} d="M9 5H7a2 2 0 00-2 2v12a2 2 0 002 2h10a2 2 0 002-2V7a2 2 0 00-2-2h-2M9 5a2 2 0 002 2h2a2 2 0 002-2M9 5a2 2 0 012-2h2a2 2 0 012 2" />
+              </svg>
+            </div>
+            <p className="text-slate-700 font-medium">No orders found</p>
+            <p className="text-sm text-slate-400 mt-1">
+              {search || stageFilter ? 'Try adjusting your filters.' : 'No orders available.'}
+            </p>
           </div>
         )}
 
         {/* Table */}
         {!loading && !error && filtered.length > 0 && (
-          <div className="bg-white rounded-xl border border-gray-200 overflow-hidden shadow-sm">
+          <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
             <div className="overflow-x-auto">
-              <table className="w-full text-sm" style={{ minWidth: '1280px' }}>
+              <table className="w-full text-sm" style={{ minWidth: '1200px' }}>
                 <thead>
-                  <tr className="bg-gray-50 border-b border-gray-200 text-left">
-                    <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Order</th>
-                    <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Customer / Centre</th>
-                    <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Model</th>
-                    <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Order Date</th>
-                    <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Amount</th>
-                    <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Portal Stage</th>
-                    <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Delivery</th>
-                    <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Invoice</th>
-                    <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Payment</th>
-                    <th className="px-4 py-3 font-semibold text-gray-600 whitespace-nowrap">Last Updated</th>
-                    <th className="px-4 py-3 font-semibold text-gray-600 text-center whitespace-nowrap">
-                      Detail
-                    </th>
+                  <tr className="border-b border-slate-200 bg-slate-50 text-left">
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Order</th>
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Customer / Centre</th>
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Model</th>
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Date</th>
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Amount</th>
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Stage</th>
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Delivery</th>
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Invoice</th>
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Payment</th>
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Updated</th>
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider text-center whitespace-nowrap">Detail</th>
                   </tr>
                 </thead>
-                <tbody className="divide-y divide-gray-100">
-                  {filtered.map(order => {
-                    const stageColor = STAGE_COLORS[order.portal_stage] ?? 'bg-gray-100 text-gray-600';
+                <tbody className="divide-y divide-slate-100">
+                  {filtered.map(order => (
+                    <tr
+                      key={order.id}
+                      onClick={() => router.push(`/orders/${order.id}`)}
+                      className="hover:bg-slate-50 transition-colors cursor-pointer group"
+                    >
+                      <td className="px-5 py-3.5 whitespace-nowrap">
+                        <p className="font-mono text-sm font-semibold text-blue-700 group-hover:text-blue-800">
+                          {order.order_no}
+                        </p>
+                        <p className="text-xs text-slate-400 mt-0.5">{order.order_status}</p>
+                      </td>
 
-                    return (
-                      <tr
-                        key={order.id}
-                        onClick={() => router.push(`/orders/${order.id}`)}
-                        className="hover:bg-gray-50 transition-colors cursor-pointer"
-                      >
+                      <td className="px-5 py-3.5">
+                        <p className="font-medium text-slate-800 whitespace-nowrap">{order.customer ?? '—'}</p>
+                        {order.location && (
+                          <p className="text-xs text-slate-400 mt-0.5">{order.location}</p>
+                        )}
+                      </td>
 
-                        {/* Order */}
-                        <td className="px-4 py-3 whitespace-nowrap">
-                          <span className="font-mono font-semibold text-blue-700">
-                            {order.order_no}
-                          </span>
-                          <p className="text-xs text-gray-400 mt-0.5">{order.order_status}</p>
-                        </td>
+                      <td className="px-5 py-3.5 text-slate-600" style={{ maxWidth: '160px' }}>
+                        <span className="line-clamp-2">
+                          {order.model_names.length > 0 ? order.model_names.join(', ') : '—'}
+                        </span>
+                      </td>
 
-                        {/* Customer / Centre */}
-                        <td className="px-4 py-3">
-                          <p className="font-medium text-gray-900 whitespace-nowrap">
-                            {order.customer ?? '—'}
-                          </p>
-                          {order.location && (
-                            <p className="text-xs text-gray-400 mt-0.5">📍 {order.location}</p>
-                          )}
-                        </td>
+                      <td className="px-5 py-3.5 text-slate-500 whitespace-nowrap text-xs">
+                        {fmtDate(order.order_date)}
+                      </td>
 
-                        {/* Model */}
-                        <td className="px-4 py-3 text-gray-700" style={{ maxWidth: '160px' }}>
-                          {order.model_names.length > 0
-                            ? order.model_names.join(', ')
-                            : <span className="text-gray-300">&mdash;</span>}
-                        </td>
+                      <td className="px-5 py-3.5 font-semibold text-slate-900 whitespace-nowrap">
+                        {fmtAmount(order.amount_total)}
+                      </td>
 
-                        {/* Order Date */}
-                        <td className="px-4 py-3 text-gray-500 whitespace-nowrap text-xs">
-                          {fmtDate(order.order_date)}
-                        </td>
+                      <td className="px-5 py-3.5 whitespace-nowrap">
+                        <StatusChip
+                          label={order.portal_stage_label}
+                          variant={STAGE_VARIANT[order.portal_stage] ?? 'neutral'}
+                        />
+                      </td>
 
-                        {/* Amount */}
-                        <td className="px-4 py-3 font-semibold text-gray-900 whitespace-nowrap">
-                          {fmtAmount(order.amount_total)}
-                        </td>
+                      <td className="px-5 py-3.5 whitespace-nowrap">
+                        <StatusChip
+                          label={order.delivery_status}
+                          variant={DELIVERY_VARIANT[order.delivery_status] ?? 'neutral'}
+                        />
+                      </td>
 
-                        {/* Portal Stage */}
-                        <td className="px-4 py-3 whitespace-nowrap">
-                          <span className={`text-xs px-2.5 py-1 rounded-full font-semibold ${stageColor}`}>
-                            {order.portal_stage_label}
-                          </span>
-                        </td>
+                      <td className="px-5 py-3.5 whitespace-nowrap">
+                        <StatusChip
+                          label={order.invoice_status}
+                          variant={INVOICE_VARIANT[order.invoice_status] ?? 'neutral'}
+                        />
+                      </td>
 
-                        {/* Delivery */}
-                        <td className="px-4 py-3">
-                          <Badge label={order.delivery_status} colorMap={DELIVERY_COLORS} />
-                        </td>
+                      <td className="px-5 py-3.5 whitespace-nowrap">
+                        <PaymentCell order={order} />
+                      </td>
 
-                        {/* Invoice */}
-                        <td className="px-4 py-3">
-                          <Badge label={order.invoice_status} colorMap={INVOICE_COLORS} />
-                        </td>
+                      <td className="px-5 py-3.5 text-slate-400 text-xs whitespace-nowrap">
+                        {fmtDate(order.last_updated)}
+                      </td>
 
-                        {/* Payment */}
-                        <td className="px-4 py-3 whitespace-nowrap">
-                          {order.payment_overdue ? (
-                            <span className="text-red-600 font-semibold text-xs">🔴 Overdue</span>
-                          ) : order.payment_status === 'collected' ? (
-                            <span className="text-green-600 font-semibold text-xs">✅ Collected</span>
-                          ) : order.days_to_payment > 0 ? (
-                            <span className="text-amber-600 text-xs font-semibold">
-                              {order.days_to_payment}d left
-                            </span>
-                          ) : (
-                            <span className="text-gray-400 text-xs">Pending</span>
-                          )}
-                        </td>
-
-                        {/* Last Updated */}
-                        <td className="px-4 py-3 text-gray-400 text-xs whitespace-nowrap">
-                          {fmtDate(order.last_updated)}
-                        </td>
-
-                        {/* Detail link */}
-                        <td className="px-4 py-3 text-center" onClick={e => e.stopPropagation()}>
-                          <a
-                            href={`/orders/${order.id}`}
-                            className="text-xs text-blue-600 hover:underline font-medium"
-                          >
-                            View →
-                          </a>
-                        </td>
-
-                      </tr>
-                    );
-                  })}
+                      <td className="px-5 py-3.5 text-center" onClick={e => e.stopPropagation()}>
+                        <a
+                          href={`/orders/${order.id}`}
+                          className="inline-flex items-center gap-1 text-xs font-medium text-blue-600 hover:text-blue-700 border border-blue-200 hover:border-blue-300 px-2.5 py-1 rounded-md transition-all"
+                        >
+                          View
+                          <svg className="w-3 h-3" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M9 5l7 7-7 7" />
+                          </svg>
+                        </a>
+                      </td>
+                    </tr>
+                  ))}
                 </tbody>
               </table>
             </div>
 
-            <div className="px-4 py-3 border-t border-gray-100 flex items-center justify-between">
-              <p className="text-xs text-gray-400">
+            <div className="px-5 py-3 border-t border-slate-100 flex items-center justify-between bg-slate-50/50">
+              <p className="text-xs text-slate-400">
                 Showing {filtered.length} of {orders.length} orders
               </p>
-              <p className="text-xs text-gray-300">
-                Source: Odoo XML-RPC live
-              </p>
+              <p className="text-xs text-slate-300">Live · Odoo XML-RPC</p>
             </div>
           </div>
         )}
+
       </div>
     </div>
   );
