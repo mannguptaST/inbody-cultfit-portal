@@ -113,7 +113,62 @@ def _is_overdue(deadline_str: str | None, stage_id: int) -> bool:
         return False
 
 
-def _build_lead(lead: dict) -> dict:
+_SO_FIELDS = [
+    'id', 'name', 'opportunity_id',
+    'inbody_po_number', 'inbody_po_received_date', 'inbody_pi_issued_date',
+    'inbody_installation_status', 'inbody_vendor_portal_status',
+    'inbody_confirmation_mail_sent', 'inbody_md_approval_status',
+    'inbody_portal_visible_notes',
+    'amount_untaxed', 'amount_tax', 'order_line',
+]
+
+_PORTAL_STAGE_FIELD = 'inbody_portal_stage'
+
+
+def _so_for_lead(lead_id: int, models, uid) -> dict:
+    """Return the latest sale.order linked to a crm.lead, or {}."""
+    leads = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS, 'crm.lead', 'read',
+        [[lead_id]], {'fields': ['order_ids']},
+    )
+    so_ids = (leads[0].get('order_ids') or []) if leads else []
+    if not so_ids:
+        return {}
+    sos = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS, 'sale.order', 'read',
+        [so_ids[-1:]], {'fields': _SO_FIELDS},
+    )
+    return sos[0] if sos else {}
+
+
+def _so_batch(leads: list[dict], models, uid) -> dict[int, dict]:
+    """Return {lead_id: so_data} from already-fetched leads (order_ids must be present)."""
+    if not leads:
+        return {}
+    lead_to_so: dict[int, list[int]] = {}
+    all_so_ids: list[int] = []
+    for l in leads:
+        so_ids = l.get('order_ids') or []
+        lead_to_so[l['id']] = so_ids
+        all_so_ids.extend(so_ids)
+
+    if not all_so_ids:
+        return {}
+
+    sos = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS, 'sale.order', 'read',
+        [all_so_ids], {'fields': _SO_FIELDS},
+    )
+    so_map: dict[int, dict] = {s['id']: s for s in sos}
+
+    result: dict[int, dict] = {}
+    for lead_id, so_ids in lead_to_so.items():
+        if so_ids:
+            result[lead_id] = so_map.get(so_ids[-1], {})
+    return result
+
+
+def _build_lead(lead: dict, so: dict | None = None) -> dict:
     stage_id_val = lead.get('stage_id')
     stage_id     = stage_id_val[0] if stage_id_val else 0
     stage_label  = stage_id_val[1] if stage_id_val else ''
@@ -162,14 +217,14 @@ def _build_lead(lead: dict) -> dict:
         'payment_overdue':  payment_overdue,
         'payment_due_date': deadline_str,
         'days_to_payment':  days_to_payment,
-        'installation_status': 'not_started',
-        'vendor_portal_status': 'not_uploaded',
-        'confirmation_mail_sent': False,
-        'portal_notes': '',
-        'po_number': None,
-        'po_received_date': None,
-        'pi_issued_date': None,
-        'md_approval_status': 'pending',
+        'installation_status': (so or {}).get('inbody_installation_status') or 'not_started',
+        'vendor_portal_status': (so or {}).get('inbody_vendor_portal_status') or 'not_uploaded',
+        'confirmation_mail_sent': bool((so or {}).get('inbody_confirmation_mail_sent', False)),
+        'portal_notes': (so or {}).get('inbody_portal_visible_notes') or '',
+        'po_number': (so or {}).get('inbody_po_number') or None,
+        'po_received_date': _parse_date((so or {}).get('inbody_po_received_date')),
+        'pi_issued_date': _parse_date((so or {}).get('inbody_pi_issued_date')),
+        'md_approval_status': (so or {}).get('inbody_md_approval_status') or 'pending',
         'crm_stage': stage_label,
         'deal_status': deal_status_name or '',
         'salesperson': (lead['user_id'][1] if lead.get('user_id') else None),
@@ -182,6 +237,7 @@ _LEAD_FIELDS = [
     'deal_type', 'date_deadline', 'create_date', 'write_date',
     'user_id', 'x_studio_machine_installed_at', 'city',
     'payment_term_id', 'forecasted_amt', 'won_status', 'is_credit_deal',
+    'order_ids',
 ]
 
 
@@ -199,7 +255,8 @@ def _sync_fetch_cultfit_orders(partner_id: int = 0) -> dict:
         {'fields': _LEAD_FIELDS, 'order': 'id desc', 'limit': 200},
     )
 
-    result = [_build_lead(l) for l in leads]
+    so_map = _so_batch(leads, models, uid)
+    result = [_build_lead(l, so_map.get(l['id'])) for l in leads]
     return {'orders': result, 'count': len(result)}
 
 
@@ -223,7 +280,8 @@ def _sync_fetch_cultfit_order_by_id(order_id: int, partner_id: int = 0) -> dict 
 
     if not leads:
         return None
-    return _build_lead(leads[0])
+    so = _so_for_lead(leads[0]['id'], models, uid)
+    return _build_lead(leads[0], so)
 
 
 async def fetch_cultfit_order_by_id(order_id: int, partner_id: int = 0) -> dict | None:
@@ -346,11 +404,54 @@ async def set_cultfit_stage(
     )
 
 
+_DEAL_FIELD_MAP = {
+    'installation_status':    'inbody_installation_status',
+    'vendor_portal_status':   'inbody_vendor_portal_status',
+    'confirmation_mail_sent': 'inbody_confirmation_mail_sent',
+    'md_approval_status':     'inbody_md_approval_status',
+}
+
+
+def _sync_update_cultfit_deal_fields(
+    order_id: int, updates: dict, changed_by: str = '', reason: str = ''
+) -> dict:
+    uid, models = _connect()
+
+    # Get linked sale.orders
+    leads = models.execute_kw(
+        ODOO_DB, uid, ODOO_PASS, 'crm.lead', 'read',
+        [[order_id]], {'fields': ['order_ids']},
+    )
+    so_ids = (leads[0].get('order_ids') or []) if leads else []
+
+    so_vals: dict = {}
+    for portal_key, odoo_field in _DEAL_FIELD_MAP.items():
+        if portal_key in updates:
+            so_vals[odoo_field] = updates[portal_key]
+
+    if so_ids and so_vals:
+        models.execute_kw(
+            ODOO_DB, uid, ODOO_PASS, 'sale.order', 'write',
+            [so_ids, so_vals],
+        )
+
+    if reason and so_ids:
+        note_body = f"<p><b>Portal update by {changed_by}:</b> {reason}</p>"
+        for so_id in so_ids:
+            models.execute_kw(
+                ODOO_DB, uid, ODOO_PASS, 'sale.order', 'message_post',
+                [[so_id]], {'body': note_body},
+            )
+
+    return {'order_id': order_id, 'updated': list(so_vals.keys())}
+
+
 async def update_cultfit_deal_fields(
     order_id: int, updates: dict, changed_by: str = '', reason: str = ''
 ) -> dict:
-    """Stub — deal field write-back not yet mapped for live Odoo."""
-    return {'order_id': order_id, 'updated': []}
+    return await asyncio.to_thread(
+        _sync_update_cultfit_deal_fields, order_id, updates, changed_by, reason
+    )
 
 
 # ── Odoo attachment download ───────────────────────────────────────────────────
