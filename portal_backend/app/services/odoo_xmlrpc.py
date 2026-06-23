@@ -217,14 +217,49 @@ def _build_lead(lead: dict, so: dict | None = None) -> dict:
         'payment_overdue':  payment_overdue,
         'payment_due_date': deadline_str,
         'days_to_payment':  days_to_payment,
-        'installation_status': (so or {}).get('inbody_installation_status') or 'not_started',
-        'vendor_portal_status': (so or {}).get('inbody_vendor_portal_status') or 'not_uploaded',
-        'confirmation_mail_sent': bool((so or {}).get('inbody_confirmation_mail_sent', False)),
-        'portal_notes': (so or {}).get('inbody_portal_visible_notes') or '',
-        'po_number': (so or {}).get('inbody_po_number') or None,
-        'po_received_date': _parse_date((so or {}).get('inbody_po_received_date')),
-        'pi_issued_date': _parse_date((so or {}).get('inbody_pi_issued_date')),
-        'md_approval_status': (so or {}).get('inbody_md_approval_status') or 'pending',
+        # Status fields: prefer linked sale.order; fall back to Studio fields on crm.lead itself
+        'installation_status': (
+            (so or {}).get('inbody_installation_status')
+            or lead.get('x_studio_installation_status')
+            or 'not_started'
+        ),
+        'vendor_portal_status': (
+            (so or {}).get('inbody_vendor_portal_status')
+            or lead.get('x_studio_vendor_portal_status')
+            or 'not_uploaded'
+        ),
+        'confirmation_mail_sent': bool(
+            (so or {}).get('inbody_confirmation_mail_sent')
+            or lead.get('x_studio_confirmation_mail_sent')
+            or False
+        ),
+        'portal_notes': (
+            (so or {}).get('inbody_portal_visible_notes')
+            or lead.get('x_studio_portal_notes')
+            or ''
+        ),
+        'po_number': (
+            (so or {}).get('inbody_po_number')
+            or lead.get('x_studio_po_number')
+            or lead.get('x_studio_client_po_number')
+            or None
+        ),
+        'po_received_date': _parse_date(
+            (so or {}).get('inbody_po_received_date')
+            or lead.get('x_studio_po_received_date')
+            or lead.get('x_studio_po_date')
+        ),
+        'pi_issued_date': _parse_date(
+            (so or {}).get('inbody_pi_issued_date')
+            or lead.get('x_studio_pi_issued_date')
+            or lead.get('x_studio_pi_date')
+        ),
+        'md_approval_status': (
+            (so or {}).get('inbody_md_approval_status')
+            or lead.get('x_studio_md_approval_status')
+            or lead.get('x_studio_md_approval')
+            or 'pending'
+        ),
         'crm_stage': stage_label,
         'deal_status': deal_status_name or '',
         'salesperson': (lead['user_id'][1] if lead.get('user_id') else None),
@@ -238,6 +273,15 @@ _LEAD_FIELDS = [
     'user_id', 'x_studio_machine_installed_at', 'city',
     'payment_term_id', 'forecasted_amt', 'won_status', 'is_credit_deal',
     'order_ids',
+    # Studio / custom fields that may exist directly on crm.lead
+    'x_studio_po_number', 'x_studio_client_po_number',
+    'x_studio_po_received_date', 'x_studio_po_date',
+    'x_studio_pi_issued_date', 'x_studio_pi_date',
+    'x_studio_installation_status',
+    'x_studio_vendor_portal_status',
+    'x_studio_confirmation_mail_sent',
+    'x_studio_md_approval_status', 'x_studio_md_approval',
+    'x_studio_portal_notes',
 ]
 
 
