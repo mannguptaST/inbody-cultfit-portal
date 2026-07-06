@@ -35,9 +35,8 @@ const ADMIN_PASS    = process.env.PORTAL_ADMIN_PASS    ?? '';
 const CUSTOMER_PASS = process.env.PORTAL_CUSTOMER_PASS ?? '';
 
 export const PORTAL_USERS = [
-  { id: 1, email: 'admin@inbody.com',    role: 'admin' as const,    name: 'InBody Admin', password: ADMIN_PASS,    partner_id: 0 },
-  { id: 2, email: 'guru@cultfittest.in', role: 'customer' as const, name: 'Guru',         password: CUSTOMER_PASS, partner_id: 0 },
-  { id: 3, email: 'vijay@cultfittest.in',role: 'customer' as const, name: 'Vijay',        password: CUSTOMER_PASS, partner_id: 0 },
+  { id: 1, email: 'admin@inbody.com',     role: 'admin' as const,    name: 'InBody Admin', password: ADMIN_PASS,    partner_id: 0 },
+  { id: 2, email: 'cultfit@curefit.com',  role: 'customer' as const, name: 'CultFit',      password: CUSTOMER_PASS, partner_id: 0 },
 ];
 
 export function findUser(email: string) {
