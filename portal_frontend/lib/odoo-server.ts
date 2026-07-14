@@ -246,7 +246,7 @@ const LEAD_FIELDS = [
   'id', 'name', 'partner_id', 'stage_id', 'deal_status_id',
   'deal_type', 'date_deadline', 'create_date', 'write_date',
   'user_id', 'x_studio_machine_installed_at', 'city',
-  'payment_term_id', 'forecasted_amt', 'won_status', 'is_credit_deal', 'order_ids',
+  'payment_term_id', 'expected_revenue', 'won_status', 'is_credit_deal', 'order_ids',
 ];
 
 const SO_FIELDS = ['id', 'name', 'opportunity_id', 'amount_untaxed', 'amount_tax', 'order_line'];
@@ -294,7 +294,7 @@ function buildLead(lead: Record<string, unknown>): Record<string, unknown> {
     model_names:  [],
     order_date:   parseDate(lead.create_date),
     last_updated: parseDate(lead.write_date),
-    amount_total: lead.forecasted_amt || 0,
+    amount_total: lead.expected_revenue || 0,
     amount_untaxed: 0,
     amount_tax:   0,
     currency:     'INR',
