@@ -1,26 +1,28 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { requireAuth } from '@/lib/auth-server';
-import { fetchCultFitOrderById } from '@/lib/odoo-server';
+import { requireAuthUser } from '@/lib/auth-server';
+import { fetchCultFitOrderById, PartnerNotMappedError, type Authz } from '@/lib/odoo-server';
 
 export async function GET(
   req: NextRequest,
   { params }: { params: Promise<{ id: string }> },
 ) {
-  const payload = requireAuth(req.headers.get('authorization'));
-  if (!payload) return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
+  const user = requireAuthUser(req);
+  if (!user) return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
 
   const { id } = await params;
   const orderId = parseInt(id, 10);
   if (isNaN(orderId)) return NextResponse.json({ detail: 'Invalid order ID' }, { status: 400 });
 
   try {
-    const partnerId = Number(payload.partner_id) || 0;
-    const order = await fetchCultFitOrderById(orderId, partnerId);
+    const authz: Authz = user.role === 'admin' ? { role: 'admin' } : { role: 'customer', scope: user.scope };
+    const order = await fetchCultFitOrderById(orderId, authz);
     if (!order) return NextResponse.json({ detail: 'Order not found' }, { status: 404 });
     return NextResponse.json(order);
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : 'Failed to fetch order';
-    console.error('[order detail]', msg);
-    return NextResponse.json({ detail: msg }, { status: 503 });
+    if (e instanceof PartnerNotMappedError) {
+      return NextResponse.json({ detail: e.message }, { status: 403 });
+    }
+    console.error('[order detail]', e instanceof Error ? e.message : e);
+    return NextResponse.json({ detail: 'Failed to fetch order. Please try again later.' }, { status: 503 });
   }
 }

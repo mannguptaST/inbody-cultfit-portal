@@ -4,7 +4,7 @@ import { useState, useEffect } from 'react';
 import Image from 'next/image';
 import { useRouter } from 'next/navigation';
 import { portalLogin } from '@/lib/api';
-import { saveSession, isLoggedIn, getUserRole } from '@/lib/auth';
+import { fetchCurrentUser, isInBodyStaff } from '@/lib/auth';
 
 export default function LoginPage() {
   const router = useRouter();
@@ -14,12 +14,12 @@ export default function LoginPage() {
   const [loading, setLoading]   = useState(false);
   const [showPass, setShowPass] = useState(false);
 
-  // Already logged in → go to correct page based on role
+  // Already logged in (valid session cookie) → go to correct page based on role
   useEffect(() => {
-    if (!isLoggedIn()) return;
-    const role = getUserRole();
-    const isStaff = role === 'admin' || role === 'inbody_manager' || role === 'inbody_user';
-    router.replace(isStaff ? '/admin' : '/dashboard');
+    fetchCurrentUser().then(user => {
+      if (!user) return;
+      router.replace(isInBodyStaff(user.role) ? '/admin' : '/dashboard');
+    });
   }, [router]);
 
   async function handleSubmit(e: React.FormEvent) {
@@ -27,10 +27,10 @@ export default function LoginPage() {
     setError('');
     setLoading(true);
     try {
+      // The login API sets the session as an httpOnly cookie itself — there is
+      // no token in this response to store, the browser already has it.
       const res = await portalLogin(email.trim(), password);
-      saveSession(res.token, res.user);
-      const isStaff = res.user.role === 'admin' || res.user.role === 'inbody_manager' || res.user.role === 'inbody_user';
-      router.replace(isStaff ? '/admin' : '/dashboard');
+      router.replace(isInBodyStaff(res.user.role) ? '/admin' : '/dashboard');
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Login failed. Please try again.');
     } finally {

@@ -1,9 +1,36 @@
 // auth-server.ts — Server-only JWT + user store.
 // Never import this on the client side.
 
+import 'server-only';
 import { createHmac, timingSafeEqual } from 'crypto';
+import type { NextRequest, NextResponse } from 'next/server';
 
 const JWT_SECRET = process.env.JWT_SECRET ?? 'dev-secret-CHANGE-IN-PRODUCTION';
+
+// The session token lives only in an httpOnly cookie — never in localStorage,
+// never in a JSON response body, never readable by client-side JS.
+export const SESSION_COOKIE = 'portal_session';
+const SESSION_MAX_AGE_SECONDS = 7 * 86_400;
+
+export function setSessionCookie(res: NextResponse, token: string): void {
+  res.cookies.set(SESSION_COOKIE, token, {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: SESSION_MAX_AGE_SECONDS,
+  });
+}
+
+export function clearSessionCookie(res: NextResponse): void {
+  res.cookies.set(SESSION_COOKIE, '', {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'lax',
+    path: '/',
+    maxAge: 0,
+  });
+}
 
 function b64url(buf: Buffer): string {
   return buf.toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
@@ -12,7 +39,7 @@ function b64url(buf: Buffer): string {
 export function signJwt(payload: Record<string, unknown>): string {
   const header = b64url(Buffer.from(JSON.stringify({ alg: 'HS256', typ: 'JWT' })));
   const now    = Math.floor(Date.now() / 1000);
-  const body   = b64url(Buffer.from(JSON.stringify({ ...payload, iat: now, exp: now + 7 * 86_400 })));
+  const body   = b64url(Buffer.from(JSON.stringify({ ...payload, iat: now, exp: now + SESSION_MAX_AGE_SECONDS })));
   const sig    = b64url(createHmac('sha256', JWT_SECRET).update(`${header}.${body}`).digest());
   return `${header}.${body}.${sig}`;
 }
@@ -34,9 +61,34 @@ export function verifyJwt(token: string): Record<string, unknown> | null {
 const ADMIN_PASS    = process.env.PORTAL_ADMIN_PASS    ?? '';
 const CUSTOMER_PASS = process.env.PORTAL_CUSTOMER_PASS ?? '';
 
-export const PORTAL_USERS = [
-  { id: 1, email: 'admin@inbody.com',     role: 'admin' as const,    name: 'InBody Admin', password: ADMIN_PASS,    partner_id: 0 },
-  { id: 2, email: 'cultfit@curefit.com',  role: 'customer' as const, name: 'CultFit',      password: CUSTOMER_PASS, partner_id: 0 },
+// A customer's data access is scoped one of two ways — never by trusting a
+// partner id supplied by the client, always resolved server-side from here:
+//   - 'cultfit_domain': the same CultFit/Curefit name-matching domain admin
+//     sees, resolved fresh on every request. Used when a customer legitimately
+//     represents the whole CultFit relationship across all of its ~45 regional
+//     Odoo commercial-partner entities — new regions show up with no config
+//     change needed.
+//   - 'partner_ids': a fixed, explicit allowlist of Odoo commercial partner
+//     ids. Use this for a future customer who should see only specific
+//     partner(s), not the whole CultFit-style domain.
+export type CustomerScope =
+  | { kind: 'cultfit_domain' }
+  | { kind: 'partner_ids'; partnerIds: number[] };
+
+interface PortalUser {
+  id: number;
+  email: string;
+  role: 'admin' | 'customer';
+  name: string;
+  password: string;
+  // Only meaningful for role === 'customer'. Missing/absent scope for a
+  // customer account must never fall back to broad access — see odoo-server.ts.
+  scope?: CustomerScope;
+}
+
+export const PORTAL_USERS: PortalUser[] = [
+  { id: 1, email: 'admin@inbody.com',    role: 'admin',    name: 'InBody Admin', password: ADMIN_PASS },
+  { id: 2, email: 'cultfit@curefit.com', role: 'customer', name: 'CultFit',      password: CUSTOMER_PASS, scope: { kind: 'cultfit_domain' } },
 ];
 
 export function findUser(email: string) {
@@ -53,7 +105,25 @@ export function checkPassword(plain: string, stored: string): boolean {
   try { return timingSafeEqual(a, b); } catch { return false; }
 }
 
-export function requireAuth(authHeader: string | null): Record<string, unknown> | null {
-  if (!authHeader?.startsWith('Bearer ')) return null;
-  return verifyJwt(authHeader.slice(7));
+export interface AuthedUser {
+  id: number;
+  email: string;
+  role: 'admin' | 'customer';
+  name: string;
+  scope?: CustomerScope;
+}
+
+// Reads the session token from the httpOnly cookie (never a header, never
+// anything the client could set directly), verifies it, then re-resolves
+// the user's current role/scope from PORTAL_USERS — every protected route
+// uses this so authorization always reflects live config, never a claim
+// baked into a token that may be valid for up to 7 days.
+export function requireAuthUser(req: NextRequest): AuthedUser | null {
+  const token = req.cookies.get(SESSION_COOKIE)?.value;
+  if (!token) return null;
+  const payload = verifyJwt(token);
+  if (!payload) return null;
+  const user = findUser(String(payload.email ?? ''));
+  if (!user) return null;
+  return { id: user.id, email: user.email, role: user.role, name: user.name, scope: user.scope };
 }

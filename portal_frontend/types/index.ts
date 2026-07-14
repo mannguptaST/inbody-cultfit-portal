@@ -9,59 +9,17 @@ export interface User {
 }
 
 export interface LoginResponse {
-  token: string;
-  expires_in: number;
+  // No token here by design — the session lives only in an httpOnly cookie
+  // set directly by the login API route, never readable by client JS.
   user: User;
 }
 
-export type OrderStage =
-  | 'stage_1_order_received'
-  | 'stage_2_pi_issued'
-  | 'stage_3_po_received'
-  | 'stage_4_md_approved'
-  | 'stage_5_dispatched'
-  | 'stage_6_installation_confirmed'
-  | 'stage_7_vendor_uploaded'
-  | 'stage_8_confirmation_sent'
-  | 'stage_9_payment_collected';
-
-export type PaymentStatus = 'pending' | 'partial' | 'collected';
-export type VendorPortalStatus = 'pending' | 'uploaded';
-export type InstallationStatus = 'pending' | 'scheduled' | 'confirmed';
-export type CocoFofoType = 'coco' | 'fofo';
-
-export interface Order {
-  id: number;
-  name: string;
-  centre_name: string;
-  customer: string;
-  coco_fofo_type: CocoFofoType;
-  portal_stage: OrderStage;
-  portal_stage_label: string;
-  date_order: string | null;
-  amount_total?: number;
-  currency: string;
-  payment_due_date: string | null;
-  days_to_payment: number;
-  payment_overdue: boolean;
-  payment_status: PaymentStatus;
-  vendor_portal_status: VendorPortalStatus;
-  installation_status: InstallationStatus;
-  portal_notes: string;
-  // Detail-only fields (not in list)
-  po_number?: string;
-  po_received_date?: string | null;
-  pi_issued_date?: string | null;
-  md_approval_status?: 'pending' | 'approved' | 'rejected';
-  vendor_portal_upload_date?: string | null;
-  installation_date?: string | null;
-  confirmation_mail_sent?: boolean;
-}
-
-export interface OrdersResponse {
-  orders: Order[];
-  count: number;
-}
+// FOFO/COCO masking is NOT implemented: no field on crm.lead or sale.order in
+// production Odoo encodes it (confirmed via fields_get — see
+// PORTAL_SECURITY_AND_TESTING.md). There used to be types here
+// (CocoFofoType, plus the old sale.order-shaped Order/OrdersResponse/
+// TimelineResponse from the deleted FastAPI backend) that referenced fields
+// nothing in this app ever populates — removed rather than left dangling.
 
 export type TimelineStatus = 'done' | 'pending' | 'rejected';
 
@@ -71,29 +29,6 @@ export interface TimelineStage {
   status: TimelineStatus;
   date: string | null;
   icon: string;
-}
-
-export interface TimelineResponse {
-  order_id: number;
-  order_name: string;
-  current_stage: number;
-  coco_fofo_type: CocoFofoType;
-  timeline: TimelineStage[];
-}
-
-export interface Document {
-  id: number;
-  name: string;
-  mimetype: string;
-  size: number;
-  date: string | null;
-  download_url: string;
-}
-
-export interface DocumentsResponse {
-  order_id: number;
-  documents: Document[];
-  count: number;
 }
 
 export interface ApiError {
@@ -135,6 +70,10 @@ export interface CultFitOrder {
   po_received_date: string | null;
   pi_issued_date: string | null;
   md_approval_status: string;
+  crm_stage: string;
+  deal_status: string;
+  salesperson: string | null;
+  expected_closing: string | null;
 }
 
 export interface CultFitOrdersResponse {

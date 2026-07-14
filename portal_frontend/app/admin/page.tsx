@@ -1,55 +1,33 @@
 'use client';
 
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useState, useCallback, useMemo } from 'react';
 import { useRouter } from 'next/navigation';
 import { getCultFitOrders } from '@/lib/api';
-import { isLoggedIn, getUser, clearSession, isInBodyStaff } from '@/lib/auth';
+import { fetchCurrentUser, isInBodyStaff, logout } from '@/lib/auth';
+import { STAGE_LABELS, STAGE_KEYS, STAGE_VARIANT, DELIVERY_VARIANT, INVOICE_VARIANT } from '@/lib/stage-config';
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
-import type { CultFitOrder } from '@/types';
+import type { CultFitOrder, User } from '@/types';
 
-// ── Stage config ──────────────────────────────────────────────────────────────
+// ── Config ────────────────────────────────────────────────────────────────────
 
-const STAGE_LABELS: Record<string, string> = {
-  new:                'New',
-  po_received:        'PO Received',
-  pi_shared:          'PI Shared',
-  dispatch_requested: 'Dispatch Requested',
-  dispatched:         'Dispatched',
-  delivered:          'Delivered (Not Installed)',
-  server_updated:     'Server Updated',
-  deal_closed:        'Deal Closed',
-};
+const PAGE_SIZE = 25;
 
-const STAGE_KEYS = Object.keys(STAGE_LABELS);
+type SortKey = 'updated_desc' | 'updated_asc' | 'amount_desc' | 'deadline_asc';
 
-type ChipVariant = 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'teal' | 'indigo' | 'orange' | 'purple';
+const SORT_OPTIONS: Array<{ value: SortKey; label: string }> = [
+  { value: 'updated_desc', label: 'Latest updated' },
+  { value: 'updated_asc', label: 'Oldest updated' },
+  { value: 'amount_desc', label: 'Amount (high to low)' },
+  { value: 'deadline_asc', label: 'Payment deadline' },
+];
 
-const STAGE_VARIANT: Record<string, ChipVariant> = {
-  new:                'neutral',
-  po_received:        'indigo',
-  pi_shared:          'info',
-  dispatch_requested: 'warning',
-  dispatched:         'warning',
-  delivered:          'orange',
-  server_updated:     'teal',
-  deal_closed:        'success',
-};
-
-const DELIVERY_VARIANT: Record<string, ChipVariant> = {
-  'No Delivery':          'neutral',
-  'Pending':              'warning',
-  'Ready to Dispatch':    'info',
-  'Partially Dispatched': 'orange',
-  'Delivered':            'success',
-};
-
-const INVOICE_VARIANT: Record<string, ChipVariant> = {
-  'Nothing to Invoice':    'neutral',
-  'To Invoice':            'info',
-  'Invoiced':              'success',
-  'Upselling Opportunity': 'purple',
-};
+const PAYMENT_FILTERS = [
+  { value: '', label: 'All Payments' },
+  { value: 'overdue', label: 'Overdue' },
+  { value: 'pending', label: 'Pending' },
+  { value: 'collected', label: 'Collected' },
+];
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -63,6 +41,36 @@ function fmtAmount(amount: number | null | undefined): string {
   return '₹' + amount.toLocaleString('en-IN');
 }
 
+function fmtTime(d: Date | null): string {
+  if (!d) return '—';
+  return d.toLocaleTimeString('en-IN', { hour: 'numeric', minute: '2-digit' });
+}
+
+function paymentBucket(o: CultFitOrder): 'overdue' | 'collected' | 'pending' {
+  if (o.payment_overdue) return 'overdue';
+  if (o.payment_status === 'collected') return 'collected';
+  return 'pending';
+}
+
+function sortOrders(orders: CultFitOrder[], sort: SortKey): CultFitOrder[] {
+  const copy = [...orders];
+  switch (sort) {
+    case 'updated_asc':
+      return copy.sort((a, b) => (a.last_updated ?? '').localeCompare(b.last_updated ?? ''));
+    case 'amount_desc':
+      return copy.sort((a, b) => (b.amount_total ?? 0) - (a.amount_total ?? 0));
+    case 'deadline_asc':
+      return copy.sort((a, b) => {
+        if (!a.payment_due_date) return 1;
+        if (!b.payment_due_date) return -1;
+        return a.payment_due_date.localeCompare(b.payment_due_date);
+      });
+    case 'updated_desc':
+    default:
+      return copy.sort((a, b) => (b.last_updated ?? '').localeCompare(a.last_updated ?? ''));
+  }
+}
+
 function PaymentCell({ order }: { order: CultFitOrder }) {
   if (order.payment_overdue)
     return <span className="text-xs font-semibold text-red-600">Overdue</span>;
@@ -71,6 +79,22 @@ function PaymentCell({ order }: { order: CultFitOrder }) {
   if (order.days_to_payment > 0)
     return <span className="text-xs font-medium text-amber-600">{order.days_to_payment}d left</span>;
   return <span className="text-xs text-slate-400">Pending</span>;
+}
+
+function SkeletonRows() {
+  return (
+    <div className="divide-y divide-slate-100">
+      {Array.from({ length: 8 }).map((_, i) => (
+        <div key={i} className="px-5 py-4 flex items-center gap-6 animate-pulse">
+          <div className="h-4 bg-slate-100 rounded w-24" />
+          <div className="h-4 bg-slate-100 rounded w-32 hidden sm:block" />
+          <div className="h-4 bg-slate-100 rounded w-20 hidden md:block" />
+          <div className="h-4 bg-slate-100 rounded w-16 ml-auto" />
+          <div className="h-5 bg-slate-100 rounded-full w-24" />
+        </div>
+      ))}
+    </div>
+  );
 }
 
 // ── Page ──────────────────────────────────────────────────────────────────────
@@ -82,13 +106,21 @@ export default function AdminPage() {
   const [error, setError]             = useState('');
   const [search, setSearch]           = useState('');
   const [stageFilter, setStageFilter] = useState('');
-  const [user, setUser]               = useState<ReturnType<typeof getUser>>(null);
+  const [paymentFilter, setPaymentFilter] = useState('');
+  const [salespersonFilter, setSalespersonFilter] = useState('');
+  const [sort, setSort]               = useState<SortKey>('updated_desc');
+  const [page, setPage]               = useState(1);
+  const [lastRefreshed, setLastRefreshed] = useState<Date | null>(null);
+  const [user, setUser]               = useState<User | null>(null);
 
+  // Middleware already gates page access server-side; this fetch is purely
+  // to get the user's name/role for display.
   useEffect(() => {
-    if (!isLoggedIn()) { router.replace('/login'); return; }
-    const u = getUser();
-    setUser(u);
-    if (!isInBodyStaff()) { router.replace('/dashboard'); }
+    fetchCurrentUser().then(u => {
+      if (!u) { router.replace('/login'); return; }
+      setUser(u);
+      if (!isInBodyStaff(u.role)) router.replace('/dashboard');
+    });
   }, [router]);
 
   const fetchOrders = useCallback(async () => {
@@ -97,6 +129,7 @@ export default function AdminPage() {
     try {
       const res = await getCultFitOrders();
       setOrders(res.orders);
+      setLastRefreshed(new Date());
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to load orders.');
     } finally {
@@ -104,29 +137,46 @@ export default function AdminPage() {
     }
   }, []);
 
+  // eslint-disable-next-line react-hooks/set-state-in-effect -- standard fetch-on-mount; loading already starts true
   useEffect(() => { fetchOrders(); }, [fetchOrders]);
 
-  function handleLogout() {
-    clearSession();
+  async function handleLogout() {
+    await logout();
     router.replace('/login');
   }
 
-  const filtered = orders.filter(o => {
-    const q = search.toLowerCase();
-    const matchSearch =
-      !q ||
-      o.order_no.toLowerCase().includes(q) ||
-      (o.location ?? '').toLowerCase().includes(q) ||
-      (o.customer ?? '').toLowerCase().includes(q) ||
-      o.model_names.some(m => m.toLowerCase().includes(q)) ||
-      (o.portal_stage_label ?? '').toLowerCase().includes(q);
-    const matchStage = !stageFilter || o.portal_stage === stageFilter;
-    return matchSearch && matchStage;
-  });
+  const salespeople = useMemo(
+    () => [...new Set(orders.map(o => o.salesperson).filter((s): s is string => Boolean(s)))],
+    [orders],
+  );
+
+  const filtered = sortOrders(
+    orders.filter(o => {
+      const q = search.toLowerCase();
+      const matchSearch =
+        !q ||
+        o.order_no.toLowerCase().includes(q) ||
+        (o.location ?? '').toLowerCase().includes(q) ||
+        (o.customer ?? '').toLowerCase().includes(q) ||
+        o.model_names.some(m => m.toLowerCase().includes(q)) ||
+        (o.portal_stage_label ?? '').toLowerCase().includes(q);
+      const matchStage = !stageFilter || o.portal_stage === stageFilter;
+      const matchPayment = !paymentFilter || paymentBucket(o) === paymentFilter;
+      const matchSalesperson = !salespersonFilter || o.salesperson === salespersonFilter;
+      return matchSearch && matchStage && matchPayment && matchSalesperson;
+    }),
+    sort,
+  );
+
+  const totalPages = Math.max(1, Math.ceil(filtered.length / PAGE_SIZE));
+  const pageSafe = Math.min(page, totalPages);
+  const pageItems = filtered.slice((pageSafe - 1) * PAGE_SIZE, pageSafe * PAGE_SIZE);
 
   const overdue   = orders.filter(o => o.payment_overdue).length;
   const collected = orders.filter(o => o.payment_status === 'collected').length;
   const pending   = orders.filter(o => o.payment_status !== 'collected').length;
+
+  const hasFilters = Boolean(search || stageFilter || paymentFilter || salespersonFilter);
 
   const stats = [
     {
@@ -182,7 +232,7 @@ export default function AdminPage() {
         role="STAFF"
         userName={user?.name}
         search={search}
-        onSearchChange={setSearch}
+        onSearchChange={v => { setSearch(v); setPage(1); }}
         onRefresh={fetchOrders}
         onLogout={handleLogout}
       />
@@ -209,21 +259,49 @@ export default function AdminPage() {
           ))}
         </div>
 
-        {/* Controls row: stage filter + result count */}
-        <div className="flex flex-col sm:flex-row items-start sm:items-center gap-3 mb-5">
+        {/* Controls row */}
+        <div className="flex flex-wrap items-center gap-3 mb-5">
           <select
             value={stageFilter}
-            onChange={e => setStageFilter(e.target.value)}
-            className="text-sm border border-slate-200 rounded-lg px-3 py-2 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 min-w-[180px]"
+            onChange={e => { setStageFilter(e.target.value); setPage(1); }}
+            className="text-sm border border-slate-200 rounded-lg px-3 py-2 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 min-w-[160px]"
           >
             <option value="">All Stages</option>
             {STAGE_KEYS.map(k => (
               <option key={k} value={k}>{STAGE_LABELS[k]}</option>
             ))}
           </select>
-          {(search || stageFilter) && (
+          <select
+            value={paymentFilter}
+            onChange={e => { setPaymentFilter(e.target.value); setPage(1); }}
+            className="text-sm border border-slate-200 rounded-lg px-3 py-2 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 min-w-[150px]"
+          >
+            {PAYMENT_FILTERS.map(f => (
+              <option key={f.value} value={f.value}>{f.label}</option>
+            ))}
+          </select>
+          {salespeople.length > 0 && (
+            <select
+              value={salespersonFilter}
+              onChange={e => { setSalespersonFilter(e.target.value); setPage(1); }}
+              className="text-sm border border-slate-200 rounded-lg px-3 py-2 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 min-w-[160px]"
+            >
+              <option value="">All Salespeople</option>
+              {salespeople.map(s => <option key={s} value={s}>{s}</option>)}
+            </select>
+          )}
+          <select
+            value={sort}
+            onChange={e => { setSort(e.target.value as SortKey); setPage(1); }}
+            className="text-sm border border-slate-200 rounded-lg px-3 py-2 bg-white text-slate-700 focus:outline-none focus:ring-2 focus:ring-blue-500 min-w-[170px]"
+          >
+            {SORT_OPTIONS.map(o => (
+              <option key={o.value} value={o.value}>Sort: {o.label}</option>
+            ))}
+          </select>
+          {hasFilters && (
             <button
-              onClick={() => { setSearch(''); setStageFilter(''); }}
+              onClick={() => { setSearch(''); setStageFilter(''); setPaymentFilter(''); setSalespersonFilter(''); setPage(1); }}
               className="text-xs text-blue-600 hover:text-blue-700 underline"
             >
               Clear filters
@@ -236,18 +314,15 @@ export default function AdminPage() {
           )}
         </div>
 
-        {/* Loading */}
+        {/* Loading skeleton */}
         {loading && (
-          <div className="flex items-center justify-center py-24">
-            <div className="text-center">
-              <div className="animate-spin w-7 h-7 border-2 border-blue-600 border-t-transparent rounded-full mx-auto mb-3" />
-              <p className="text-sm text-slate-500">Loading orders...</p>
-            </div>
+          <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
+            <SkeletonRows />
           </div>
         )}
 
         {/* Error */}
-        {error && (
+        {!loading && error && (
           <div className="bg-red-50 border border-red-200 rounded-xl p-6 text-center">
             <p className="text-sm text-red-700 font-medium mb-2">{error}</p>
             <button onClick={fetchOrders} className="text-sm text-blue-600 hover:underline">
@@ -266,7 +341,7 @@ export default function AdminPage() {
             </div>
             <p className="text-slate-700 font-medium">No orders found</p>
             <p className="text-sm text-slate-400 mt-1">
-              {search || stageFilter ? 'Try adjusting your filters.' : 'No orders available.'}
+              {hasFilters ? 'Try adjusting your filters.' : 'No orders available.'}
             </p>
           </div>
         )}
@@ -292,7 +367,7 @@ export default function AdminPage() {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-slate-100">
-                  {filtered.map(order => (
+                  {pageItems.map(order => (
                     <tr
                       key={order.id}
                       onClick={() => router.push(`/orders/${order.id}`)}
@@ -372,11 +447,30 @@ export default function AdminPage() {
               </table>
             </div>
 
-            <div className="px-5 py-3 border-t border-slate-100 flex items-center justify-between bg-slate-50/50">
+            <div className="px-5 py-3 border-t border-slate-100 flex flex-wrap items-center gap-3 justify-between bg-slate-50/50">
               <p className="text-xs text-slate-400">
-                Showing {filtered.length} of {orders.length} orders
+                Showing {(pageSafe - 1) * PAGE_SIZE + 1}–{Math.min(pageSafe * PAGE_SIZE, filtered.length)} of {filtered.length}
+                {' '}· Last refreshed {fmtTime(lastRefreshed)} · Live · Odoo XML-RPC
               </p>
-              <p className="text-xs text-slate-300">Live · Odoo XML-RPC</p>
+              {totalPages > 1 && (
+                <div className="flex items-center gap-1">
+                  <button
+                    onClick={() => setPage(p => Math.max(1, p - 1))}
+                    disabled={pageSafe === 1}
+                    className="text-xs px-2.5 py-1 rounded border border-slate-200 text-slate-600 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-slate-100"
+                  >
+                    Prev
+                  </button>
+                  <span className="text-xs text-slate-500 px-1">{pageSafe} / {totalPages}</span>
+                  <button
+                    onClick={() => setPage(p => Math.min(totalPages, p + 1))}
+                    disabled={pageSafe === totalPages}
+                    className="text-xs px-2.5 py-1 rounded border border-slate-200 text-slate-600 disabled:opacity-40 disabled:cursor-not-allowed hover:bg-slate-100"
+                  >
+                    Next
+                  </button>
+                </div>
+              )}
             </div>
           </div>
         )}

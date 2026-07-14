@@ -3,43 +3,18 @@
 import { useEffect, useState } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import {
-  getCultFitOrderDetail, getDocuments, getOdooAttachments,
-  updateDealStatus, setCultFitPortalStage,
-  type DealStatusUpdate, type OdooAttachment,
+  getCultFitOrderDetail, getOdooAttachments, setCultFitPortalStage,
+  type OdooAttachment,
 } from '@/lib/api';
-import { isLoggedIn, getToken, isInBodyStaff, getUser, clearSession } from '@/lib/auth';
+import { fetchCurrentUser, isInBodyStaff, logout } from '@/lib/auth';
+import { STAGE_LABELS, STAGE_DEFS, CULTFIT_STAGE_MAP, DELIVERY_VARIANT, INVOICE_VARIANT } from '@/lib/stage-config';
 import OrderTimeline from '@/components/OrderTimeline';
 import PaymentCountdown from '@/components/PaymentCountdown';
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
-import type { CultFitOrder, DocumentsResponse, TimelineStage } from '@/types';
+import type { CultFitOrder, TimelineStage } from '@/types';
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
-
-// ── Stage definitions ─────────────────────────────────────────────────────────
-
-const STAGE_DEFS: Array<{ key: string; label: string; icon: string }> = [
-  { key: 'stage_1_order_received',         label: 'Order Received',           icon: 'shopping-cart'  },
-  { key: 'stage_2_pi_issued',              label: 'PI Issued',                icon: 'file-text'      },
-  { key: 'stage_3_po_received',            label: 'PO Received',              icon: 'inbox'          },
-  { key: 'stage_4_md_approved',            label: 'MD Approved',              icon: 'check-square'   },
-  { key: 'stage_5_dispatched',             label: 'Dispatched',               icon: 'truck'          },
-  { key: 'stage_6_installation_confirmed', label: 'Installation Confirmed',   icon: 'tool'           },
-  { key: 'stage_7_vendor_uploaded',        label: 'Vendor Portal Uploaded',   icon: 'upload-cloud'   },
-  { key: 'stage_8_confirmation_sent',      label: 'Confirmation Mail Sent',   icon: 'mail'           },
-  { key: 'stage_9_payment_collected',      label: 'Payment Collected',        icon: 'check-circle'   },
-];
-
-const CULTFIT_STAGE_MAP: Record<string, number> = {
-  new:                1,
-  pi_shared:          2,
-  po_received:        3,
-  dispatch_requested: 4,
-  dispatched:         5,
-  delivered:          6,
-  server_updated:     7,
-  deal_closed:        9,
-};
+const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '/api';
 
 function buildTimeline(order: CultFitOrder): { stages: TimelineStage[]; currentStage: number } {
   const stageDefIdx = STAGE_DEFS.findIndex(s => s.key === order.portal_stage);
@@ -68,43 +43,6 @@ function buildTimeline(order: CultFitOrder): { stages: TimelineStage[]; currentS
 
   return { stages, currentStage };
 }
-
-// ── Label normalizers (handles both raw Odoo strings and human-readable) ──────
-
-const INSTALL_LABELS: Record<string, string> = {
-  not_started:   'Not Started',
-  in_progress:   'In Progress',
-  confirmed:     'Confirmed',
-  'Not Started': 'Not Started',
-  'In Progress': 'In Progress',
-  'Confirmed':   'Confirmed',
-};
-
-const VENDOR_LABELS: Record<string, string> = {
-  not_uploaded:   'Not Uploaded',
-  uploaded:       'Uploaded',
-  'Not Uploaded': 'Not Uploaded',
-  'Uploaded':     'Uploaded',
-};
-
-// ── Badge variant maps ────────────────────────────────────────────────────────
-
-type ChipVariant = 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'teal' | 'indigo' | 'orange' | 'purple';
-
-const DELIVERY_VARIANT: Record<string, ChipVariant> = {
-  'No Delivery':          'neutral',
-  'Pending':              'warning',
-  'Ready to Dispatch':    'info',
-  'Partially Dispatched': 'orange',
-  'Delivered':            'success',
-};
-
-const INVOICE_VARIANT: Record<string, ChipVariant> = {
-  'Nothing to Invoice':    'neutral',
-  'To Invoice':            'info',
-  'Invoiced':              'success',
-  'Upselling Opportunity': 'purple',
-};
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -158,19 +96,12 @@ export default function OrderDetailPage() {
   const orderId = Number(params.id);
 
   const [order, setOrder]       = useState<CultFitOrder | null>(null);
-  const [docs, setDocs]         = useState<DocumentsResponse | null>(null);
   const [odooDocs, setOdooDocs] = useState<OdooAttachment[]>([]);
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState('');
   const [downloading, setDownloading] = useState<number | null>(null);
   const [isStaff, setIsStaff]   = useState(false);
   const [userName, setUserName] = useState('');
-
-  // Deal status form (staff only)
-  const [dealForm, setDealForm]   = useState<DealStatusUpdate>({});
-  const [dealReason, setDealReason] = useState('');
-  const [saving, setSaving]       = useState(false);
-  const [saveMsg, setSaveMsg]     = useState<{ ok: boolean; text: string } | null>(null);
 
   // Portal stage update (staff only)
   const [stageKey, setStageKey]         = useState('');
@@ -179,66 +110,32 @@ export default function OrderDetailPage() {
   const [stageSaveMsg, setStageSaveMsg] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
-    if (!isLoggedIn()) { router.replace('/login'); return; }
-    const staff = isInBodyStaff();
-    setIsStaff(staff);
-    const u = getUser();
-    setUserName(u?.name ?? '');
+    // Middleware already gates page access server-side; this fetch is purely
+    // to get the user's name/role for display.
+    fetchCurrentUser().then(u => {
+      if (!u) { router.replace('/login'); return; }
+      setIsStaff(isInBodyStaff(u.role));
+      setUserName(u.name ?? '');
+    });
     if (!orderId) return;
 
     Promise.all([
       getCultFitOrderDetail(orderId),
-      getDocuments(orderId).catch(() => null),
       getOdooAttachments(orderId).catch(() => ({ attachments: [], count: 0 })),
     ])
-      .then(([o, d, odoo]) => {
+      .then(([o, odoo]) => {
         setOrder(o);
-        setDocs(d);
         setOdooDocs(odoo?.attachments ?? []);
-        const instMap: Record<string, string> = {
-          'Not Started': 'not_started', 'In Progress': 'in_progress', 'Confirmed': 'confirmed',
-        };
-        const vendMap: Record<string, string> = {
-          'Not Uploaded': 'not_uploaded', 'Uploaded': 'uploaded',
-        };
-        setDealForm({
-          payment_status:         o.payment_status,
-          installation_status:    instMap[o.installation_status] ?? 'not_started',
-          vendor_portal_status:   vendMap[o.vendor_portal_status] ?? 'not_uploaded',
-          confirmation_mail_sent: o.confirmation_mail_sent,
-          md_approval_status:     o.md_approval_status,
-        });
         setStageKey(o.portal_stage || 'new');
       })
       .catch(err => setError(err.message ?? 'Failed to load order.'))
       .finally(() => setLoading(false));
   }, [orderId, router]);
 
-  async function handleDownload(docId: number, filename: string) {
-    setDownloading(docId);
-    try {
-      const token = getToken();
-      const resp = await fetch(`${API_BASE}/api/v1/portal/documents/${docId}`, {
-        headers: { Authorization: `Bearer ${token}` },
-      });
-      if (!resp.ok) throw new Error('Download failed');
-      const blob = await resp.blob();
-      const url = URL.createObjectURL(blob);
-      const a = document.createElement('a');
-      a.href = url; a.download = filename; a.click();
-      URL.revokeObjectURL(url);
-    } catch { alert('Download failed. Please try again.'); }
-    finally { setDownloading(null); }
-  }
-
   async function handleOdooDownload(attachmentId: number, filename: string) {
     setDownloading(attachmentId);
     try {
-      const token = getToken();
-      const resp = await fetch(
-        `${API_BASE}/portal/cultfit/orders/${orderId}/attachments/${attachmentId}`,
-        { headers: { Authorization: `Bearer ${token}` } },
-      );
+      const resp = await fetch(`${API_BASE}/portal/cultfit/orders/${orderId}/attachments/${attachmentId}`);
       if (!resp.ok) throw new Error('Download failed');
       const blob = await resp.blob();
       const url = URL.createObjectURL(blob);
@@ -247,44 +144,16 @@ export default function OrderDetailPage() {
       URL.revokeObjectURL(url);
     } catch { alert('Download failed. Please try again.'); }
     finally { setDownloading(null); }
-  }
-
-  async function handleSaveDealStatus() {
-    if (!order) return;
-    if (!dealReason.trim()) {
-      setSaveMsg({ ok: false, text: 'Reason / Note is required before saving.' });
-      return;
-    }
-    setSaving(true);
-    setSaveMsg(null);
-    try {
-      await updateDealStatus(order.id, { ...dealForm, reason: dealReason });
-      const updated = await getCultFitOrderDetail(order.id);
-      setOrder(updated);
-      const instMap: Record<string, string> = {
-        'Not Started': 'not_started', 'In Progress': 'in_progress', 'Confirmed': 'confirmed',
-      };
-      const vendMap: Record<string, string> = {
-        'Not Uploaded': 'not_uploaded', 'Uploaded': 'uploaded',
-      };
-      setDealForm({
-        payment_status:         updated.payment_status,
-        installation_status:    instMap[updated.installation_status] ?? 'not_started',
-        vendor_portal_status:   vendMap[updated.vendor_portal_status] ?? 'not_uploaded',
-        confirmation_mail_sent: updated.confirmation_mail_sent,
-        md_approval_status:     updated.md_approval_status,
-      });
-      setDealReason('');
-      setSaveMsg({ ok: true, text: 'Deal status updated and logged.' });
-    } catch (err: unknown) {
-      setSaveMsg({ ok: false, text: err instanceof Error ? err.message : 'Save failed.' });
-    } finally { setSaving(false); }
   }
 
   async function handleSavePortalStage() {
     if (!order) return;
     if (!stageReason.trim()) {
       setStageSaveMsg({ ok: false, text: 'Reason / Note is required before updating stage.' });
+      return;
+    }
+    const targetLabel = STAGE_LABELS[stageKey] ?? stageKey;
+    if (!window.confirm(`Change ${order.order_no} to "${targetLabel}"?\n\nReason: ${stageReason.trim()}`)) {
       return;
     }
     setStageSaving(true);
@@ -301,8 +170,8 @@ export default function OrderDetailPage() {
     } finally { setStageSaving(false); }
   }
 
-  function handleLogout() {
-    clearSession();
+  async function handleLogout() {
+    await logout();
     router.replace('/login');
   }
 
@@ -357,11 +226,6 @@ export default function OrderDetailPage() {
   if (!order) return null;
 
   const { stages, currentStage } = buildTimeline(order);
-
-  const installLabel = INSTALL_LABELS[order.installation_status] ?? order.installation_status;
-  const vendorLabel  = VENDOR_LABELS[order.vendor_portal_status]  ?? order.vendor_portal_status;
-  const isInstallDone = order.installation_status === 'confirmed' || order.installation_status === 'Confirmed';
-  const isVendorDone  = order.vendor_portal_status === 'uploaded' || order.vendor_portal_status === 'Uploaded';
 
   return (
     <div className="min-h-screen bg-slate-50">
@@ -475,37 +339,6 @@ export default function OrderDetailPage() {
               />
             </div>
 
-            {/* Quick status */}
-            <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
-              <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Quick Status</h2>
-              <div className="space-y-3">
-                {[
-                  {
-                    label: 'Installation',
-                    value: installLabel,
-                    done:  isInstallDone,
-                  },
-                  {
-                    label: 'Vendor Portal',
-                    value: vendorLabel,
-                    done:  isVendorDone,
-                  },
-                  {
-                    label: 'Confirmation Mail',
-                    value: order.confirmation_mail_sent ? 'Sent' : 'Pending',
-                    done:  order.confirmation_mail_sent,
-                  },
-                ].map(item => (
-                  <div key={item.label} className="flex items-center justify-between gap-3">
-                    <span className="text-sm text-slate-500">{item.label}</span>
-                    <span className={`text-sm font-medium ${item.done ? 'text-green-600' : 'text-slate-400'}`}>
-                      {item.value}
-                    </span>
-                  </div>
-                ))}
-              </div>
-            </div>
-
             {/* Update Portal Stage — staff only */}
             {isStaff && (
               <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
@@ -516,14 +349,9 @@ export default function OrderDetailPage() {
                     onChange={e => setStageKey(e.target.value)}
                     className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-indigo-500 bg-white"
                   >
-                    <option value="new">New</option>
-                    <option value="pi_shared">PI Shared</option>
-                    <option value="po_received">PO Received</option>
-                    <option value="dispatch_requested">Dispatch Requested</option>
-                    <option value="dispatched">Dispatched</option>
-                    <option value="delivered">Delivered (Not Installed)</option>
-                    <option value="server_updated">Server Updated</option>
-                    <option value="deal_closed">Deal Closed</option>
+                    {Object.entries(STAGE_LABELS).map(([key, label]) => (
+                      <option key={key} value={key}>{label}</option>
+                    ))}
                   </select>
 
                   <div>
@@ -556,109 +384,6 @@ export default function OrderDetailPage() {
                     className="w-full bg-indigo-600 hover:bg-indigo-700 disabled:bg-indigo-300 text-white text-sm font-semibold py-2.5 rounded-lg transition-colors"
                   >
                     {stageSaving ? 'Updating...' : 'Update Stage'}
-                  </button>
-                </div>
-              </div>
-            )}
-
-            {/* Update Deal Status — staff only */}
-            {isStaff && (
-              <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
-                <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Update Deal Status</h2>
-                <div className="space-y-3">
-
-                  <div>
-                    <label className="text-xs font-medium text-slate-500 block mb-1">Payment Status</label>
-                    <select
-                      value={dealForm.payment_status ?? ''}
-                      onChange={e => setDealForm(f => ({ ...f, payment_status: e.target.value }))}
-                      className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
-                    >
-                      <option value="pending">Pending</option>
-                      <option value="overdue">Overdue</option>
-                      <option value="collected">Collected</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="text-xs font-medium text-slate-500 block mb-1">Installation Status</label>
-                    <select
-                      value={dealForm.installation_status ?? ''}
-                      onChange={e => setDealForm(f => ({ ...f, installation_status: e.target.value }))}
-                      className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
-                    >
-                      <option value="not_started">Not Started</option>
-                      <option value="in_progress">In Progress</option>
-                      <option value="confirmed">Confirmed</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="text-xs font-medium text-slate-500 block mb-1">Vendor Portal Status</label>
-                    <select
-                      value={dealForm.vendor_portal_status ?? ''}
-                      onChange={e => setDealForm(f => ({ ...f, vendor_portal_status: e.target.value }))}
-                      className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
-                    >
-                      <option value="not_uploaded">Not Uploaded</option>
-                      <option value="uploaded">Uploaded</option>
-                    </select>
-                  </div>
-
-                  <div>
-                    <label className="text-xs font-medium text-slate-500 block mb-1">MD Approval</label>
-                    <select
-                      value={dealForm.md_approval_status ?? ''}
-                      onChange={e => setDealForm(f => ({ ...f, md_approval_status: e.target.value }))}
-                      className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 bg-white"
-                    >
-                      <option value="pending">Pending</option>
-                      <option value="approved">Approved</option>
-                      <option value="rejected">Rejected</option>
-                    </select>
-                  </div>
-
-                  <div className="flex items-center gap-2.5 pt-0.5">
-                    <input
-                      type="checkbox"
-                      id="conf-mail"
-                      checked={dealForm.confirmation_mail_sent ?? false}
-                      onChange={e => setDealForm(f => ({ ...f, confirmation_mail_sent: e.target.checked }))}
-                      className="w-4 h-4 rounded border-slate-300 text-blue-600 focus:ring-blue-500"
-                    />
-                    <label htmlFor="conf-mail" className="text-sm text-slate-700">Confirmation Mail Sent</label>
-                  </div>
-
-                  <div>
-                    <label className="text-xs font-medium text-slate-500 block mb-1">
-                      Reason / Note <span className="text-red-500">*</span>
-                      <span className="font-normal text-slate-400 ml-1">— logged in Odoo</span>
-                    </label>
-                    <textarea
-                      rows={3}
-                      value={dealReason}
-                      onChange={e => setDealReason(e.target.value)}
-                      placeholder="e.g. Payment received via NEFT on 16 Jun 2026"
-                      className={`w-full text-sm border rounded-lg px-3 py-2 focus:outline-none focus:ring-2 resize-none ${
-                        !dealReason.trim()
-                          ? 'border-red-300 focus:ring-red-400'
-                          : 'border-slate-300 focus:ring-blue-500'
-                      }`}
-                    />
-                  </div>
-
-                  {saveMsg && (
-                    <p className={`text-xs font-medium ${saveMsg.ok ? 'text-green-600' : 'text-red-600'}`}>
-                      {saveMsg.text}
-                    </p>
-                  )}
-
-                  <button
-                    onClick={handleSaveDealStatus}
-                    disabled={saving}
-                    className="w-full bg-blue-700 hover:bg-blue-800 disabled:bg-blue-300 text-white text-sm font-semibold py-2.5 rounded-lg transition-colors"
-                  >
-                    {saving ? 'Saving...' : 'Save Changes'}
                   </button>
                 </div>
               </div>
@@ -727,49 +452,7 @@ export default function OrderDetailPage() {
             </div>
           )}
 
-          {/* Manually uploaded documents */}
-          {docs && docs.count > 0 ? (
-            <div>
-              {odooDocs.length > 0 && (
-                <p className="text-xs font-semibold text-slate-400 uppercase tracking-wide mb-3">Uploaded by InBody</p>
-              )}
-              <div className="divide-y divide-slate-100">
-                {docs.documents.map(doc => (
-                  <div key={doc.id} className="flex items-center justify-between py-3 first:pt-0 last:pb-0">
-                    <div className="flex items-center gap-3 min-w-0">
-                      <FiletypeIcon mimetype={doc.mimetype} />
-                      <div className="min-w-0">
-                        <p className="text-sm font-medium text-slate-800 truncate">{doc.name}</p>
-                        <p className="text-xs text-slate-400 mt-0.5">
-                          {formatBytes(doc.size)}
-                          {doc.date && ` · ${new Date(doc.date).toLocaleDateString('en-IN')}`}
-                        </p>
-                      </div>
-                    </div>
-                    <button
-                      onClick={() => handleDownload(doc.id, doc.name)}
-                      disabled={downloading === doc.id}
-                      className="ml-4 flex-shrink-0 inline-flex items-center gap-1.5 text-sm text-blue-600 hover:text-blue-800 font-medium disabled:text-slate-400 transition"
-                    >
-                      {downloading === doc.id ? (
-                        <>
-                          <span className="animate-spin w-3.5 h-3.5 border-2 border-blue-400 border-t-transparent rounded-full" />
-                          Downloading...
-                        </>
-                      ) : (
-                        <>
-                          <svg className="w-3.5 h-3.5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-                            <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
-                          </svg>
-                          Download
-                        </>
-                      )}
-                    </button>
-                  </div>
-                ))}
-              </div>
-            </div>
-          ) : odooDocs.length === 0 ? (
+          {odooDocs.length === 0 && (
             <div className="text-center py-10">
               <div className="w-12 h-12 bg-slate-100 rounded-full flex items-center justify-center mx-auto mb-3">
                 <svg className="w-6 h-6 text-slate-300" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -777,9 +460,9 @@ export default function OrderDetailPage() {
                 </svg>
               </div>
               <p className="text-sm text-slate-500">No documents yet</p>
-              <p className="text-xs text-slate-300 mt-1">Documents will appear here once uploaded by InBody</p>
+              <p className="text-xs text-slate-300 mt-1">Quotation and invoice PDFs will appear here once available in Odoo</p>
             </div>
-          ) : null}
+          )}
         </div>
 
       </div>
