@@ -312,7 +312,7 @@ const LEAD_FIELDS = [
   'payment_term_id', 'expected_revenue', 'won_status', 'is_credit_deal', 'order_ids',
 ];
 
-const SO_FIELDS = ['id', 'name', 'opportunity_id', 'amount_untaxed', 'amount_tax', 'order_line'];
+const SO_FIELDS = ['id', 'name', 'opportunity_id', 'amount_untaxed', 'amount_tax', 'order_line', 'client_order_ref'];
 
 // ──── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -333,7 +333,79 @@ function isOverdue(ds: string | null, stageId: number): boolean {
 
 type OdooTuple = [number, string] | false;
 
-function buildLead(lead: Record<string, unknown>): Record<string, unknown> {
+// Per-lead rollup of its linked sale.order(s). A crm.lead can have zero, one,
+// or several linked sale orders (order_ids) — these three fields each need a
+// different combination rule when there's more than one:
+//   - poNumber: no meaningful way to combine two reference strings, so we use
+//     the most-recently-linked order (last id in order_ids) as "the" order —
+//     the same convention the pre-Next.js FastAPI backend used (so_ids[-1:]).
+//   - amountUntaxed / amountTax: money combines cleanly by summation, so all
+//     linked orders are summed rather than picking just one.
+//   - modelNames: the deduplicated union of every product across every linked
+//     order, since a deal can accumulate models across more than one order.
+// Confirmed via a live, read-only fields_get probe against production Odoo:
+// no field for "PO received date" or "PI issued date" exists on crm.lead or
+// sale.order (the only close match is client_order_ref, mapped to poNumber
+// above). Do not invent a value for those two dates — leave them null.
+interface SoAggregate {
+  amountUntaxed: number;
+  amountTax: number;
+  poNumber: string | null;
+  modelNames: string[];
+}
+
+const EMPTY_SO_AGG: SoAggregate = { amountUntaxed: 0, amountTax: 0, poNumber: null, modelNames: [] };
+
+// Batched for a set of already-fetched leads (each must include order_ids from
+// LEAD_FIELDS). Reused by both the list and single-order fetch so detail pages
+// and list pages never disagree on these fields. No new authorization surface:
+// every sale.order/sale.order.line id read here is reached only through
+// order_ids on a lead that already passed authzDomain()/the id-match domain.
+async function fetchSoAggregates(leads: Record<string, unknown>[]): Promise<Map<number, SoAggregate>> {
+  const result = new Map<number, SoAggregate>();
+
+  const leadToSo: Record<number, number[]> = {};
+  const allSoIds: number[] = [];
+  for (const l of leads) {
+    const ids = (l.order_ids as number[]) || [];
+    leadToSo[l.id as number] = ids;
+    allSoIds.push(...ids);
+  }
+  if (!allSoIds.length) return result;
+
+  const sos = await executeKw('sale.order', 'read', [allSoIds], { fields: SO_FIELDS }) as Record<string, unknown>[];
+  const soMap = new Map(sos.map(so => [so.id as number, so]));
+
+  const allLineIds = sos.flatMap(so => (so.order_line as number[]) || []);
+  const lineProductMap = new Map<number, string>();
+  if (allLineIds.length) {
+    const lines = await executeKw('sale.order.line', 'read', [allLineIds], { fields: ['id', 'product_id'] }) as Record<string, unknown>[];
+    for (const line of lines) {
+      const p = line.product_id as OdooTuple;
+      if (p) lineProductMap.set(line.id as number, p[1]);
+    }
+  }
+
+  for (const [leadIdStr, soIds] of Object.entries(leadToSo)) {
+    const leadSos = soIds.map(id => soMap.get(id)).filter((s): s is Record<string, unknown> => !!s);
+    if (!leadSos.length) continue;
+    const primary = leadSos[leadSos.length - 1];
+    const modelNames = Array.from(new Set(
+      leadSos.flatMap(so => ((so.order_line as number[]) || [])
+        .map(lineId => lineProductMap.get(lineId))
+        .filter((n): n is string => !!n))
+    ));
+    result.set(Number(leadIdStr), {
+      amountUntaxed: leadSos.reduce((sum, so) => sum + ((so.amount_untaxed as number) || 0), 0),
+      amountTax: leadSos.reduce((sum, so) => sum + ((so.amount_tax as number) || 0), 0),
+      poNumber: (primary.client_order_ref as string) || null,
+      modelNames,
+    });
+  }
+  return result;
+}
+
+function buildLead(lead: Record<string, unknown>, soAgg: SoAggregate = EMPTY_SO_AGG): Record<string, unknown> {
   const stageVal     = lead.stage_id      as OdooTuple;
   const dsVal        = lead.deal_status_id as OdooTuple;
   const partnerVal   = lead.partner_id    as OdooTuple;
@@ -354,12 +426,12 @@ function buildLead(lead: Record<string, unknown>): Record<string, unknown> {
     order_no:     lead.name || `CRM-${lead.id}`,
     customer:     partnerVal ? partnerVal[1] : null,
     location:     lead.x_studio_machine_installed_at || lead.city || null,
-    model_names:  [],
+    model_names:  soAgg.modelNames,
     order_date:   parseDate(lead.create_date),
     last_updated: parseDate(lead.write_date),
     amount_total: lead.expected_revenue || 0,
-    amount_untaxed: 0,
-    amount_tax:   0,
+    amount_untaxed: soAgg.amountUntaxed,
+    amount_tax:   soAgg.amountTax,
     currency:     'INR',
     payment_terms: ptVal ? ptVal[1] : null,
     order_status:  stageLabel,
@@ -375,7 +447,9 @@ function buildLead(lead: Record<string, unknown>): Record<string, unknown> {
     vendor_portal_status:   'not_uploaded',
     confirmation_mail_sent: false,
     portal_notes: '',
-    po_number:        null,
+    po_number:        soAgg.poNumber,
+    // No field for either date exists on crm.lead or sale.order in production
+    // Odoo (verified live via fields_get) — left null rather than invented.
     po_received_date: null,
     pi_issued_date:   null,
     md_approval_status: 'pending',
@@ -395,21 +469,8 @@ export async function fetchCultFitOrders(authz: Authz): Promise<{ orders: unknow
     fields: LEAD_FIELDS, order: 'id desc', limit: 200,
   }) as Record<string, unknown>[];
 
-  const allSoIds: number[] = [];
-  const leadToSo: Record<number, number[]> = {};
-  for (const l of leads) {
-    const ids = (l.order_ids as number[]) || [];
-    leadToSo[l.id as number] = ids;
-    allSoIds.push(...ids);
-  }
-
-  const soMap: Record<number, Record<string, unknown>> = {};
-  if (allSoIds.length > 0) {
-    const sos = await executeKw('sale.order', 'read', [allSoIds], { fields: SO_FIELDS }) as Record<string, unknown>[];
-    for (const so of sos) soMap[so.id as number] = so;
-  }
-
-  const orders = leads.map(l => buildLead(l));
+  const soAggMap = await fetchSoAggregates(leads);
+  const orders = leads.map(l => buildLead(l, soAggMap.get(l.id as number)));
   return { orders, count: orders.length };
 }
 
@@ -423,8 +484,10 @@ export async function fetchCultFitOrderById(orderId: number, authz: Authz): Prom
   const leads = await executeKw('crm.lead', 'search_read', [domain], {
     fields: LEAD_FIELDS, limit: 1,
   }) as Record<string, unknown>[];
+  if (!leads.length) return null;
 
-  return leads.length ? buildLead(leads[0]) : null;
+  const soAggMap = await fetchSoAggregates(leads);
+  return buildLead(leads[0], soAggMap.get(leads[0].id as number));
 }
 
 const REVERSE_DS = Object.fromEntries(Object.entries(DEAL_STATUS_MAP).map(([k, v]) => [v, k]));
