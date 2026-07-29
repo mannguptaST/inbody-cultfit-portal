@@ -84,3 +84,27 @@ export const CULTFIT_STAGE_MAP: Record<string, number> = {
   server_updated: 7,
   deal_closed: 9,
 };
+
+// Customer-facing labels for the "New Order Request" flow (My Requests /
+// request detail pages) — same underlying portal_stage keys as STAGE_LABELS
+// above, deliberately not a second status system. Wording differs because
+// the audience/context differs (a customer tracking a fresh request reads
+// "PO received" as staff-operational, not their own submission's progress).
+//
+// Only 'new' ("Request Submitted") is reachable in Phase 1 — nothing yet
+// writes deal_status_id for a portal-created request, so the rest of this
+// map is a best-effort placeholder for when Phase 2+ starts moving these
+// requests through the existing pipeline. The existing pipeline's key order
+// (po_received before pi_shared) doesn't line up perfectly with the
+// request-flow's conceptual order described for it — revisit once these
+// stages actually become reachable rather than guessing further now.
+export const REQUEST_STAGE_LABELS: Record<string, string> = {
+  new: 'Request Submitted',
+  po_received: 'Under Review',
+  pi_shared: 'PI Ready',
+  dispatch_requested: 'PO Pending',
+  dispatched: 'Dispatch Processing',
+  delivered: 'Dispatched',
+  server_updated: 'Installation Pending',
+  deal_closed: 'Completed',
+};

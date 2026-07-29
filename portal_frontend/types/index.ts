@@ -80,3 +80,68 @@ export interface CultFitOrdersResponse {
   orders: CultFitOrder[];
   count: number;
 }
+
+// ── Phase 1: New Order Request (CultFit CRM Opportunity requests) ────────────
+
+export interface CultFitProductOption {
+  id: number;
+  code: string;
+  name: string;
+  hasBundle: boolean;
+}
+
+export interface PortalRequestProduct {
+  id: number;
+  code: string;
+  name: string;
+}
+
+export interface PortalRequestDetails {
+  requestName: string;
+  cocoFofo: 'COCO' | 'FOFO';
+  mainProduct: PortalRequestProduct;
+  quantity: number;
+  includedProducts: PortalRequestProduct[];
+  deliveryAddress: string;
+  contactName: string;
+  contactPhone: string;
+  contactEmail: string | null;
+  preferredDeliveryDate: string | null;
+  notes: string;
+  portalAccount: string;
+  submittedDate: string;
+}
+
+export interface PortalRequestSummary {
+  id: number;
+  name: string;
+  details: PortalRequestDetails | null;
+  portal_stage: string;
+  portal_stage_label: string;
+  salesperson: string | null;
+  created_date: string | null;
+  last_updated: string | null;
+}
+
+export interface PortalRequestTimelineEntry {
+  date: string | null;
+  author: string;
+  body: string;
+}
+
+export interface PortalRequestDetail extends PortalRequestSummary {
+  timeline: PortalRequestTimelineEntry[];
+}
+
+export interface NewOrderRequestPayload {
+  requestName: string;
+  cocoFofo: 'COCO' | 'FOFO';
+  mainProductId: number;
+  quantity: number;
+  deliveryAddress: string;
+  contactName: string;
+  contactPhone: string;
+  contactEmail?: string;
+  preferredDeliveryDate?: string;
+  notes?: string;
+}
