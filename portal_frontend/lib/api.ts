@@ -10,6 +10,13 @@ import type {
   PortalRequestSummary,
   PortalRequestDetail,
   NewOrderRequestPayload,
+  EligibleSalesperson,
+  AdminRequestSummary,
+  AdminRequestDetail,
+  PIDraftInfo,
+  PIPublishedSnapshot,
+  CustomerPIView,
+  PIStatus,
 } from '@/types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '/api';
@@ -117,6 +124,72 @@ export async function getOrderRequests(): Promise<{ requests: PortalRequestSumma
   return apiFetch('/portal/cultfit/requests');
 }
 
-export async function getOrderRequestDetail(id: number): Promise<PortalRequestDetail> {
+export async function getOrderRequestDetail(id: number): Promise<PortalRequestDetail & { pi: CustomerPIView }> {
   return apiFetch(`/portal/cultfit/requests/${id}`);
+}
+
+// ── Phase 2: PI workflow ──────────────────────────────────────────────────────
+
+export async function respondToPI(
+  id: number, action: 'confirm' | 'request_correction', comment?: string,
+): Promise<{ status: PIStatus }> {
+  return apiFetch(`/portal/cultfit/requests/${id}/pi/respond`, {
+    method: 'POST',
+    body: JSON.stringify({ action, comment }),
+  });
+}
+
+export function getPIDownloadUrl(id: number): string {
+  return `${API_BASE}/portal/cultfit/requests/${id}/pi/pdf`;
+}
+
+export async function getAdminRequests(): Promise<{ requests: AdminRequestSummary[] }> {
+  return apiFetch('/admin/cultfit/requests');
+}
+
+export async function getAdminRequestDetail(id: number): Promise<AdminRequestDetail> {
+  return apiFetch(`/admin/cultfit/requests/${id}`);
+}
+
+export async function getEligibleSalespeople(): Promise<{ salespeople: EligibleSalesperson[] }> {
+  return apiFetch('/admin/cultfit/salespeople');
+}
+
+export async function assignRequestSalesperson(
+  id: number, salespersonId: number,
+): Promise<{ salesperson: EligibleSalesperson }> {
+  return apiFetch(`/admin/cultfit/requests/${id}/salesperson`, {
+    method: 'POST',
+    body: JSON.stringify({ salespersonId }),
+  });
+}
+
+export async function createDraftPI(id: number, mainProductPrice: number): Promise<PIDraftInfo> {
+  return apiFetch(`/admin/cultfit/requests/${id}/pi`, {
+    method: 'POST',
+    body: JSON.stringify({ mainProductPrice }),
+  });
+}
+
+export async function createPIRevision(id: number, mainProductPrice: number): Promise<PIDraftInfo> {
+  return apiFetch(`/admin/cultfit/requests/${id}/pi/revise`, {
+    method: 'POST',
+    body: JSON.stringify({ mainProductPrice }),
+  });
+}
+
+export async function updatePIDraft(
+  id: number, soId: number, updates: { mainProductPrice?: number; validityDate?: string },
+): Promise<PIDraftInfo> {
+  return apiFetch(`/admin/cultfit/requests/${id}/pi`, {
+    method: 'PATCH',
+    body: JSON.stringify({ soId, ...updates }),
+  });
+}
+
+export async function publishPI(id: number, soId: number): Promise<PIPublishedSnapshot> {
+  return apiFetch(`/admin/cultfit/requests/${id}/pi/publish`, {
+    method: 'POST',
+    body: JSON.stringify({ soId }),
+  });
 }

@@ -27,8 +27,18 @@ const CUSTOMER_NAV = [
   { href: '/requests', label: 'My Requests' },
 ];
 
+const ADMIN_NAV = [
+  { href: '/admin', label: 'Orders' },
+  { href: '/admin/requests', label: 'Requests' },
+];
+
 function isCustomerNavActive(pathname: string | null, href: string): boolean {
   return pathname === href || (href === '/requests' && !!pathname?.startsWith('/requests/') && pathname !== '/requests/new');
+}
+
+function isAdminNavActive(pathname: string | null, href: string): boolean {
+  if (href === '/admin') return pathname === '/admin';
+  return pathname === href || !!pathname?.startsWith(`${href}/`);
 }
 
 export default function PortalHeader({
@@ -62,6 +72,23 @@ export default function PortalHeader({
                 href={item.href}
                 className={`text-sm px-3 py-1.5 rounded-lg transition-colors ${
                   isCustomerNavActive(pathname, item.href) ? 'bg-blue-50 text-blue-700 font-medium' : 'text-slate-500 hover:text-slate-800 hover:bg-slate-50'
+                }`}
+              >
+                {item.label}
+              </Link>
+            ))}
+          </nav>
+        )}
+
+        {/* Admin/staff primary nav — desktop */}
+        {role === 'STAFF' && (
+          <nav className="hidden sm:flex items-center gap-1 flex-shrink-0">
+            {ADMIN_NAV.map(item => (
+              <Link
+                key={item.href}
+                href={item.href}
+                className={`text-sm px-3 py-1.5 rounded-lg transition-colors ${
+                  isAdminNavActive(pathname, item.href) ? 'bg-violet-50 text-violet-700 font-medium' : 'text-slate-500 hover:text-slate-800 hover:bg-slate-50'
                 }`}
               >
                 {item.label}
@@ -156,6 +183,23 @@ export default function PortalHeader({
               href={item.href}
               className={`text-sm px-3 py-1.5 rounded-lg whitespace-nowrap transition-colors ${
                 isCustomerNavActive(pathname, item.href) ? 'bg-blue-50 text-blue-700 font-medium' : 'text-slate-500 hover:text-slate-800 hover:bg-slate-50'
+              }`}
+            >
+              {item.label}
+            </Link>
+          ))}
+        </nav>
+      )}
+
+      {/* Admin/staff primary nav — mobile */}
+      {role === 'STAFF' && (
+        <nav className="sm:hidden flex items-center gap-1 px-4 py-2 border-t border-slate-100 overflow-x-auto">
+          {ADMIN_NAV.map(item => (
+            <Link
+              key={item.href}
+              href={item.href}
+              className={`text-sm px-3 py-1.5 rounded-lg whitespace-nowrap transition-colors ${
+                isAdminNavActive(pathname, item.href) ? 'bg-violet-50 text-violet-700 font-medium' : 'text-slate-500 hover:text-slate-800 hover:bg-slate-50'
               }`}
             >
               {item.label}

@@ -131,6 +131,7 @@ export interface PortalRequestSummary {
   portal_stage: string;
   portal_stage_label: string;
   salesperson: string | null;
+  salespersonPhone: string | null;
   created_date: string | null;
   last_updated: string | null;
 }
@@ -153,4 +154,82 @@ export interface NewOrderRequestPayload {
   deliveryAddress: string;
   preferredDeliveryDate?: string;
   notes?: string;
+}
+
+// ── Phase 2: PI workflow (admin creates/publishes, customer confirms) ────────
+
+export type PIStatus = 'not_created' | 'draft' | 'awaiting_confirmation' | 'confirmed' | 'correction_requested';
+
+export interface EligibleSalesperson {
+  id: number;
+  name: string;
+}
+
+export interface PIDraftLine {
+  id: number;
+  productId: number;
+  code: string;
+  name: string;
+  quantity: number;
+  unitPrice: number;
+  taxLabel: string;
+  untaxedTotal: number;
+  taxTotal: number;
+}
+
+export interface PIDraftInfo {
+  id: number;
+  name: string;
+  state: string;
+  validityDate: string | null;
+  mainProductUnitPrice: number;
+  lines: PIDraftLine[];
+  untaxedAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+}
+
+export interface PISnapshotLineItem {
+  code: string;
+  name: string;
+  quantity: number;
+  unitPrice: number;
+  taxLabel: string;
+  taxTotal: number;
+  untaxedTotal: number;
+}
+
+export interface PIPublishedSnapshot {
+  version: number;
+  quotationId: number;
+  quotationNumber: string;
+  publishedDate: string;
+  publishedBy: string;
+  attachmentId: number;
+  requestReference: string;
+  cultfitCompanyName: string;
+  deliveryAddress: string;
+  cocoFofo: 'COCO' | 'FOFO';
+  preferredDeliveryDate: string | null;
+  salespersonName: string;
+  lineItems: PISnapshotLineItem[];
+  untaxedAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+  validityDate: string;
+}
+
+export interface AdminRequestSummary extends PortalRequestSummary {
+  piStatus: PIStatus;
+}
+
+export interface AdminRequestDetail extends PortalRequestDetail {
+  piStatus: PIStatus;
+  draftPI: PIDraftInfo | null;
+  publishedPI: PIPublishedSnapshot | null;
+}
+
+export interface CustomerPIView {
+  status: PIStatus;
+  snapshot: PIPublishedSnapshot | null;
 }

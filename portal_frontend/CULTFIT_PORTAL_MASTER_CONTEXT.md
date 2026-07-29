@@ -5,8 +5,8 @@ in-progress order-request workflow. Read this before making changes — it
 exists so a future session (human or AI) doesn't have to re-derive any of
 this from scratch. No secret values appear anywhere in this document.
 
-Last updated: 2026-07-29, alongside the "resolve contact server-side" change
-described in §9–10.
+Last updated: 2026-07-29, alongside the Phase 2 PI workflow build
+(`feature/pi-workflow-v2`) described in §11.
 
 ---
 
@@ -368,15 +368,102 @@ automatically** — that requires an explicit decision from InBody.
 
 ---
 
-## 11. Future phase roadmap — document only, not built
+## 11. Future phase roadmap
 
-Do not build these without being explicitly asked to start that phase.
+**Phase 2 — PI: BUILT** (`feature/pi-workflow-v2`, not yet merged/deployed —
+see §14). Admin assigns a salesperson (`crm.lead.user_id`, live-loaded from
+the union of the three "Sales" security groups — historical CultFit
+salespeople were checked live and found to no longer be members of any
+active Sales group, so the eligible list is today's roster, not frozen
+history), then creates a **draft `sale.order`** from the request's own
+stored details (never re-derived any other way), linked via
+`opportunity_id`. Admin sets/confirms the main product price and validity
+date, then **Publish PI**. Customer sees nothing until published; once
+published, they can download the PDF and Confirm or Request Correction.
 
-**Phase 2 — PI:** InBody staff creates the quotation/PI in Odoo. Portal
-detects the linked `sale.order`. Customer downloads the PI (Odoo already has
-a native report for this: `sale.report_saleorder_pro_forma` — no custom
-template needed). Customer confirms the PI or requests a correction.
-Call/WhatsApp actions. "PI Ready" status.
+Do not build further phases without being explicitly asked to start that
+phase.
+
+**Why the PI PDF is NOT Odoo's native report** — verified live, do not
+re-attempt without a real fix to one of these two blockers:
+- Calling `ir.actions.report._render_qweb_pdf` over XML-RPC fails: *"Private
+  methods ... cannot be called remotely."* The old public alias
+  (`render_qweb_pdf`) no longer exists in this Odoo 19 instance either.
+- The web `/report/pdf/<report>/<res_ids>` endpoint (what a browser hits on
+  Print) needs an interactive session login. `POST /web/session/authenticate`
+  with this portal's API credentials returns **"Access Denied"** — almost
+  certainly because the Odoo service account was deliberately set up as
+  API/XML-RPC-only (or is using an API key rather than a real password),
+  with no backend/web login rights. Not a bug to route around.
+
+So `lib/pi-pdf.ts` renders its own look-alike PDF (via `pdfkit`, no
+headless-browser dependency — deliberately avoided given past Playwright/
+gstack binary-mismatch friction in this dev environment) from data already
+read via XML-RPC: line items, taxes, totals, company/GST details (verified
+live from `res.company` id 1), and the same bank-details/T&C boilerplate
+InBody's real quotations already carry (copied verbatim from live
+historical CultFit orders — see `PI_TERMS` block in `lib/pi-pdf.ts`).
+**Not byte-identical to Odoo's own template.** If InBody later provisions a
+web-login-capable Odoo credential, the render path in `publishPI()`
+(`lib/odoo-server.ts`) is the only place that would need to change.
+
+**PI status/versioning has no new Odoo field or model** — same
+zero-new-infrastructure approach as Phase 1: a structured JSON blob in an
+HTML-comment chatter marker on the Opportunity, one marker per event
+(`PORTAL_PI_DRAFT_CREATED`, `PORTAL_PI_SUPERSEDED`, `PORTAL_PI_PUBLISHED`,
+`PORTAL_PI_CUSTOMER_RESPONSE`), decoded back out and matched by an explicit
+`version` number embedded in the marker — never trusted from live
+`sale.order` state, so a published version's numbers stay frozen even if
+the underlying quotation is edited afterward (only `createPIRevision`
+supersedes a version, by cancelling the old `sale.order` — `state:
+'cancel'` — and creating a fresh one; PIs are never auto-confirmed, they
+stay in Odoo's draft/quotation state even after publish). Version number =
+`crm.lead.order_ids.length` at publish time (includes cancelled
+predecessors, so it only ever increases).
+
+Warranty years on the PDF are only asserted for the two products with a
+verified historical rule (InBody 260/260S → 5 years, InBody 120 → 1 year,
+`WARRANTY_YEARS_MAP` in `lib/odoo-server.ts`) — any other main product
+prints a generic phrase rather than a guessed number.
+
+Salesperson `Call`/`WhatsApp` buttons use `res.users.mobile_phone` (falling
+back to `phone`) — note the field is `mobile_phone`, **not** `mobile`
+(`mobile` doesn't exist on `res.users` in this instance, confirmed live via
+a real fault). Never shown when neither is set.
+
+### Controlled test results (2026-07-29, both test quotations cancelled and the test Opportunity archived afterward)
+
+Full flow exercised against production Odoo (submit → assign salesperson →
+create draft PI → publish → customer confirm) and verified field-by-field
+directly against Odoo, not just the app's own responses. Two real bugs
+found and fixed in the process:
+
+- **`pdfkit` reads its font `.afm` files from disk relative to its own
+  module path at runtime** — Turbopack/webpack bundling breaks that path
+  resolution (`ENOENT ... C:\ROOT\node_modules\pdfkit\...`). Fixed by adding
+  `serverExternalPackages: ["pdfkit"]` to `next.config.ts` — keeps it a real
+  `node_modules` require instead of bundling it. Required for `pdfkit` to
+  work in this app at all, on any environment (dev, Preview, Production).
+- **pdfkit's core Helvetica font has no Indian Rupee glyph** (U+20B9 isn't
+  in WinAnsiEncoding) — a literal `₹` silently rendered as a stray
+  superscript "1". Fixed by using `"Rs. "` instead. Also fixed: the Terms &
+  Conditions/Bank Details block was inheriting the narrow ~65pt column
+  width left over from the totals section (pdfkit carries position/width
+  state across `.text()` calls that don't pass explicit x/width) — now
+  explicit full-width (`50, doc.y, { width: 495 }`) on every call in that
+  section.
+
+Verified: draft `sale.order` fields (`opportunity_id`, `partner_id` /
+`partner_invoice_id` / `partner_shipping_id` all = CultFit partner, no new
+address created, `company_id`, `user_id`, `pricelist_id`,
+`client_order_ref`, `validity_date`, `date_order` auto-populated by Odoo's
+own stock default) all correct; tax/line math correct (5%/18% GST applied
+per product, bundle lines at ₹0); `Create Revision` correctly cancels the
+prior `sale.order` (`state: 'cancel'`) and increments version; published
+PDF downloads as a valid, well-formed, correctly laid-out PDF matching the
+published snapshot exactly; customer confirm flips status correctly and a
+second response is correctly rejected (400); admin list/detail and customer
+view agree on status throughout.
 
 **Phase 3 — PO:** Customer uploads the official PO PDF as `ir.attachment`
 (create rights already confirmed on this model). InBody verifies the PO. PO
@@ -432,6 +519,15 @@ devices for the shared login) until Phase 6.
   logged server-side only.
 - No customer, sale order, PI, invoice, or email is created anywhere in
   Phase 1.
+- Phase 2: customer can never supply/change salesperson id, main product
+  price, quotation id, or attachment id — all resolved/verified server-side.
+  A draft PI is never visible to the customer (the customer-facing fetch
+  path only ever reads published chatter snapshots, never a draft
+  `sale.order`, by construction). PI PDF download re-verifies the attachment
+  belongs to the specific `sale.order` in the published snapshot before
+  reading it (same ownership-check pattern as the existing quotation/invoice
+  attachment downloads). Unpublished/nonexistent PI returns an identical
+  safe 404 either way.
 
 ---
 
@@ -452,3 +548,8 @@ devices for the shared login) until Phase 6.
 - Do not create a real production Opportunity without explicit approval —
   use the controlled-test pattern (submit one clearly-labeled test request,
   verify every field directly against Odoo, then archive it) instead.
+- Phase 2 work happens on `feature/pi-workflow-v2` (branched from `main`
+  after Phase 1 was merged/deployed). Same controlled-test discipline
+  applies before release: a real `sale.order`/PI/attachment/chatter marker
+  should only be created against production Odoo with explicit approval,
+  verified field-by-field, then archived/cancelled if it was purely a test.

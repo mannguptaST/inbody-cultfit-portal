@@ -2,12 +2,21 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter, useParams } from 'next/navigation';
-import { getOrderRequestDetail } from '@/lib/api';
+import { getOrderRequestDetail, respondToPI, getPIDownloadUrl } from '@/lib/api';
 import { fetchCurrentUser, isInBodyStaff, logout } from '@/lib/auth';
-import { STAGE_VARIANT } from '@/lib/stage-config';
+import { STAGE_VARIANT, PI_STATUS_LABELS, PI_STATUS_VARIANT } from '@/lib/stage-config';
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
-import type { PortalRequestDetail } from '@/types';
+import type { PortalRequestDetail, CustomerPIView } from '@/types';
+
+function digitsOnly(phone: string): string {
+  return phone.replace(/[^\d]/g, '');
+}
+
+function fmtInr(n: number | null | undefined): string {
+  if (n == null) return '—';
+  return '₹' + n.toLocaleString('en-IN', { maximumFractionDigits: 2 });
+}
 
 function fmtDate(d: string | null | undefined): string {
   if (!d) return '—';
@@ -20,7 +29,6 @@ function fmtDateTime(d: string | null | undefined): string {
 }
 
 const FUTURE_SECTIONS = [
-  { key: 'pi', label: 'Proforma Invoice (PI)' },
   { key: 'po', label: 'Purchase Order (PO)' },
   { key: 'dispatch', label: 'Dispatch' },
   { key: 'invoice', label: 'Invoice' },
@@ -33,9 +41,22 @@ export default function RequestDetailPage() {
   const requestId = Number(params.id);
 
   const [request, setRequest] = useState<PortalRequestDetail | null>(null);
+  const [pi, setPi] = useState<CustomerPIView | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
   const [userName, setUserName] = useState('');
+
+  const [showCorrectionForm, setShowCorrectionForm] = useState(false);
+  const [comment, setComment] = useState('');
+  const [responding, setResponding] = useState(false);
+  const [respondError, setRespondError] = useState('');
+
+  function load() {
+    getOrderRequestDetail(requestId)
+      .then(res => { const { pi: piView, ...rest } = res; setRequest(rest); setPi(piView); })
+      .catch(err => setError(err instanceof Error ? err.message : 'Failed to load request.'))
+      .finally(() => setLoading(false));
+  }
 
   useEffect(() => {
     fetchCurrentUser().then(u => {
@@ -44,16 +65,32 @@ export default function RequestDetailPage() {
       setUserName(u.name ?? '');
     });
     if (!requestId) return;
-
-    getOrderRequestDetail(requestId)
-      .then(setRequest)
-      .catch(err => setError(err instanceof Error ? err.message : 'Failed to load request.'))
-      .finally(() => setLoading(false));
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestId, router]);
 
   async function handleLogout() {
     await logout();
     router.replace('/login');
+  }
+
+  async function handleRespond(action: 'confirm' | 'request_correction') {
+    if (action === 'request_correction' && !comment.trim()) {
+      setRespondError('Please describe what needs correcting.');
+      return;
+    }
+    setResponding(true);
+    setRespondError('');
+    try {
+      await respondToPI(requestId, action, comment.trim() || undefined);
+      setShowCorrectionForm(false);
+      setComment('');
+      load();
+    } catch (err: unknown) {
+      setRespondError(err instanceof Error ? err.message : 'Failed to submit response.');
+    } finally {
+      setResponding(false);
+    }
   }
 
   if (loading) return (
@@ -186,6 +223,125 @@ export default function RequestDetailPage() {
               )}
             </div>
 
+            {/* Proforma Invoice */}
+            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
+              <div className="flex items-center justify-between mb-4">
+                <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide">Proforma Invoice</h2>
+                {pi && pi.status !== 'not_created' && (
+                  <StatusChip label={PI_STATUS_LABELS[pi.status]} variant={PI_STATUS_VARIANT[pi.status]} />
+                )}
+              </div>
+
+              {(!pi || pi.status === 'not_created' || !pi.snapshot) ? (
+                <p className="text-sm text-slate-500">InBody is preparing your PI.</p>
+              ) : (
+                <div className="space-y-4">
+                  <div className="grid grid-cols-2 sm:grid-cols-4 gap-4 text-sm">
+                    <div>
+                      <p className="text-xs text-slate-400 uppercase tracking-wide">PI Number</p>
+                      <p className="font-mono font-medium text-slate-800 mt-0.5">{pi.snapshot.quotationNumber}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-400 uppercase tracking-wide">Version</p>
+                      <p className="text-slate-700 mt-0.5">V{pi.snapshot.version}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-400 uppercase tracking-wide">Published</p>
+                      <p className="text-slate-700 mt-0.5">{fmtDate(pi.snapshot.publishedDate)}</p>
+                    </div>
+                    <div>
+                      <p className="text-xs text-slate-400 uppercase tracking-wide">Valid Until</p>
+                      <p className="text-slate-700 mt-0.5">{fmtDate(pi.snapshot.validityDate)}</p>
+                    </div>
+                  </div>
+
+                  <div className="overflow-x-auto">
+                    <table className="w-full text-sm">
+                      <thead>
+                        <tr className="text-left text-xs text-slate-400 uppercase tracking-wide border-b border-slate-100">
+                          <th className="py-2 pr-3">Product</th>
+                          <th className="py-2 pr-3 text-right">Qty</th>
+                          <th className="py-2 text-right">Amount</th>
+                        </tr>
+                      </thead>
+                      <tbody className="divide-y divide-slate-50">
+                        {pi.snapshot.lineItems.map((l, i) => (
+                          <tr key={i}>
+                            <td className="py-2 pr-3 text-slate-700">[{l.code}] {l.name}</td>
+                            <td className="py-2 pr-3 text-right text-slate-600">{l.quantity}</td>
+                            <td className="py-2 text-right text-slate-700">{fmtInr(l.untaxedTotal)}</td>
+                          </tr>
+                        ))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="flex flex-wrap gap-6 text-sm border-t border-slate-100 pt-3">
+                    <p className="text-slate-500">Untaxed: <span className="text-slate-800 font-medium">{fmtInr(pi.snapshot.untaxedAmount)}</span></p>
+                    <p className="text-slate-500">Tax: <span className="text-slate-800 font-medium">{fmtInr(pi.snapshot.taxAmount)}</span></p>
+                    <p className="text-slate-500">Total: <span className="text-slate-900 font-semibold">{fmtInr(pi.snapshot.totalAmount)}</span></p>
+                  </div>
+
+                  <div className="flex flex-wrap items-center gap-3 pt-2">
+                    <a
+                      href={getPIDownloadUrl(request.id)}
+                      className="text-sm text-blue-600 hover:text-blue-700 border border-blue-200 hover:border-blue-300 bg-blue-50 px-4 py-2 rounded-lg transition-all"
+                    >
+                      Download PI
+                    </a>
+
+                    {pi.status === 'awaiting_confirmation' && !showCorrectionForm && (
+                      <>
+                        <button
+                          onClick={() => handleRespond('confirm')}
+                          disabled={responding}
+                          className="bg-green-600 hover:bg-green-700 disabled:bg-green-300 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors"
+                        >
+                          Confirm PI
+                        </button>
+                        <button
+                          onClick={() => setShowCorrectionForm(true)}
+                          disabled={responding}
+                          className="text-sm text-amber-700 hover:text-amber-800 border border-amber-200 hover:border-amber-300 bg-amber-50 px-4 py-2 rounded-lg transition-all"
+                        >
+                          Request Correction
+                        </button>
+                      </>
+                    )}
+                  </div>
+
+                  {pi.status === 'awaiting_confirmation' && showCorrectionForm && (
+                    <div className="border-t border-slate-100 pt-4 space-y-3">
+                      <label className="text-xs font-medium text-slate-600 block">
+                        What needs to be corrected? <span className="text-red-500">*</span>
+                      </label>
+                      <textarea
+                        rows={3}
+                        value={comment}
+                        onChange={e => setComment(e.target.value)}
+                        maxLength={1000}
+                        className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+                      />
+                      <div className="flex items-center gap-3">
+                        <button
+                          onClick={() => handleRespond('request_correction')}
+                          disabled={responding}
+                          className="bg-amber-600 hover:bg-amber-700 disabled:bg-amber-300 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors"
+                        >
+                          {responding ? 'Submitting...' : 'Submit Correction Request'}
+                        </button>
+                        <button onClick={() => { setShowCorrectionForm(false); setComment(''); }} className="text-sm text-slate-500 hover:text-slate-700">
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+
+                  {respondError && <p className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{respondError}</p>}
+                </div>
+              )}
+            </div>
+
             {/* Future sections — disabled placeholders, no fake data */}
             <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
               <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Order Progress</h2>
@@ -228,6 +384,23 @@ export default function RequestDetailPage() {
               <StatusChip label={request.portal_stage_label} variant={STAGE_VARIANT[request.portal_stage] ?? 'neutral'} />
               <div className="mt-4 space-y-2 text-xs text-slate-500">
                 <p>Assigned representative: <span className="text-slate-700 font-medium">{request.salesperson ?? 'Not yet assigned'}</span></p>
+                {request.salespersonPhone && (
+                  <div className="flex items-center gap-2 pt-1">
+                    <a
+                      href={`tel:${request.salespersonPhone}`}
+                      className="text-xs text-blue-600 hover:text-blue-700 border border-blue-200 hover:border-blue-300 bg-blue-50 px-3 py-1.5 rounded-lg transition-all"
+                    >
+                      Call
+                    </a>
+                    <a
+                      href={`https://wa.me/${digitsOnly(request.salespersonPhone)}`}
+                      target="_blank" rel="noopener noreferrer"
+                      className="text-xs text-green-700 hover:text-green-800 border border-green-200 hover:border-green-300 bg-green-50 px-3 py-1.5 rounded-lg transition-all"
+                    >
+                      WhatsApp
+                    </a>
+                  </div>
+                )}
                 <p>Created: {fmtDate(request.created_date)}</p>
                 <p>Last updated: {fmtDate(request.last_updated)}</p>
               </div>

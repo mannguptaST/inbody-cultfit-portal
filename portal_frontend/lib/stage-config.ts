@@ -108,3 +108,22 @@ export const REQUEST_STAGE_LABELS: Record<string, string> = {
   server_updated: 'Installation Pending',
   deal_closed: 'Completed',
 };
+
+// Phase 2 PI workflow status (admin list/detail + customer request detail) —
+// a display-only mapping of the PIStatus values computed server-side in
+// lib/odoo-server.ts, not a second independent status system.
+export const PI_STATUS_LABELS: Record<string, string> = {
+  not_created: 'No PI Yet',
+  draft: 'Draft PI',
+  awaiting_confirmation: 'Awaiting Confirmation',
+  confirmed: 'Confirmed',
+  correction_requested: 'Correction Requested',
+};
+
+export const PI_STATUS_VARIANT: Record<string, ChipVariant> = {
+  not_created: 'neutral',
+  draft: 'warning',
+  awaiting_confirmation: 'info',
+  confirmed: 'success',
+  correction_requested: 'danger',
+};
