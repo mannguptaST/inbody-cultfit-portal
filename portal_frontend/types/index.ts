@@ -96,6 +96,13 @@ export interface PortalRequestProduct {
   name: string;
 }
 
+export interface ResolvedCultFitContact {
+  name: string | null;
+  phone: string | null;
+  email: string | null;
+  source: 'portal-mapped' | 'primary-contact' | 'company' | 'portal-account-only';
+}
+
 export interface PortalRequestDetails {
   requestName: string;
   cocoFofo: 'COCO' | 'FOFO';
@@ -103,13 +110,18 @@ export interface PortalRequestDetails {
   quantity: number;
   includedProducts: PortalRequestProduct[];
   deliveryAddress: string;
-  contactName: string;
-  contactPhone: string;
-  contactEmail: string | null;
   preferredDeliveryDate: string | null;
   notes: string;
   portalAccount: string;
   submittedDate: string;
+  cultfitCompany: string | null;
+  contact: ResolvedCultFitContact | null;
+  // Legacy — only present on records created before contact resolution moved
+  // server-side. New records never set these; kept so old records still
+  // render. See CULTFIT_PORTAL_MASTER_CONTEXT.md.
+  contactName?: string;
+  contactPhone?: string;
+  contactEmail?: string | null;
 }
 
 export interface PortalRequestSummary {
@@ -139,9 +151,6 @@ export interface NewOrderRequestPayload {
   mainProductId: number;
   quantity: number;
   deliveryAddress: string;
-  contactName: string;
-  contactPhone: string;
-  contactEmail?: string;
   preferredDeliveryDate?: string;
   notes?: string;
 }

@@ -60,14 +60,14 @@ export async function POST(req: NextRequest) {
     const authz: Authz = { role: 'customer', scope: user.scope };
     const result = await createPortalOrderRequest(
       {
+        // Whitelisted, field-by-field — contact details are deliberately not
+        // read here at all (never trusted from the client; resolved
+        // server-side from the existing CultFit contact structure instead).
         requestName: body.requestName,
         cocoFofo: body.cocoFofo,
         mainProductId: body.mainProductId,
         quantity: body.quantity,
         deliveryAddress: body.deliveryAddress,
-        contactName: body.contactName,
-        contactPhone: body.contactPhone,
-        contactEmail: body.contactEmail,
         preferredDeliveryDate: body.preferredDeliveryDate,
         notes: body.notes,
       },

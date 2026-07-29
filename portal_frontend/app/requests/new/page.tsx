@@ -7,23 +7,22 @@ import { fetchCurrentUser, isInBodyStaff, logout } from '@/lib/auth';
 import PortalHeader from '@/components/PortalHeader';
 import type { CultFitProductOption } from '@/types';
 
+// Contact details (name/phone/email) are deliberately NOT collected here —
+// the CultFit customer/contact already exists in Odoo, resolved server-side
+// on submit. See CULTFIT_PORTAL_MASTER_CONTEXT.md §9.
 interface FormState {
   requestName: string;
   cocoFofo: '' | 'COCO' | 'FOFO';
   mainProductId: string;
   quantity: string;
   deliveryAddress: string;
-  contactName: string;
-  contactPhone: string;
-  contactEmail: string;
   preferredDeliveryDate: string;
   notes: string;
 }
 
 const EMPTY_FORM: FormState = {
   requestName: '', cocoFofo: '', mainProductId: '', quantity: '1',
-  deliveryAddress: '', contactName: '', contactPhone: '', contactEmail: '',
-  preferredDeliveryDate: '', notes: '',
+  deliveryAddress: '', preferredDeliveryDate: '', notes: '',
 };
 
 export default function NewOrderRequestPage() {
@@ -71,12 +70,6 @@ export default function NewOrderRequestPage() {
     const qty = Number(form.quantity);
     if (!Number.isInteger(qty) || qty < 1 || qty > 999) errs.quantity = 'Enter a whole number between 1 and 999';
     if (!form.deliveryAddress.trim()) errs.deliveryAddress = 'Required';
-    if (!form.contactName.trim()) errs.contactName = 'Required';
-    if (!form.contactPhone.trim()) errs.contactPhone = 'Required';
-    else if (!/^[0-9+()\-\s]{6,30}$/.test(form.contactPhone.trim())) errs.contactPhone = 'Enter a valid phone number';
-    if (form.contactEmail.trim() && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(form.contactEmail.trim())) {
-      errs.contactEmail = 'Enter a valid email address';
-    }
     return errs;
   }
 
@@ -96,9 +89,6 @@ export default function NewOrderRequestPage() {
         mainProductId: Number(form.mainProductId),
         quantity: Number(form.quantity),
         deliveryAddress: form.deliveryAddress.trim(),
-        contactName: form.contactName.trim(),
-        contactPhone: form.contactPhone.trim(),
-        contactEmail: form.contactEmail.trim() || undefined,
         preferredDeliveryDate: form.preferredDeliveryDate || undefined,
         notes: form.notes.trim() || undefined,
       });
@@ -221,56 +211,14 @@ export default function NewOrderRequestPage() {
             {fieldErrors.deliveryAddress && <p className="text-xs text-red-600 mt-1">{fieldErrors.deliveryAddress}</p>}
           </div>
 
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label className="text-xs font-medium text-slate-600 block mb-1">
-                Contact Person Name <span className="text-red-500">*</span>
-              </label>
-              <input
-                type="text"
-                value={form.contactName}
-                onChange={e => set('contactName', e.target.value)}
-                maxLength={100}
-                className={inputCls(!!fieldErrors.contactName)}
-              />
-              {fieldErrors.contactName && <p className="text-xs text-red-600 mt-1">{fieldErrors.contactName}</p>}
-            </div>
-            <div>
-              <label className="text-xs font-medium text-slate-600 block mb-1">
-                Contact Phone <span className="text-red-500">*</span>
-              </label>
-              <input
-                type="tel"
-                value={form.contactPhone}
-                onChange={e => set('contactPhone', e.target.value)}
-                maxLength={30}
-                className={inputCls(!!fieldErrors.contactPhone)}
-              />
-              {fieldErrors.contactPhone && <p className="text-xs text-red-600 mt-1">{fieldErrors.contactPhone}</p>}
-            </div>
-          </div>
-
-          <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-            <div>
-              <label className="text-xs font-medium text-slate-600 block mb-1">Contact Email</label>
-              <input
-                type="email"
-                value={form.contactEmail}
-                onChange={e => set('contactEmail', e.target.value)}
-                maxLength={150}
-                className={inputCls(!!fieldErrors.contactEmail)}
-              />
-              {fieldErrors.contactEmail && <p className="text-xs text-red-600 mt-1">{fieldErrors.contactEmail}</p>}
-            </div>
-            <div>
-              <label className="text-xs font-medium text-slate-600 block mb-1">Preferred Delivery Date</label>
-              <input
-                type="date"
-                value={form.preferredDeliveryDate}
-                onChange={e => set('preferredDeliveryDate', e.target.value)}
-                className={inputCls(false)}
-              />
-            </div>
+          <div>
+            <label className="text-xs font-medium text-slate-600 block mb-1">Preferred Delivery Date</label>
+            <input
+              type="date"
+              value={form.preferredDeliveryDate}
+              onChange={e => set('preferredDeliveryDate', e.target.value)}
+              className={inputCls(false) + ' sm:w-1/2'}
+            />
           </div>
 
           <div>

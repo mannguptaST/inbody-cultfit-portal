@@ -149,20 +149,31 @@ export default function RequestDetailPage() {
                     <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">Delivery Address</p>
                     <p className="text-sm text-slate-700 mt-0.5">{d.deliveryAddress}</p>
                   </div>
-                  <div>
-                    <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">Contact Person</p>
-                    <p className="text-sm text-slate-700 mt-0.5">{d.contactName}</p>
-                  </div>
-                  <div>
-                    <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">Contact Phone</p>
-                    <p className="text-sm text-slate-700 mt-0.5">{d.contactPhone}</p>
-                  </div>
-                  {d.contactEmail && (
+                  {d.cultfitCompany && (
                     <div>
-                      <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">Contact Email</p>
-                      <p className="text-sm text-slate-700 mt-0.5">{d.contactEmail}</p>
+                      <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">CultFit Company</p>
+                      <p className="text-sm text-slate-700 mt-0.5">{d.cultfitCompany}</p>
                     </div>
                   )}
+                  {/* Contact is resolved server-side from the existing Odoo contact —
+                      never customer-entered. Shown only when reliably found, never
+                      as blank/fake fields. Falls back to the legacy customer-entered
+                      values only for requests submitted before this change. */}
+                  {d.contact && (d.contact.name || d.contact.phone || d.contact.email) ? (
+                    <div>
+                      <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">Contact (from Odoo)</p>
+                      <p className="text-sm text-slate-700 mt-0.5">
+                        {[d.contact.name, d.contact.phone, d.contact.email].filter(Boolean).join(' · ')}
+                      </p>
+                    </div>
+                  ) : (d.contactName || d.contactPhone || d.contactEmail) ? (
+                    <div>
+                      <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">Contact</p>
+                      <p className="text-sm text-slate-700 mt-0.5">
+                        {[d.contactName, d.contactPhone, d.contactEmail].filter(Boolean).join(' · ')}
+                      </p>
+                    </div>
+                  ) : null}
                   {d.notes && (
                     <div className="sm:col-span-2">
                       <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">Notes</p>

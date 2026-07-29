@@ -759,6 +759,13 @@ export interface PortalRequestProduct {
   name: string;
 }
 
+export interface ResolvedCultFitContact {
+  name: string | null;
+  phone: string | null;
+  email: string | null;
+  source: 'portal-mapped' | 'primary-contact' | 'company' | 'portal-account-only';
+}
+
 export interface PortalRequestDetails {
   requestName: string;
   cocoFofo: 'COCO' | 'FOFO';
@@ -766,13 +773,22 @@ export interface PortalRequestDetails {
   quantity: number;
   includedProducts: PortalRequestProduct[];
   deliveryAddress: string;
-  contactName: string;
-  contactPhone: string;
-  contactEmail: string | null;
   preferredDeliveryDate: string | null;
   notes: string;
   portalAccount: string;
   submittedDate: string;
+  // Resolved server-side from the existing CultFit contact structure — see
+  // resolveCultFitParty() below and CULTFIT_PORTAL_MASTER_CONTEXT.md. Always
+  // present on records created from this point forward.
+  cultfitCompany: string | null;
+  contact: ResolvedCultFitContact | null;
+  // Legacy — only ever present on records created before contact resolution
+  // moved server-side (customer used to type these into the form directly).
+  // Never written by new code; kept only so decodeRequestDetails and the UI
+  // can still render old records without breaking.
+  contactName?: string;
+  contactPhone?: string;
+  contactEmail?: string | null;
 }
 
 function encodeRequestDetails(details: PortalRequestDetails): string {
@@ -794,19 +810,71 @@ function buildRequestDescriptionHtml(details: PortalRequestDetails): string {
   const includedLine = details.includedProducts.length
     ? details.includedProducts.map(p => `${escapeHtml(p.code)} ${escapeHtml(p.name)}`).join(', ')
     : '—';
+  const c = details.contact;
+  const contactLine = c
+    ? [c.name, c.phone, c.email].filter(Boolean).map(v => escapeHtml(String(v))).join(' · ') || '—'
+    : '—';
   const lines = [
     `<p><b>${PORTAL_REQUEST_MARKER}</b> — submitted via CultFit portal by ${escapeHtml(details.portalAccount)} on ${escapeHtml(details.submittedDate)}</p>`,
+    details.cultfitCompany ? `<p><b>CultFit company:</b> ${escapeHtml(details.cultfitCompany)}</p>` : '',
     `<p><b>Location/Request name:</b> ${escapeHtml(details.requestName)}</p>`,
     `<p><b>COCO/FOFO:</b> ${escapeHtml(details.cocoFofo)}</p>`,
     `<p><b>Main product:</b> ${escapeHtml(details.mainProduct.code)} ${escapeHtml(details.mainProduct.name)} × ${details.quantity}</p>`,
     `<p><b>Included (free):</b> ${includedLine}</p>`,
     `<p><b>Delivery address:</b> ${escapeHtml(details.deliveryAddress)}</p>`,
-    `<p><b>Contact:</b> ${escapeHtml(details.contactName)} · ${escapeHtml(details.contactPhone)}${details.contactEmail ? ' · ' + escapeHtml(details.contactEmail) : ''}</p>`,
+    `<p><b>Contact (from existing Odoo record, source: ${escapeHtml(c?.source ?? 'none')}):</b> ${contactLine}</p>`,
     details.preferredDeliveryDate ? `<p><b>Preferred delivery date:</b> ${escapeHtml(details.preferredDeliveryDate)}</p>` : '',
     details.notes ? `<p><b>Notes:</b> ${escapeHtml(details.notes)}</p>` : '',
     `<!--PORTAL_REQUEST_DATA:${encodeRequestDetails(details)}-->`,
   ];
   return lines.filter(Boolean).join('');
+}
+
+// Resolves the CultFit company + contact details to store on a new request —
+// never customer-submitted (the contact-entry form fields were removed; the
+// CultFit customer/contact already exists in Odoo, so we don't ask them to
+// retype it — see CULTFIT_PORTAL_MASTER_CONTEXT.md). Priority, per the
+// confirmed resolution rule:
+//   1. A res.partner under the CultFit company whose email matches the
+//      authenticated portal account exactly. None exists today — the portal
+//      login (cultfit@curefit.com) is a shared account, not mapped to any
+//      Odoo contact — verified live. Kept as priority 1 so this resolves
+//      correctly the moment a future per-user account IS mapped.
+//   2. The CultFit company's primary contact — res.partner type='contact'
+//      (Odoo's own convention for "the" default contact on a company),
+//      verified live to exist for partner 1822 with both phone and email.
+//   3. The company record itself (partner_id = CULTFIT_PARTNER_ID) if it has
+//      usable phone/email.
+//   4. Fallback: only the portal account's own email — never invented, never
+//      a blank field presented as real data.
+async function resolveCultFitParty(
+  authz: Authz, portalAccountEmail: string,
+): Promise<{ companyName: string | null; contact: ResolvedCultFitContact }> {
+  const partnerId = resolveCultFitPartnerId(authz);
+
+  const company = await executeKw('res.partner', 'read', [[partnerId]], { fields: ['name', 'phone', 'email'] }) as
+    { name: string; phone: string | false; email: string | false }[];
+  const companyName = company[0]?.name ?? null;
+
+  const mapped = await executeKw('res.partner', 'search_read', [
+    [['email', '=', portalAccountEmail], ['id', 'child_of', partnerId]],
+  ], { fields: ['name', 'phone', 'email'], limit: 1 }) as { name: string; phone: string | false; email: string | false }[];
+  if (mapped.length) {
+    return { companyName, contact: { name: mapped[0].name, phone: mapped[0].phone || null, email: mapped[0].email || null, source: 'portal-mapped' } };
+  }
+
+  const primary = await executeKw('res.partner', 'search_read', [
+    [['parent_id', '=', partnerId], ['type', '=', 'contact']],
+  ], { fields: ['name', 'phone', 'email'], limit: 1 }) as { name: string; phone: string | false; email: string | false }[];
+  if (primary.length && (primary[0].phone || primary[0].email)) {
+    return { companyName, contact: { name: primary[0].name, phone: primary[0].phone || null, email: primary[0].email || null, source: 'primary-contact' } };
+  }
+
+  if (company[0] && (company[0].phone || company[0].email)) {
+    return { companyName, contact: { name: company[0].name, phone: company[0].phone || null, email: company[0].email || null, source: 'company' } };
+  }
+
+  return { companyName, contact: { name: null, phone: null, email: portalAccountEmail, source: 'portal-account-only' } };
 }
 
 // The single canonical CultFit commercial partner for new-request creation —
@@ -995,14 +1063,11 @@ export interface NewOrderRequestInput {
   mainProductId: unknown;
   quantity: unknown;
   deliveryAddress: unknown;
-  contactName: unknown;
-  contactPhone: unknown;
-  contactEmail: unknown;
   preferredDeliveryDate: unknown;
   notes: unknown;
 }
 
-const MAX_LEN = { requestName: 120, deliveryAddress: 300, contactName: 100, contactPhone: 30, contactEmail: 150, notes: 1000 };
+const MAX_LEN = { requestName: 120, deliveryAddress: 300, notes: 1000 };
 
 function requiredText(v: unknown, field: string, max: number): string {
   if (typeof v !== 'string' || !v.trim()) throw new InvalidRequestError(`${field} is required.`);
@@ -1024,9 +1089,6 @@ export async function createPortalOrderRequest(
 
   const requestName = requiredText(input.requestName, 'Request/location name', MAX_LEN.requestName);
   const deliveryAddress = requiredText(input.deliveryAddress, 'Delivery address', MAX_LEN.deliveryAddress);
-  const contactName = requiredText(input.contactName, 'Contact person name', MAX_LEN.contactName);
-  const contactPhone = requiredText(input.contactPhone, 'Contact phone', MAX_LEN.contactPhone);
-  if (!/^[0-9+()\-\s]{6,30}$/.test(contactPhone)) throw new InvalidRequestError('Contact phone looks invalid.');
 
   if (input.cocoFofo !== 'COCO' && input.cocoFofo !== 'FOFO') {
     throw new InvalidRequestError('COCO/FOFO must be COCO or FOFO.');
@@ -1036,15 +1098,6 @@ export async function createPortalOrderRequest(
   const quantity = Number(input.quantity);
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > 999) {
     throw new InvalidRequestError('Quantity must be a whole number between 1 and 999.');
-  }
-
-  let contactEmail: string | null = null;
-  if (typeof input.contactEmail === 'string' && input.contactEmail.trim()) {
-    const trimmed = input.contactEmail.trim();
-    if (trimmed.length > MAX_LEN.contactEmail || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(trimmed)) {
-      throw new InvalidRequestError('Contact email looks invalid.');
-    }
-    contactEmail = trimmed;
   }
 
   let preferredDeliveryDate: string | null = null;
@@ -1073,6 +1126,7 @@ export async function createPortalOrderRequest(
   const stageId = await resolveNewStageId();
   const industryId = await resolveFitnessIndustryId();
   const subIndustryId = await resolveDefaultSubIndustryId();
+  const { companyName, contact } = await resolveCultFitParty(authz, portalAccountEmail);
 
   if (await findRecentDuplicateRequest(partnerId, requestName, mainProduct.id, quantity, deliveryAddress)) {
     throw new DuplicateRequestError();
@@ -1085,13 +1139,12 @@ export async function createPortalOrderRequest(
     quantity,
     includedProducts,
     deliveryAddress,
-    contactName,
-    contactPhone,
-    contactEmail,
     preferredDeliveryDate,
     notes,
     portalAccount: portalAccountEmail,
     submittedDate: new Date().toISOString().slice(0, 10),
+    cultfitCompany: companyName,
+    contact,
   };
 
   const leadId = await executeKw('crm.lead', 'create', [{
@@ -1106,9 +1159,6 @@ export async function createPortalOrderRequest(
     // this key is left out entirely, which violates "leave salesperson
     // unassigned for admin to set manually".
     user_id: false,
-    contact_name: contactName,
-    phone: contactPhone,
-    email_from: contactEmail || false,
     description: buildRequestDescriptionHtml(details),
   }]) as number;
 
