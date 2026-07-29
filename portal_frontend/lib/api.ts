@@ -6,6 +6,10 @@ import type {
   LoginResponse,
   CultFitOrder,
   CultFitOrdersResponse,
+  CultFitProductOption,
+  PortalRequestSummary,
+  PortalRequestDetail,
+  NewOrderRequestPayload,
 } from '@/types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '/api';
@@ -92,4 +96,27 @@ export async function getOdooAttachments(
   orderId: number,
 ): Promise<{ attachments: OdooAttachment[]; count: number }> {
   return apiFetch(`/portal/cultfit/orders/${orderId}/attachments`);
+}
+
+// ── New Order Request (Phase 1) ───────────────────────────────────────────────
+
+export async function getCultFitProducts(): Promise<{ products: CultFitProductOption[] }> {
+  return apiFetch('/portal/cultfit/products');
+}
+
+export async function submitOrderRequest(
+  payload: NewOrderRequestPayload,
+): Promise<{ id: number; name: string }> {
+  return apiFetch('/portal/cultfit/requests', {
+    method: 'POST',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getOrderRequests(): Promise<{ requests: PortalRequestSummary[] }> {
+  return apiFetch('/portal/cultfit/requests');
+}
+
+export async function getOrderRequestDetail(id: number): Promise<PortalRequestDetail> {
+  return apiFetch(`/portal/cultfit/requests/${id}`);
 }

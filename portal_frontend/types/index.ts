@@ -80,3 +80,77 @@ export interface CultFitOrdersResponse {
   orders: CultFitOrder[];
   count: number;
 }
+
+// ── Phase 1: New Order Request (CultFit CRM Opportunity requests) ────────────
+
+export interface CultFitProductOption {
+  id: number;
+  code: string;
+  name: string;
+  hasBundle: boolean;
+}
+
+export interface PortalRequestProduct {
+  id: number;
+  code: string;
+  name: string;
+}
+
+export interface ResolvedCultFitContact {
+  name: string | null;
+  phone: string | null;
+  email: string | null;
+  source: 'portal-mapped' | 'primary-contact' | 'company' | 'portal-account-only';
+}
+
+export interface PortalRequestDetails {
+  requestName: string;
+  cocoFofo: 'COCO' | 'FOFO';
+  mainProduct: PortalRequestProduct;
+  quantity: number;
+  includedProducts: PortalRequestProduct[];
+  deliveryAddress: string;
+  preferredDeliveryDate: string | null;
+  notes: string;
+  portalAccount: string;
+  submittedDate: string;
+  cultfitCompany: string | null;
+  contact: ResolvedCultFitContact | null;
+  // Legacy — only present on records created before contact resolution moved
+  // server-side. New records never set these; kept so old records still
+  // render. See CULTFIT_PORTAL_MASTER_CONTEXT.md.
+  contactName?: string;
+  contactPhone?: string;
+  contactEmail?: string | null;
+}
+
+export interface PortalRequestSummary {
+  id: number;
+  name: string;
+  details: PortalRequestDetails | null;
+  portal_stage: string;
+  portal_stage_label: string;
+  salesperson: string | null;
+  created_date: string | null;
+  last_updated: string | null;
+}
+
+export interface PortalRequestTimelineEntry {
+  date: string | null;
+  author: string;
+  body: string;
+}
+
+export interface PortalRequestDetail extends PortalRequestSummary {
+  timeline: PortalRequestTimelineEntry[];
+}
+
+export interface NewOrderRequestPayload {
+  requestName: string;
+  cocoFofo: 'COCO' | 'FOFO';
+  mainProductId: number;
+  quantity: number;
+  deliveryAddress: string;
+  preferredDeliveryDate?: string;
+  notes?: string;
+}

@@ -28,7 +28,7 @@ export function proxy(req: NextRequest) {
     return NextResponse.redirect(new URL(CUSTOMER_HOME, req.url));
   }
 
-  if (pathname.startsWith('/dashboard') && user.role === 'admin') {
+  if ((pathname.startsWith('/dashboard') || pathname.startsWith('/requests')) && user.role === 'admin') {
     return NextResponse.redirect(new URL(STAFF_HOME, req.url));
   }
 
@@ -36,5 +36,5 @@ export function proxy(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/admin/:path*', '/dashboard/:path*', '/orders/:path*'],
+  matcher: ['/admin/:path*', '/dashboard/:path*', '/orders/:path*', '/requests/:path*'],
 };

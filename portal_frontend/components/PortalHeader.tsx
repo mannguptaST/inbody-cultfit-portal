@@ -1,6 +1,7 @@
 'use client';
 import Image from 'next/image';
 import Link from 'next/link';
+import { usePathname } from 'next/navigation';
 
 interface Props {
   role?: 'STAFF' | 'CUSTOMER' | 'ADMIN';
@@ -20,10 +21,22 @@ const ROLE_BADGE: Record<string, string> = {
   CUSTOMER: 'bg-blue-50 text-blue-700 border border-blue-200',
 };
 
+const CUSTOMER_NAV = [
+  { href: '/dashboard', label: 'My Orders' },
+  { href: '/requests/new', label: 'New Order Request' },
+  { href: '/requests', label: 'My Requests' },
+];
+
+function isCustomerNavActive(pathname: string | null, href: string): boolean {
+  return pathname === href || (href === '/requests' && !!pathname?.startsWith('/requests/') && pathname !== '/requests/new');
+}
+
 export default function PortalHeader({
   role, userName, search, onSearchChange, onRefresh, onLogout,
   backHref, backLabel, crumb,
 }: Props) {
+  const pathname = usePathname();
+
   return (
     <header className="sticky top-0 z-40 bg-white border-b border-slate-200">
       <div className="max-w-screen-2xl mx-auto px-6 h-14 flex items-center gap-4">
@@ -39,6 +52,23 @@ export default function PortalHeader({
             </span>
           )}
         </div>
+
+        {/* Customer primary nav — desktop */}
+        {role === 'CUSTOMER' && (
+          <nav className="hidden sm:flex items-center gap-1 flex-shrink-0">
+            {CUSTOMER_NAV.map(item => (
+              <Link
+                key={item.href}
+                href={item.href}
+                className={`text-sm px-3 py-1.5 rounded-lg transition-colors ${
+                  isCustomerNavActive(pathname, item.href) ? 'bg-blue-50 text-blue-700 font-medium' : 'text-slate-500 hover:text-slate-800 hover:bg-slate-50'
+                }`}
+              >
+                {item.label}
+              </Link>
+            ))}
+          </nav>
+        )}
 
         {/* Breadcrumb (detail pages) */}
         {backHref && backLabel && (
@@ -116,6 +146,23 @@ export default function PortalHeader({
         </div>
 
       </div>
+
+      {/* Customer primary nav — mobile (the desktop nav above is hidden below sm) */}
+      {role === 'CUSTOMER' && (
+        <nav className="sm:hidden flex items-center gap-1 px-4 py-2 border-t border-slate-100 overflow-x-auto">
+          {CUSTOMER_NAV.map(item => (
+            <Link
+              key={item.href}
+              href={item.href}
+              className={`text-sm px-3 py-1.5 rounded-lg whitespace-nowrap transition-colors ${
+                isCustomerNavActive(pathname, item.href) ? 'bg-blue-50 text-blue-700 font-medium' : 'text-slate-500 hover:text-slate-800 hover:bg-slate-50'
+              }`}
+            >
+              {item.label}
+            </Link>
+          ))}
+        </nav>
+      )}
     </header>
   );
 }

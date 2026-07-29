@@ -3,7 +3,7 @@
 
 import 'server-only';
 import type { CustomerScope } from '@/lib/auth-server';
-import { STAGE_LABELS, STAGE_KEYS } from '@/lib/stage-config';
+import { STAGE_LABELS, STAGE_KEYS, REQUEST_STAGE_LABELS } from '@/lib/stage-config';
 
 const ODOO_URL  = (process.env.ODOO_BASE_URL  ?? '').replace(/\/$/, '');
 const ODOO_DB   = process.env.ODOO_DB          ?? '';
@@ -245,13 +245,59 @@ export async function checkOdooHealth(): Promise<boolean> {
 const CLOSED_STAGE_IDS = new Set([8, 9, 10, 11]);
 const COLLECTED_STAGE_ID = 8;
 
-const CULTFIT_DOMAIN = [
-  '|', '|', '|',
+// Single source of truth for "which Odoo commercial partner is CultFit" — a
+// stable id, configured via env, never hardcoded at any other call site in
+// this file. Replaces the name-based domain this project shipped with
+// initially: on 2026-07-29 the canonical partner (id 1822, ~80 linked leads)
+// was renamed live in production from "CULTFIT HEALTHCARE PRIVATE LIMITED"
+// to "CULT.FIT LIMITED" mid-session — a plain substring match against the
+// other 4 patterns this file used to rely on no longer caught it ('cult fit'
+// has a space, this has a period), which silently dropped the matched-lead
+// count from ~85 to 3 and affected every existing CultFit read (dashboard,
+// admin, order detail), not just this file's new additions. A rename can
+// never do that again with an id-based domain. commercial_partner_id already
+// resolves any child/location contact up to its top-level company, so a
+// single equality check on this id covers every CultFit location/address
+// without needing to enumerate them.
+const CULTFIT_PARTNER_ID = Number(process.env.CULTFIT_PARTNER_ID);
+
+function cultfitDomain(): unknown[] {
+  if (!Number.isInteger(CULTFIT_PARTNER_ID) || CULTFIT_PARTNER_ID <= 0) {
+    throw new Error('CULTFIT_PARTNER_ID is not configured — refusing to resolve CultFit access.');
+  }
+  return [['partner_id.commercial_partner_id', '=', CULTFIT_PARTNER_ID]];
+}
+
+// Retained ONLY as a guarded, opt-in diagnostic — never used to grant or
+// deny access. checkCultFitPartnerDrift() below compares this against the
+// id-based domain so a future rename shows up as a logged warning instead of
+// a silent access change, without ever letting a name match widen or narrow
+// what a customer can actually see.
+const CULTFIT_NAME_FALLBACK_DOMAIN = [
+  '|', '|', '|', '|',
   ['partner_id.commercial_partner_id.name', 'ilike', 'cultfit'],
   ['partner_id.commercial_partner_id.name', 'ilike', 'curefit'],
   ['partner_id.commercial_partner_id.name', 'ilike', 'cult fit'],
   ['partner_id.commercial_partner_id.name', 'ilike', 'cultfit healthcare'],
+  ['partner_id.commercial_partner_id.name', 'ilike', 'cult.fit'],
 ];
+
+// Best-effort, on-demand drift check — NOT called automatically on any
+// request path (an extra live Odoo round-trip per request isn't worth it for
+// a diagnostic). Call this manually (e.g. from a future admin/health route)
+// if you want to confirm the configured id still matches what name-based
+// matching would find. Never throws, never affects authorization.
+export async function checkCultFitPartnerDrift(): Promise<{ idBasedCount: number; nameBasedCount: number; drifted: boolean }> {
+  try {
+    const [idBasedCount, nameBasedCount] = await Promise.all([
+      executeKw('crm.lead', 'search_count', [cultfitDomain()]) as Promise<number>,
+      executeKw('crm.lead', 'search_count', [CULTFIT_NAME_FALLBACK_DOMAIN]) as Promise<number>,
+    ]);
+    return { idBasedCount, nameBasedCount, drifted: idBasedCount !== nameBasedCount };
+  } catch {
+    return { idBasedCount: -1, nameBasedCount: -1, drifted: false };
+  }
+}
 
 // ──── Authorization (never trust client input for any of this) ───────────────
 
@@ -267,17 +313,16 @@ export type Authz =
   | { role: 'customer'; scope: CustomerScope | undefined };
 
 // Every CultFit fetch — list AND single-record — resolves its domain from
-// this function only. It always includes the CultFit/Curefit domain, even
-// for admin, so no authenticated user of any role can ever read a crm.lead
-// outside the CultFit family through these functions, and a customer with
-// no (or an empty) scope gets a hard 403 rather than any fallback to broad
-// access.
+// this function only. It always includes the CultFit domain, even for admin,
+// so no authenticated user of any role can ever read a crm.lead outside the
+// CultFit family through these functions, and a customer with no (or an
+// empty) scope gets a hard 403 rather than any fallback to broad access.
 function authzDomain(authz: Authz): unknown[] {
-  if (authz.role === 'admin') return [...CULTFIT_DOMAIN];
+  if (authz.role === 'admin') return cultfitDomain();
 
   const scope = authz.scope;
   if (!scope) throw new PartnerNotMappedError();
-  if (scope.kind === 'cultfit_domain') return [...CULTFIT_DOMAIN];
+  if (scope.kind === 'cultfit_domain') return cultfitDomain();
   if (scope.kind === 'partner_ids') {
     if (!scope.partnerIds.length) throw new PartnerNotMappedError();
     return [['partner_id.commercial_partner_id', 'in', scope.partnerIds]];
@@ -312,7 +357,7 @@ const LEAD_FIELDS = [
   'payment_term_id', 'expected_revenue', 'won_status', 'is_credit_deal', 'order_ids',
 ];
 
-const SO_FIELDS = ['id', 'name', 'opportunity_id', 'amount_untaxed', 'amount_tax', 'order_line'];
+const SO_FIELDS = ['id', 'name', 'opportunity_id', 'amount_untaxed', 'amount_tax', 'order_line', 'client_order_ref'];
 
 // ──── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -333,7 +378,79 @@ function isOverdue(ds: string | null, stageId: number): boolean {
 
 type OdooTuple = [number, string] | false;
 
-function buildLead(lead: Record<string, unknown>): Record<string, unknown> {
+// Per-lead rollup of its linked sale.order(s). A crm.lead can have zero, one,
+// or several linked sale orders (order_ids) — these three fields each need a
+// different combination rule when there's more than one:
+//   - poNumber: no meaningful way to combine two reference strings, so we use
+//     the most-recently-linked order (last id in order_ids) as "the" order —
+//     the same convention the pre-Next.js FastAPI backend used (so_ids[-1:]).
+//   - amountUntaxed / amountTax: money combines cleanly by summation, so all
+//     linked orders are summed rather than picking just one.
+//   - modelNames: the deduplicated union of every product across every linked
+//     order, since a deal can accumulate models across more than one order.
+// Confirmed via a live, read-only fields_get probe against production Odoo:
+// no field for "PO received date" or "PI issued date" exists on crm.lead or
+// sale.order (the only close match is client_order_ref, mapped to poNumber
+// above). Do not invent a value for those two dates — leave them null.
+interface SoAggregate {
+  amountUntaxed: number;
+  amountTax: number;
+  poNumber: string | null;
+  modelNames: string[];
+}
+
+const EMPTY_SO_AGG: SoAggregate = { amountUntaxed: 0, amountTax: 0, poNumber: null, modelNames: [] };
+
+// Batched for a set of already-fetched leads (each must include order_ids from
+// LEAD_FIELDS). Reused by both the list and single-order fetch so detail pages
+// and list pages never disagree on these fields. No new authorization surface:
+// every sale.order/sale.order.line id read here is reached only through
+// order_ids on a lead that already passed authzDomain()/the id-match domain.
+async function fetchSoAggregates(leads: Record<string, unknown>[]): Promise<Map<number, SoAggregate>> {
+  const result = new Map<number, SoAggregate>();
+
+  const leadToSo: Record<number, number[]> = {};
+  const allSoIds: number[] = [];
+  for (const l of leads) {
+    const ids = (l.order_ids as number[]) || [];
+    leadToSo[l.id as number] = ids;
+    allSoIds.push(...ids);
+  }
+  if (!allSoIds.length) return result;
+
+  const sos = await executeKw('sale.order', 'read', [allSoIds], { fields: SO_FIELDS }) as Record<string, unknown>[];
+  const soMap = new Map(sos.map(so => [so.id as number, so]));
+
+  const allLineIds = sos.flatMap(so => (so.order_line as number[]) || []);
+  const lineProductMap = new Map<number, string>();
+  if (allLineIds.length) {
+    const lines = await executeKw('sale.order.line', 'read', [allLineIds], { fields: ['id', 'product_id'] }) as Record<string, unknown>[];
+    for (const line of lines) {
+      const p = line.product_id as OdooTuple;
+      if (p) lineProductMap.set(line.id as number, p[1]);
+    }
+  }
+
+  for (const [leadIdStr, soIds] of Object.entries(leadToSo)) {
+    const leadSos = soIds.map(id => soMap.get(id)).filter((s): s is Record<string, unknown> => !!s);
+    if (!leadSos.length) continue;
+    const primary = leadSos[leadSos.length - 1];
+    const modelNames = Array.from(new Set(
+      leadSos.flatMap(so => ((so.order_line as number[]) || [])
+        .map(lineId => lineProductMap.get(lineId))
+        .filter((n): n is string => !!n))
+    ));
+    result.set(Number(leadIdStr), {
+      amountUntaxed: leadSos.reduce((sum, so) => sum + ((so.amount_untaxed as number) || 0), 0),
+      amountTax: leadSos.reduce((sum, so) => sum + ((so.amount_tax as number) || 0), 0),
+      poNumber: (primary.client_order_ref as string) || null,
+      modelNames,
+    });
+  }
+  return result;
+}
+
+function buildLead(lead: Record<string, unknown>, soAgg: SoAggregate = EMPTY_SO_AGG): Record<string, unknown> {
   const stageVal     = lead.stage_id      as OdooTuple;
   const dsVal        = lead.deal_status_id as OdooTuple;
   const partnerVal   = lead.partner_id    as OdooTuple;
@@ -354,12 +471,12 @@ function buildLead(lead: Record<string, unknown>): Record<string, unknown> {
     order_no:     lead.name || `CRM-${lead.id}`,
     customer:     partnerVal ? partnerVal[1] : null,
     location:     lead.x_studio_machine_installed_at || lead.city || null,
-    model_names:  [],
+    model_names:  soAgg.modelNames,
     order_date:   parseDate(lead.create_date),
     last_updated: parseDate(lead.write_date),
     amount_total: lead.expected_revenue || 0,
-    amount_untaxed: 0,
-    amount_tax:   0,
+    amount_untaxed: soAgg.amountUntaxed,
+    amount_tax:   soAgg.amountTax,
     currency:     'INR',
     payment_terms: ptVal ? ptVal[1] : null,
     order_status:  stageLabel,
@@ -375,7 +492,9 @@ function buildLead(lead: Record<string, unknown>): Record<string, unknown> {
     vendor_portal_status:   'not_uploaded',
     confirmation_mail_sent: false,
     portal_notes: '',
-    po_number:        null,
+    po_number:        soAgg.poNumber,
+    // No field for either date exists on crm.lead or sale.order in production
+    // Odoo (verified live via fields_get) — left null rather than invented.
     po_received_date: null,
     pi_issued_date:   null,
     md_approval_status: 'pending',
@@ -395,21 +514,8 @@ export async function fetchCultFitOrders(authz: Authz): Promise<{ orders: unknow
     fields: LEAD_FIELDS, order: 'id desc', limit: 200,
   }) as Record<string, unknown>[];
 
-  const allSoIds: number[] = [];
-  const leadToSo: Record<number, number[]> = {};
-  for (const l of leads) {
-    const ids = (l.order_ids as number[]) || [];
-    leadToSo[l.id as number] = ids;
-    allSoIds.push(...ids);
-  }
-
-  const soMap: Record<number, Record<string, unknown>> = {};
-  if (allSoIds.length > 0) {
-    const sos = await executeKw('sale.order', 'read', [allSoIds], { fields: SO_FIELDS }) as Record<string, unknown>[];
-    for (const so of sos) soMap[so.id as number] = so;
-  }
-
-  const orders = leads.map(l => buildLead(l));
+  const soAggMap = await fetchSoAggregates(leads);
+  const orders = leads.map(l => buildLead(l, soAggMap.get(l.id as number)));
   return { orders, count: orders.length };
 }
 
@@ -423,8 +529,10 @@ export async function fetchCultFitOrderById(orderId: number, authz: Authz): Prom
   const leads = await executeKw('crm.lead', 'search_read', [domain], {
     fields: LEAD_FIELDS, limit: 1,
   }) as Record<string, unknown>[];
+  if (!leads.length) return null;
 
-  return leads.length ? buildLead(leads[0]) : null;
+  const soAggMap = await fetchSoAggregates(leads);
+  return buildLead(leads[0], soAggMap.get(leads[0].id as number));
 }
 
 const REVERSE_DS = Object.fromEntries(Object.entries(DEAL_STATUS_MAP).map(([k, v]) => [v, k]));
@@ -549,7 +657,7 @@ export async function fetchAttachmentData(
 // a foot-gun even for a trusted staff caller. Refuses to write to a lead
 // outside the CultFit/Curefit domain.
 async function assertCultFitLead(orderId: number): Promise<void> {
-  const count = await executeKw('crm.lead', 'search_count', [[['id', '=', orderId], ...CULTFIT_DOMAIN]]) as number;
+  const count = await executeKw('crm.lead', 'search_count', [[['id', '=', orderId], ...cultfitDomain()]]) as number;
   if (!count) throw new LeadNotFoundError();
 }
 
@@ -631,4 +739,525 @@ export async function setCultFitStage(
   await applyStageKey(orderId, stageKey);
   await postStageAuditNote(orderId, oldLabel, STAGE_LABELS[stageKey], adminEmail, reason);
   return { order_id: orderId, new_stage: stageKey, new_stage_label: STAGE_LABELS[stageKey] };
+}
+
+// ──── New Order Request (Phase 1) ──────────────────────────────────────────────
+// A customer-submitted request creates ONLY a crm.lead Opportunity — never a
+// res.partner, sale.order, or PI. Everything specific to the request (product,
+// quantity, COCO/FOFO, delivery/contact info) has nowhere else to live in
+// today's schema, so it's kept as a machine-readable JSON blob inside the
+// lead's own `description` (html) field, base64-wrapped inside an HTML
+// comment so it can never break the comment syntax regardless of what a
+// customer types, alongside a human-readable rendering so InBody staff see
+// it normally in Odoo. No new Odoo field or model is created.
+
+const PORTAL_REQUEST_MARKER = 'PORTAL_ORDER_REQUEST';
+
+export interface PortalRequestProduct {
+  id: number;
+  code: string;
+  name: string;
+}
+
+export interface ResolvedCultFitContact {
+  name: string | null;
+  phone: string | null;
+  email: string | null;
+  source: 'portal-mapped' | 'primary-contact' | 'company' | 'portal-account-only';
+}
+
+export interface PortalRequestDetails {
+  requestName: string;
+  cocoFofo: 'COCO' | 'FOFO';
+  mainProduct: PortalRequestProduct;
+  quantity: number;
+  includedProducts: PortalRequestProduct[];
+  deliveryAddress: string;
+  preferredDeliveryDate: string | null;
+  notes: string;
+  portalAccount: string;
+  submittedDate: string;
+  // Resolved server-side from the existing CultFit contact structure — see
+  // resolveCultFitParty() below and CULTFIT_PORTAL_MASTER_CONTEXT.md. Always
+  // present on records created from this point forward.
+  cultfitCompany: string | null;
+  contact: ResolvedCultFitContact | null;
+  // Legacy — only ever present on records created before contact resolution
+  // moved server-side (customer used to type these into the form directly).
+  // Never written by new code; kept only so decodeRequestDetails and the UI
+  // can still render old records without breaking.
+  contactName?: string;
+  contactPhone?: string;
+  contactEmail?: string | null;
+}
+
+function encodeRequestDetails(details: PortalRequestDetails): string {
+  return Buffer.from(JSON.stringify(details)).toString('base64');
+}
+
+function decodeRequestDetails(description: unknown): PortalRequestDetails | null {
+  if (typeof description !== 'string') return null;
+  const m = description.match(/<!--PORTAL_REQUEST_DATA:([A-Za-z0-9+/=]+)-->/);
+  if (!m) return null;
+  try {
+    return JSON.parse(Buffer.from(m[1], 'base64').toString('utf8')) as PortalRequestDetails;
+  } catch {
+    return null;
+  }
+}
+
+function buildRequestDescriptionHtml(details: PortalRequestDetails): string {
+  const includedLine = details.includedProducts.length
+    ? details.includedProducts.map(p => `${escapeHtml(p.code)} ${escapeHtml(p.name)}`).join(', ')
+    : '—';
+  const c = details.contact;
+  const contactLine = c
+    ? [c.name, c.phone, c.email].filter(Boolean).map(v => escapeHtml(String(v))).join(' · ') || '—'
+    : '—';
+  const lines = [
+    `<p><b>${PORTAL_REQUEST_MARKER}</b> — submitted via CultFit portal by ${escapeHtml(details.portalAccount)} on ${escapeHtml(details.submittedDate)}</p>`,
+    details.cultfitCompany ? `<p><b>CultFit company:</b> ${escapeHtml(details.cultfitCompany)}</p>` : '',
+    `<p><b>Location/Request name:</b> ${escapeHtml(details.requestName)}</p>`,
+    `<p><b>COCO/FOFO:</b> ${escapeHtml(details.cocoFofo)}</p>`,
+    `<p><b>Main product:</b> ${escapeHtml(details.mainProduct.code)} ${escapeHtml(details.mainProduct.name)} × ${details.quantity}</p>`,
+    `<p><b>Included (free):</b> ${includedLine}</p>`,
+    `<p><b>Delivery address:</b> ${escapeHtml(details.deliveryAddress)}</p>`,
+    `<p><b>Contact (from existing Odoo record, source: ${escapeHtml(c?.source ?? 'none')}):</b> ${contactLine}</p>`,
+    details.preferredDeliveryDate ? `<p><b>Preferred delivery date:</b> ${escapeHtml(details.preferredDeliveryDate)}</p>` : '',
+    details.notes ? `<p><b>Notes:</b> ${escapeHtml(details.notes)}</p>` : '',
+    `<!--PORTAL_REQUEST_DATA:${encodeRequestDetails(details)}-->`,
+  ];
+  return lines.filter(Boolean).join('');
+}
+
+// Resolves the CultFit company + contact details to store on a new request —
+// never customer-submitted (the contact-entry form fields were removed; the
+// CultFit customer/contact already exists in Odoo, so we don't ask them to
+// retype it — see CULTFIT_PORTAL_MASTER_CONTEXT.md). Priority, per the
+// confirmed resolution rule:
+//   1. A res.partner under the CultFit company whose email matches the
+//      authenticated portal account exactly. None exists today — the portal
+//      login (cultfit@curefit.com) is a shared account, not mapped to any
+//      Odoo contact — verified live. Kept as priority 1 so this resolves
+//      correctly the moment a future per-user account IS mapped.
+//   2. The CultFit company's primary contact — res.partner type='contact'
+//      (Odoo's own convention for "the" default contact on a company),
+//      verified live to exist for partner 1822 with both phone and email.
+//   3. The company record itself (partner_id = CULTFIT_PARTNER_ID) if it has
+//      usable phone/email.
+//   4. Fallback: only the portal account's own email — never invented, never
+//      a blank field presented as real data.
+async function resolveCultFitParty(
+  authz: Authz, portalAccountEmail: string,
+): Promise<{ companyName: string | null; contact: ResolvedCultFitContact }> {
+  const partnerId = resolveCultFitPartnerId(authz);
+
+  const company = await executeKw('res.partner', 'read', [[partnerId]], { fields: ['name', 'phone', 'email'] }) as
+    { name: string; phone: string | false; email: string | false }[];
+  const companyName = company[0]?.name ?? null;
+
+  const mapped = await executeKw('res.partner', 'search_read', [
+    [['email', '=', portalAccountEmail], ['id', 'child_of', partnerId]],
+  ], { fields: ['name', 'phone', 'email'], limit: 1 }) as { name: string; phone: string | false; email: string | false }[];
+  if (mapped.length) {
+    return { companyName, contact: { name: mapped[0].name, phone: mapped[0].phone || null, email: mapped[0].email || null, source: 'portal-mapped' } };
+  }
+
+  const primary = await executeKw('res.partner', 'search_read', [
+    [['parent_id', '=', partnerId], ['type', '=', 'contact']],
+  ], { fields: ['name', 'phone', 'email'], limit: 1 }) as { name: string; phone: string | false; email: string | false }[];
+  if (primary.length && (primary[0].phone || primary[0].email)) {
+    return { companyName, contact: { name: primary[0].name, phone: primary[0].phone || null, email: primary[0].email || null, source: 'primary-contact' } };
+  }
+
+  if (company[0] && (company[0].phone || company[0].email)) {
+    return { companyName, contact: { name: company[0].name, phone: company[0].phone || null, email: company[0].email || null, source: 'company' } };
+  }
+
+  return { companyName, contact: { name: null, phone: null, email: portalAccountEmail, source: 'portal-account-only' } };
+}
+
+// The single canonical CultFit commercial partner for new-request creation —
+// reads the same CULTFIT_PARTNER_ID config every other CultFit access check
+// uses (see cultfitDomain() above), never a separate lookup. If the
+// authenticated customer's own scope is a specific single partner (the
+// 'partner_ids' allowlist form — see auth-server.ts), that is used directly
+// instead, since it is more specific than the shared default. The customer
+// never supplies this value in any form.
+function resolveCultFitPartnerId(authz: Authz): number {
+  if (authz.role === 'customer' && authz.scope?.kind === 'partner_ids' && authz.scope.partnerIds.length === 1) {
+    return authz.scope.partnerIds[0];
+  }
+  if (!Number.isInteger(CULTFIT_PARTNER_ID) || CULTFIT_PARTNER_ID <= 0) {
+    throw new Error('CULTFIT_PARTNER_ID is not configured — refusing to create a portal request.');
+  }
+  return CULTFIT_PARTNER_ID;
+}
+
+let _newStageId: number | null = null;
+
+// The CRM pipeline's actual "New" stage (crm.stage), not the deal_status_id
+// used elsewhere in this file for the order-fulfillment portal_stage. A
+// freshly submitted request is a raw opportunity that hasn't entered the
+// order-fulfillment flow yet — verified live: crm.stage id 1 is named
+// exactly "New", sequence 0 (the pipeline's own entry stage).
+async function resolveNewStageId(): Promise<number> {
+  if (_newStageId) return _newStageId;
+  const stages = await executeKw('crm.stage', 'search_read', [[['name', '=', 'New']]], { fields: ['id'], limit: 1 }) as { id: number }[];
+  if (!stages.length) throw new Error("Could not resolve the 'New' CRM stage in Odoo.");
+  _newStageId = stages[0].id;
+  return _newStageId;
+}
+
+let _fitnessIndustryId: number | null = null;
+
+// crm.lead.industry_id is mandatory in this Odoo instance (a customization,
+// not stock Odoo behavior) — discovered live via a real Odoo fault ("Missing
+// required value for the field 'Industry'") when it wasn't set. Verified:
+// 100% of existing CultFit leads (80/80) use the "Fitness" industry —
+// resolved by name here, never hardcoded, same pattern as resolveNewStageId.
+async function resolveFitnessIndustryId(): Promise<number> {
+  if (_fitnessIndustryId) return _fitnessIndustryId;
+  const industries = await executeKw('res.partner.industry', 'search_read', [[['name', '=', 'Fitness']]], { fields: ['id'], limit: 1 }) as { id: number }[];
+  if (!industries.length) throw new Error("Could not resolve the 'Fitness' industry in Odoo.");
+  _fitnessIndustryId = industries[0].id;
+  return _fitnessIndustryId;
+}
+
+let _defaultSubIndustryId: number | null = null;
+
+// crm.lead.sub_industry_id is ALSO mandatory in this instance (discovered
+// live, same way as industry_id) — but unlike industry_id, there is no
+// single dominant value: historically 81% of CultFit leads use "High Budget
+// Fitness", 12% "Medium", 6% "Low" — a real budget-tier classification this
+// portal has no input to determine per-request (it isn't one of the form
+// fields). "High Budget Fitness" (the majority value) is used here as a
+// placeholder default so the required field is satisfied, NOT because it's
+// verified correct for any given request — flag this to InBody: either
+// accept staff correcting it manually per request, or add a real form field
+// for it in a later phase.
+async function resolveDefaultSubIndustryId(): Promise<number> {
+  if (_defaultSubIndustryId) return _defaultSubIndustryId;
+  const subIndustries = await executeKw('sub.industry', 'search_read', [[['name', '=', 'High Budget Fitness']]], { fields: ['id'], limit: 1 }) as { id: number }[];
+  if (!subIndustries.length) throw new Error("Could not resolve a default sub-industry in Odoo.");
+  _defaultSubIndustryId = subIndustries[0].id;
+  return _defaultSubIndustryId;
+}
+
+// Accessory/bundle-only products, verified live against every historical
+// CultFit order line — never offered as a selectable "main product". Also
+// excludes one deprecated SKU and one legacy duplicate 260S entry.
+const EXCLUDED_PRODUCT_IDS = new Set([
+  12044, // [IIPLPR002] HP 1008A — printer, bundle-only
+  12313, // [O40208301] LB WEB_B_1Y — software, bundle-only
+  12060, // [O40208002] Not Use_LB WEB Membership Fee(Franchise) — deprecated SKU
+  11881, // [Z9ZZ04006] [X][Assy]Stand 120 — bundle-only
+  12047, // [L9I100039] G_LookinBody120 InBT400 IB120 — bundle-only
+  10837, // [E01903012] Adapter 3.4A_3rd — accessory, bundle-only
+  12343, // [IIPLRS001] Result Sheet Set — accessory
+  12277, // G_InBody 260S — legacy duplicate of 12019 (1 historical use, no code prefix)
+]);
+
+// mainProductId -> included free products. Verified against historical
+// order lines (every InBody260S order includes the HP 1008A printer;
+// every InBody120 order includes Stand 120 + LookinBody120 software).
+// NF1500/270S have no verified bundle rule — deliberately left unmapped
+// rather than guessed; they're still selectable as a main product, just
+// with no automatic inclusions.
+const BUNDLE_MAP: Record<number, PortalRequestProduct[]> = {
+  12019: [ // G_InBody260S ENG
+    { id: 12044, code: 'IIPLPR002', name: 'HP 1008A' },
+    { id: 12313, code: 'O40208301', name: 'LB WEB_B_1Y' },
+  ],
+  12001: [ // G_InBody120 ENG
+    { id: 11881, code: 'Z9ZZ04006', name: '[X][Assy]Stand 120' },
+    { id: 12047, code: 'L9I100039', name: 'G_LookinBody120 InBT400 IB120' },
+  ],
+};
+
+function parseProductLabel(displayName: string): { code: string; name: string } {
+  const m = displayName.match(/^\[([^\]]+)]\s*(.*)$/);
+  return m ? { code: m[1], name: m[2] } : { code: '', name: displayName };
+}
+
+export interface CultFitProductOption {
+  id: number;
+  code: string;
+  name: string;
+  hasBundle: boolean;
+}
+
+// Builds the product picker from products already used in CultFit/Curefit
+// orders — never the full Odoo catalog (1,835 products). Deliberately
+// queried live rather than hardcoded, so a genuinely new main model shows up
+// automatically the first time InBody staff use it in a real order.
+export async function fetchCultFitProductCatalog(): Promise<CultFitProductOption[]> {
+  const leads = await executeKw('crm.lead', 'search_read', [cultfitDomain()], { fields: ['order_ids'] }) as { order_ids: number[] }[];
+  const soIds = [...new Set(leads.flatMap(l => l.order_ids || []))];
+  if (!soIds.length) return [];
+
+  const sos = await executeKw('sale.order', 'read', [soIds], { fields: ['order_line'] }) as { order_line: number[] }[];
+  const lineIds = [...new Set(sos.flatMap(s => s.order_line || []))];
+  if (!lineIds.length) return [];
+
+  const lines = await executeKw('sale.order.line', 'read', [lineIds], { fields: ['product_id'] }) as { product_id: OdooTuple }[];
+  const seen = new Map<number, string>();
+  for (const l of lines) {
+    if (l.product_id && !EXCLUDED_PRODUCT_IDS.has(l.product_id[0])) {
+      seen.set(l.product_id[0], l.product_id[1]);
+    }
+  }
+  return [...seen.entries()]
+    .map(([id, displayName]) => ({ id, ...parseProductLabel(displayName), hasBundle: !!BUNDLE_MAP[id] }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export class InvalidRequestError extends Error {
+  constructor(message: string) { super(message); this.name = 'InvalidRequestError'; }
+}
+
+export class DuplicateRequestError extends Error {
+  constructor() {
+    super('A similar request was already submitted recently. Check My Requests before submitting again.');
+    this.name = 'DuplicateRequestError';
+  }
+}
+
+const DUPLICATE_WINDOW_MS = 5 * 60 * 1000; // 5 minutes — long enough to catch a double-click/retry, short enough not to block a genuinely repeated order later
+
+function normalizeForCompare(s: string): string {
+  return s.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+// Guards against double-click/network-retry duplicate submissions, not
+// against a customer intentionally placing the same order again later — the
+// short time window is what keeps those two cases apart. Scoped to the same
+// CultFit partner (never cross-customer), same marker, and an exact
+// normalized match on the fields that define "the same request".
+async function findRecentDuplicateRequest(
+  partnerId: number, requestName: string, mainProductId: number, quantity: number, deliveryAddress: string,
+): Promise<boolean> {
+  const sinceIso = new Date(Date.now() - DUPLICATE_WINDOW_MS).toISOString().replace('T', ' ').slice(0, 19);
+  const domain = [
+    ['partner_id.commercial_partner_id', '=', partnerId],
+    ['description', 'ilike', PORTAL_REQUEST_MARKER],
+    ['create_date', '>=', sinceIso],
+  ];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: ['description'] }) as Record<string, unknown>[];
+
+  const normName = normalizeForCompare(requestName);
+  const normAddr = normalizeForCompare(deliveryAddress);
+  return leads.some(l => {
+    const details = decodeRequestDetails(l.description);
+    if (!details) return false;
+    return normalizeForCompare(details.requestName) === normName
+      && details.mainProduct.id === mainProductId
+      && details.quantity === quantity
+      && normalizeForCompare(details.deliveryAddress) === normAddr;
+  });
+}
+
+export interface NewOrderRequestInput {
+  requestName: unknown;
+  cocoFofo: unknown;
+  mainProductId: unknown;
+  quantity: unknown;
+  deliveryAddress: unknown;
+  preferredDeliveryDate: unknown;
+  notes: unknown;
+}
+
+const MAX_LEN = { requestName: 120, deliveryAddress: 300, notes: 1000 };
+
+function requiredText(v: unknown, field: string, max: number): string {
+  if (typeof v !== 'string' || !v.trim()) throw new InvalidRequestError(`${field} is required.`);
+  const trimmed = v.trim();
+  if (trimmed.length > max) throw new InvalidRequestError(`${field} must be ${max} characters or fewer.`);
+  return trimmed;
+}
+
+// Every field here is re-validated from scratch — this function is the only
+// place client input for a new request is trusted, and only for the fields
+// listed in NewOrderRequestInput. partner/salesperson/stage/price are never
+// read from `input` at all, let alone written from it.
+export async function createPortalOrderRequest(
+  input: NewOrderRequestInput,
+  authz: Authz,
+  portalAccountEmail: string,
+): Promise<{ id: number; name: string }> {
+  if (authz.role !== 'customer') throw new InvalidRequestError('Only a customer account can submit a request.');
+
+  const requestName = requiredText(input.requestName, 'Request/location name', MAX_LEN.requestName);
+  const deliveryAddress = requiredText(input.deliveryAddress, 'Delivery address', MAX_LEN.deliveryAddress);
+
+  if (input.cocoFofo !== 'COCO' && input.cocoFofo !== 'FOFO') {
+    throw new InvalidRequestError('COCO/FOFO must be COCO or FOFO.');
+  }
+  const cocoFofo = input.cocoFofo;
+
+  const quantity = Number(input.quantity);
+  if (!Number.isInteger(quantity) || quantity < 1 || quantity > 999) {
+    throw new InvalidRequestError('Quantity must be a whole number between 1 and 999.');
+  }
+
+  let preferredDeliveryDate: string | null = null;
+  if (typeof input.preferredDeliveryDate === 'string' && input.preferredDeliveryDate.trim()) {
+    const d = input.preferredDeliveryDate.trim();
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) throw new InvalidRequestError('Preferred delivery date must be a valid date.');
+    preferredDeliveryDate = d;
+  }
+
+  let notes = '';
+  if (typeof input.notes === 'string' && input.notes.trim()) {
+    notes = input.notes.trim();
+    if (notes.length > MAX_LEN.notes) throw new InvalidRequestError(`Notes must be ${MAX_LEN.notes} characters or fewer.`);
+  }
+
+  // Never trust a client-supplied product id blindly — re-verify it against
+  // the same live "already used by CultFit" catalog the picker itself came
+  // from, so a tampered request can't reference an arbitrary Odoo product
+  // or claim a bundle that doesn't apply to it.
+  const catalog = await fetchCultFitProductCatalog();
+  const mainProduct = catalog.find(p => p.id === Number(input.mainProductId));
+  if (!mainProduct) throw new InvalidRequestError('Selected product is not a valid CultFit product.');
+  const includedProducts = BUNDLE_MAP[mainProduct.id] ?? [];
+
+  const partnerId = resolveCultFitPartnerId(authz);
+  const stageId = await resolveNewStageId();
+  const industryId = await resolveFitnessIndustryId();
+  const subIndustryId = await resolveDefaultSubIndustryId();
+  const { companyName, contact } = await resolveCultFitParty(authz, portalAccountEmail);
+
+  if (await findRecentDuplicateRequest(partnerId, requestName, mainProduct.id, quantity, deliveryAddress)) {
+    throw new DuplicateRequestError();
+  }
+
+  const details: PortalRequestDetails = {
+    requestName,
+    cocoFofo,
+    mainProduct: { id: mainProduct.id, code: mainProduct.code, name: mainProduct.name },
+    quantity,
+    includedProducts,
+    deliveryAddress,
+    preferredDeliveryDate,
+    notes,
+    portalAccount: portalAccountEmail,
+    submittedDate: new Date().toISOString().slice(0, 10),
+    cultfitCompany: companyName,
+    contact,
+  };
+
+  const leadId = await executeKw('crm.lead', 'create', [{
+    name: requestName,
+    type: 'opportunity',
+    partner_id: partnerId,
+    stage_id: stageId,
+    industry_id: industryId,
+    sub_industry_id: subIndustryId,
+    // Explicit false, not merely omitted — discovered live that Odoo's own
+    // team/onchange defaults silently auto-assign a salesperson on create if
+    // this key is left out entirely, which violates "leave salesperson
+    // unassigned for admin to set manually".
+    user_id: false,
+    description: buildRequestDescriptionHtml(details),
+  }]) as number;
+
+  try {
+    await executeKw('crm.lead', 'message_post', [[leadId]], {
+      body: `<p><b>${PORTAL_REQUEST_MARKER}</b>: new order request submitted via the CultFit customer portal by ${escapeHtml(portalAccountEmail)}.</p>`,
+      subtype_xmlid: 'mail.mt_note',
+    });
+  } catch (e) {
+    console.error('[portal-request] failed to post confirmation note for lead', leadId, e instanceof Error ? e.message : e);
+  }
+
+  return { id: leadId, name: requestName };
+}
+
+export interface PortalRequestSummary {
+  id: number;
+  name: string;
+  details: PortalRequestDetails | null;
+  portal_stage: string;
+  portal_stage_label: string;
+  salesperson: string | null;
+  created_date: string | null;
+  last_updated: string | null;
+}
+
+const PORTAL_REQUEST_FIELDS = [
+  'id', 'name', 'description', 'deal_status_id', 'stage_id', 'user_id', 'create_date', 'write_date',
+];
+
+function buildRequestSummary(lead: Record<string, unknown>): PortalRequestSummary {
+  // Reuse the exact same stage-derivation logic as the existing order
+  // pipeline (buildLead) — a portal request is still just a crm.lead, so its
+  // status must never be computed a second, independent way.
+  const built = buildLead(lead);
+  const userVal = lead.user_id as OdooTuple;
+  const portalStage = built.portal_stage as string;
+  return {
+    id: lead.id as number,
+    name: (lead.name as string) || `CRM-${lead.id}`,
+    details: decodeRequestDetails(lead.description),
+    portal_stage: portalStage,
+    portal_stage_label: REQUEST_STAGE_LABELS[portalStage] ?? (built.portal_stage_label as string),
+    salesperson: userVal ? userVal[1] : null,
+    created_date: parseDate(lead.create_date),
+    last_updated: parseDate(lead.write_date),
+  };
+}
+
+// Only leads carrying the portal marker are ever returned here — this is
+// deliberately narrower than fetchCultFitOrders, which shows the entire
+// CultFit deal history. "My Requests" must show only what the customer
+// themselves submitted through this flow.
+export async function fetchPortalOrderRequests(authz: Authz): Promise<PortalRequestSummary[]> {
+  const domain = [...authzDomain(authz), ['description', 'ilike', PORTAL_REQUEST_MARKER]];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], {
+    fields: PORTAL_REQUEST_FIELDS, order: 'id desc', limit: 200,
+  }) as Record<string, unknown>[];
+  return leads.map(buildRequestSummary);
+}
+
+function stripHtml(html: string): string {
+  return html.replace(/<!--[\s\S]*?-->/g, '').replace(/<[^>]*>/g, ' ').replace(/&nbsp;/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+export interface PortalRequestTimelineEntry {
+  date: string | null;
+  author: string;
+  body: string;
+}
+
+export interface PortalRequestDetail extends PortalRequestSummary {
+  timeline: PortalRequestTimelineEntry[];
+}
+
+export async function fetchPortalOrderRequestById(id: number, authz: Authz): Promise<PortalRequestDetail | null> {
+  const domain = [['id', '=', id], ...authzDomain(authz), ['description', 'ilike', PORTAL_REQUEST_MARKER]];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: PORTAL_REQUEST_FIELDS, limit: 1 }) as Record<string, unknown>[];
+  if (!leads.length) return null;
+  const summary = buildRequestSummary(leads[0]);
+
+  // Chatter is presentation-only here (never re-parsed for structured data —
+  // that always comes from the description blob above) — a failure to load
+  // it must never break the rest of the request detail page.
+  let timeline: PortalRequestTimelineEntry[] = [];
+  try {
+    const messages = await executeKw('mail.message', 'search_read', [[
+      ['res_id', '=', id], ['model', '=', 'crm.lead'],
+    ]], { fields: ['date', 'author_id', 'body'], order: 'date desc', limit: 30 }) as Record<string, unknown>[];
+    timeline = messages
+      .map(m => ({
+        date: m.date ? String(m.date) : null,
+        author: (m.author_id as OdooTuple) ? (m.author_id as [number, string])[1] : 'Odoo',
+        body: stripHtml(String(m.body ?? '')),
+      }))
+      .filter(m => m.body);
+  } catch (e) {
+    console.error('[portal-request] failed to load chatter for lead', id, e instanceof Error ? e.message : e);
+  }
+
+  return { ...summary, timeline };
 }
