@@ -1883,7 +1883,7 @@ export async function respondToPublishedPI(
   }
 
   const domain = [['id', '=', leadId], ...authzDomain(authz), ['description', 'ilike', PORTAL_REQUEST_MARKER]];
-  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: ['id'] }) as { id: number }[];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: ['id', 'user_id'] }) as Record<string, unknown>[];
   if (!leads.length) throw new LeadNotFoundError();
 
   const { snapshot, response } = await fetchLatestPISnapshotAndResponse(leadId);
@@ -1901,6 +1901,47 @@ export async function respondToPublishedPI(
       + encodeMarkerData(PI_RESPONSE_MARKER, record),
     subtype_xmlid: 'mail.mt_note',
   });
+
+  // Correction requests need to actually reach the assigned salesperson, not
+  // just sit in chatter — schedule a standard Odoo activity on them (no
+  // email involved; this is Odoo's own in-app "To-Do" activity system,
+  // already used by staff for every other follow-up). Created directly via
+  // mail.activity rather than the activity_schedule() convenience method —
+  // that method's kwargs (e.g. activity_type_xmlid) turned out not to match
+  // this Odoo 19 instance's signature (verified live via a real fault:
+  // "Invalid field 'activity_type_xmlid' in 'mail.activity'"). Also
+  // verified live that res_model_id (the ir.model record, not just the
+  // res_model char) must be set explicitly — omitting it faults with
+  // "Activities have to be linked to records with a not null res_id" even
+  // though res_id was set. Resolves the "To-Do" type and crm.lead's
+  // ir.model id live rather than hardcoding either. Best-effort: a failure
+  // here must never block the customer's response from being recorded,
+  // which is the operation that matters.
+  if (action === 'request_correction') {
+    const userVal = leads[0].user_id as OdooTuple;
+    if (userVal) {
+      try {
+        const [todoTypes, leadModels] = await Promise.all([
+          executeKw('mail.activity.type', 'search_read', [[['name', '=', 'To-Do']]], { fields: ['id'], limit: 1 }) as Promise<{ id: number }[]>,
+          executeKw('ir.model', 'search_read', [[['model', '=', 'crm.lead']]], { fields: ['id'], limit: 1 }) as Promise<{ id: number }[]>,
+        ]);
+        if (todoTypes.length && leadModels.length) {
+          await executeKw('mail.activity', 'create', [{
+            res_model_id: leadModels[0].id,
+            res_model: 'crm.lead',
+            res_id: leadId,
+            activity_type_id: todoTypes[0].id,
+            summary: `Portal PI correction requested — ${snapshot.quotationNumber} (v${snapshot.version})`,
+            note: escapeHtml(commentText),
+            user_id: userVal[0],
+            date_deadline: new Date().toISOString().slice(0, 10),
+          }]);
+        }
+      } catch (e) {
+        console.error('[pi-respond] failed to schedule correction activity for lead', leadId, e instanceof Error ? e.message : e);
+      }
+    }
+  }
 
   return { status: action === 'confirm' ? 'confirmed' : 'correction_requested' };
 }
