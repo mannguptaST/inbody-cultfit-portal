@@ -4,6 +4,7 @@
 import 'server-only';
 import type { CustomerScope } from '@/lib/auth-server';
 import { STAGE_LABELS, STAGE_KEYS, REQUEST_STAGE_LABELS } from '@/lib/stage-config';
+import { generatePIPdf, type PILineItem } from '@/lib/pi-pdf';
 
 const ODOO_URL  = (process.env.ODOO_BASE_URL  ?? '').replace(/\/$/, '');
 const ODOO_DB   = process.env.ODOO_DB          ?? '';
@@ -1181,6 +1182,7 @@ export interface PortalRequestSummary {
   portal_stage: string;
   portal_stage_label: string;
   salesperson: string | null;
+  salespersonPhone: string | null;
   created_date: string | null;
   last_updated: string | null;
 }
@@ -1203,9 +1205,30 @@ function buildRequestSummary(lead: Record<string, unknown>): PortalRequestSummar
     portal_stage: portalStage,
     portal_stage_label: REQUEST_STAGE_LABELS[portalStage] ?? (built.portal_stage_label as string),
     salesperson: userVal ? userVal[1] : null,
+    salespersonPhone: null, // filled in by the batched lookup below — never a fake/blank value shown as real
     created_date: parseDate(lead.create_date),
     last_updated: parseDate(lead.write_date),
   };
+}
+
+// Batched (one query for however many distinct salespeople appear across
+// the whole list) rather than one res.users read per request. Prefers
+// mobile_phone over phone since Call/WhatsApp buttons work best with a
+// mobile number — falls back to phone, and to null (never a fake number)
+// if this Odoo user genuinely has neither set.
+async function fetchSalespersonPhones(userIds: number[]): Promise<Map<number, string | null>> {
+  const result = new Map<number, string | null>();
+  if (!userIds.length) return result;
+  const users = await executeKw('res.users', 'read', [userIds], { fields: ['id', 'phone', 'mobile_phone'] }) as
+    { id: number; phone: string | false; mobile_phone: string | false }[];
+  for (const u of users) result.set(u.id, (u.mobile_phone || u.phone) || null);
+  return result;
+}
+
+function distinctUserIds(leads: Record<string, unknown>[]): number[] {
+  return [...new Set(leads
+    .map(l => (l.user_id as OdooTuple) ? (l.user_id as [number, string])[0] : null)
+    .filter((id): id is number => id != null))];
 }
 
 // Only leads carrying the portal marker are ever returned here — this is
@@ -1217,7 +1240,12 @@ export async function fetchPortalOrderRequests(authz: Authz): Promise<PortalRequ
   const leads = await executeKw('crm.lead', 'search_read', [domain], {
     fields: PORTAL_REQUEST_FIELDS, order: 'id desc', limit: 200,
   }) as Record<string, unknown>[];
-  return leads.map(buildRequestSummary);
+  const phoneMap = await fetchSalespersonPhones(distinctUserIds(leads));
+  return leads.map(l => {
+    const summary = buildRequestSummary(l);
+    const userVal = l.user_id as OdooTuple;
+    return { ...summary, salespersonPhone: userVal ? phoneMap.get(userVal[0]) ?? null : null };
+  });
 }
 
 function stripHtml(html: string): string {
@@ -1239,6 +1267,11 @@ export async function fetchPortalOrderRequestById(id: number, authz: Authz): Pro
   const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: PORTAL_REQUEST_FIELDS, limit: 1 }) as Record<string, unknown>[];
   if (!leads.length) return null;
   const summary = buildRequestSummary(leads[0]);
+  const userVal = leads[0].user_id as OdooTuple;
+  if (userVal) {
+    const phoneMap = await fetchSalespersonPhones([userVal[0]]);
+    summary.salespersonPhone = phoneMap.get(userVal[0]) ?? null;
+  }
 
   // Chatter is presentation-only here (never re-parsed for structured data —
   // that always comes from the description blob above) — a failure to load
@@ -1260,4 +1293,639 @@ export async function fetchPortalOrderRequestById(id: number, authz: Authz): Pro
   }
 
   return { ...summary, timeline };
+}
+
+// ──── PI Workflow (Phase 2) ─────────────────────────────────────────────────
+// Admin assigns a salesperson, creates a draft sale.order from the stored
+// request details, edits price/validity, then publishes it. Odoo's own
+// native PDF report cannot be produced by this portal: calling
+// ir.actions.report._render_qweb_pdf over XML-RPC is refused by Odoo itself
+// ("Private methods ... cannot be called remotely" — verified live), and the
+// web /report/pdf/ endpoint needs an interactive session login that this
+// portal's API service account cannot obtain ("Access Denied" — verified
+// live). So this renders its own look-alike PI PDF (lib/pi-pdf.ts) from data
+// already read via XML-RPC, and snapshots it as an ir.attachment on publish.
+// No new Odoo field/model exists for PI status or versioning — same
+// zero-new-infrastructure approach as Phase 1: a structured JSON blob
+// embedded in a chatter note on the Opportunity (crm.lead), one marker per
+// publish/response, decoded back out rather than trusted from live
+// sale.order state (so an earlier published version's numbers stay frozen
+// even if the underlying quotation is later revised).
+
+export class PIWorkflowError extends Error {
+  constructor(message: string) { super(message); this.name = 'PIWorkflowError'; }
+}
+
+export interface EligibleSalesperson {
+  id: number;
+  name: string;
+}
+
+const SALES_GROUP_FULL_NAMES = [
+  'Sales / User: Own Documents Only',
+  'Sales / User: All Documents',
+  'Sales / Administrator',
+];
+
+// Resolved by name on every call (same "verified live, never frozen"
+// philosophy as resolveNewStageId/fetchCultFitProductCatalog) rather than
+// hardcoded group ids — a renamed/reconfigured group should never silently
+// go stale the way the CultFit partner name once did. Union of all three
+// Sales access groups, since a salesperson could plausibly hold any of them.
+// Historical CultFit leads' own salespeople were checked live and found to
+// no longer be members of any active Sales group (past staff, presumably) —
+// so the eligible list is today's active roster, not frozen history.
+export async function fetchEligibleSalespeople(): Promise<EligibleSalesperson[]> {
+  const groups = await executeKw('res.groups', 'search_read', [[['full_name', 'in', SALES_GROUP_FULL_NAMES]]], { fields: ['user_ids'] }) as { user_ids: number[] }[];
+  const userIds = [...new Set(groups.flatMap(g => g.user_ids || []))];
+  if (!userIds.length) return [];
+  const users = await executeKw('res.users', 'search_read', [[['id', 'in', userIds], ['active', '=', true]]], { fields: ['id', 'name'] }) as EligibleSalesperson[];
+  return users.sort((a, b) => a.name.localeCompare(b.name));
+}
+
+export async function assignSalesperson(
+  leadId: number, salespersonId: number, authz: Authz, adminEmail: string,
+): Promise<EligibleSalesperson> {
+  if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can assign a salesperson.');
+  await assertCultFitLead(leadId);
+
+  const eligible = await fetchEligibleSalespeople();
+  const match = eligible.find(s => s.id === Number(salespersonId));
+  if (!match) throw new PIWorkflowError('Selected salesperson is not a valid InBody sales user.');
+
+  await executeKw('crm.lead', 'write', [[leadId], { user_id: match.id }]);
+  try {
+    await executeKw('crm.lead', 'message_post', [[leadId]], {
+      body: `<p><b>PORTAL_SALESPERSON_ASSIGNED</b>: ${escapeHtml(match.name)} assigned by ${escapeHtml(adminEmail)}.</p>`,
+      subtype_xmlid: 'mail.mt_note',
+    });
+  } catch (e) {
+    console.error('[pi] failed to post salesperson-assigned note for lead', leadId, e instanceof Error ? e.message : e);
+  }
+  return match;
+}
+
+export type PIStatus = 'not_created' | 'draft' | 'awaiting_confirmation' | 'confirmed' | 'correction_requested';
+
+export interface PIDraftLine {
+  id: number;
+  productId: number;
+  code: string;
+  name: string;
+  quantity: number;
+  unitPrice: number;
+  taxLabel: string;
+  untaxedTotal: number;
+  taxTotal: number;
+}
+
+export interface PIDraftInfo {
+  id: number;
+  name: string;
+  state: string;
+  validityDate: string | null;
+  mainProductUnitPrice: number;
+  lines: PIDraftLine[];
+  untaxedAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+}
+
+const SO_DRAFT_FIELDS = ['id', 'name', 'state', 'validity_date', 'order_line', 'amount_untaxed', 'amount_tax', 'amount_total'];
+const SOL_DRAFT_FIELDS = ['id', 'product_id', 'product_uom_qty', 'price_unit', 'tax_ids', 'price_subtotal', 'price_tax'];
+
+async function buildDraftSOInfo(so: Record<string, unknown>): Promise<PIDraftInfo> {
+  const lineIds = (so.order_line as number[]) || [];
+  const lines = lineIds.length
+    ? await executeKw('sale.order.line', 'read', [lineIds], { fields: SOL_DRAFT_FIELDS }) as Record<string, unknown>[]
+    : [];
+
+  const taxIds = [...new Set(lines.flatMap(l => (l.tax_ids as number[]) || []))];
+  const taxes = taxIds.length
+    ? await executeKw('account.tax', 'read', [taxIds], { fields: ['id', 'name'] }) as { id: number; name: string }[]
+    : [];
+  const taxMap = new Map(taxes.map(t => [t.id, t.name]));
+
+  const builtLines: PIDraftLine[] = lines.map(l => {
+    const p = l.product_id as OdooTuple;
+    const { code, name } = p ? parseProductLabel(p[1]) : { code: '', name: '' };
+    const taxLabel = ((l.tax_ids as number[]) || []).map(id => taxMap.get(id)).filter(Boolean).join(', ') || 'No Tax';
+    return {
+      id: l.id as number, productId: p ? p[0] : 0, code, name,
+      quantity: (l.product_uom_qty as number) || 0, unitPrice: (l.price_unit as number) || 0, taxLabel,
+      untaxedTotal: (l.price_subtotal as number) || 0, taxTotal: (l.price_tax as number) || 0,
+    };
+  });
+  const mainLine = builtLines.find(l => l.unitPrice > 0) ?? builtLines[0] ?? null;
+
+  return {
+    id: so.id as number, name: so.name as string, state: so.state as string,
+    validityDate: parseDate(so.validity_date),
+    mainProductUnitPrice: mainLine ? mainLine.unitPrice : 0,
+    lines: builtLines,
+    untaxedAmount: (so.amount_untaxed as number) || 0,
+    taxAmount: (so.amount_tax as number) || 0,
+    totalAmount: (so.amount_total as number) || 0,
+  };
+}
+
+// The single, currently-active (non-cancelled) sale.order linked to a
+// request lead, if any — "active" meaning not explicitly superseded via
+// createPIRevision. A published PI is still an Odoo 'draft'/'sent'
+// quotation (Phase 1/2 deliberately never confirm it), so this is also what
+// the admin PI editor and Publish PI operate on.
+async function findActiveDraftSO(leadId: number): Promise<PIDraftInfo | null> {
+  const leads = await executeKw('crm.lead', 'read', [[leadId]], { fields: ['order_ids'] }) as { order_ids: number[] }[];
+  const soIds = leads[0]?.order_ids || [];
+  if (!soIds.length) return null;
+
+  const sos = await executeKw('sale.order', 'read', [soIds], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
+  const active = sos.filter(s => s.state !== 'cancel').sort((a, b) => (b.id as number) - (a.id as number))[0];
+  return active ? buildDraftSOInfo(active) : null;
+}
+
+// Verifies a specific sale.order id genuinely belongs to this lead (via
+// crm.lead.order_ids) before any read/write touches it — same "never trust a
+// stored/supplied id blindly" pattern as fetchAttachmentData's ownership
+// check. Used by update/publish so an admin can never act on an SO from a
+// different request even by guessing/tampering with an id.
+async function verifySOBelongsToLead(leadId: number, soId: number): Promise<PIDraftInfo> {
+  const leads = await executeKw('crm.lead', 'read', [[leadId]], { fields: ['order_ids'] }) as { order_ids: number[] }[];
+  if (!(leads[0]?.order_ids || []).includes(soId)) throw new LeadNotFoundError();
+  const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
+  if (!sos.length) throw new LeadNotFoundError();
+  return buildDraftSOInfo(sos[0]);
+}
+
+const COMPANY_ID = 1; // "InBody India Private Limited" — verified live: every historical CultFit sale.order uses this company (this Odoo instance has a second, unrelated company, id 2)
+const DEFAULT_VALIDITY_DAYS = 30; // matches the ~30-day windows seen on real historical CultFit quotations
+const MAX_PRICE = 100_000_000; // sanity ceiling against a fat-fingered price, not a business rule
+
+// Only verified for these two — every other selectable main product (e.g.
+// NF1500, InBody270S) has no confirmed warranty term, so the PDF prints a
+// generic phrase rather than a guessed number. See BUNDLE_MAP above.
+const WARRANTY_YEARS_MAP: Record<number, number> = {
+  12019: 5, // InBody 260/260S
+  12001: 1, // InBody 120
+};
+
+function requirePositivePrice(v: unknown): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n <= 0 || n > MAX_PRICE) throw new PIWorkflowError('Enter a valid main product price.');
+  return n;
+}
+
+// Shared by createDraftPI and createPIRevision — builds order_line commands
+// from the request's own stored details (never re-derived any other way, so
+// the PI always matches exactly what the customer originally asked for) and
+// creates the sale.order. Does not check for an existing active draft —
+// callers are responsible for that (createDraftPI refuses if one exists,
+// createPIRevision cancels the old one first).
+async function buildAndCreateSO(
+  leadId: number, mainProductPrice: number, authz: Authz, adminEmail: string,
+): Promise<PIDraftInfo> {
+  const price = requirePositivePrice(mainProductPrice);
+
+  const leads = await executeKw('crm.lead', 'read', [[leadId]], { fields: ['description', 'user_id'] }) as Record<string, unknown>[];
+  if (!leads.length) throw new LeadNotFoundError();
+  const lead = leads[0];
+
+  const details = decodeRequestDetails(lead.description);
+  if (!details) throw new PIWorkflowError('This request has no stored product details to build a PI from.');
+
+  const userVal = lead.user_id as OdooTuple;
+  if (!userVal) throw new PIWorkflowError('Assign a salesperson before creating a PI.');
+
+  const quantity = details.quantity;
+  const productIds = [details.mainProduct.id, ...details.includedProducts.map(p => p.id)];
+  const products = await executeKw('product.product', 'read', [productIds], { fields: ['id', 'taxes_id', 'uom_id'] }) as { id: number; taxes_id: number[]; uom_id: OdooTuple }[];
+  const productMap = new Map(products.map(p => [p.id, p]));
+
+  function lineCommand(id: number, code: string, name: string, unitPrice: number, includedLabel: boolean) {
+    const p = productMap.get(id);
+    if (!p) throw new PIWorkflowError(`Product [${code}] ${name} could not be found in Odoo — cannot build this PI.`);
+    return [0, 0, {
+      product_id: id,
+      name: includedLabel ? `[${code}] ${name} (included)` : `[${code}] ${name}`,
+      product_uom_qty: quantity,
+      price_unit: unitPrice,
+      tax_ids: [[6, 0, p.taxes_id || []]],
+      product_uom_id: p.uom_id ? p.uom_id[0] : false,
+    }];
+  }
+
+  const orderLines = [
+    lineCommand(details.mainProduct.id, details.mainProduct.code, details.mainProduct.name, price, false),
+    ...details.includedProducts.map(incl => lineCommand(incl.id, incl.code, incl.name, 0, true)),
+  ];
+
+  const partnerId = resolveCultFitPartnerId(authz);
+  const partnerRead = await executeKw('res.partner', 'read', [[partnerId]], { fields: ['property_product_pricelist'] }) as { property_product_pricelist: OdooTuple }[];
+  const pricelistId = partnerRead[0]?.property_product_pricelist ? partnerRead[0].property_product_pricelist[0] : false;
+
+  const validityDate = new Date(Date.now() + DEFAULT_VALIDITY_DAYS * 86_400_000).toISOString().slice(0, 10);
+
+  const soId = await executeKw('sale.order', 'create', [{
+    partner_id: partnerId,
+    partner_invoice_id: partnerId,
+    partner_shipping_id: partnerId,
+    company_id: COMPANY_ID,
+    opportunity_id: leadId,
+    user_id: userVal[0],
+    pricelist_id: pricelistId,
+    client_order_ref: `REQ-${leadId}`,
+    validity_date: validityDate,
+    order_line: orderLines,
+  }]) as number;
+
+  try {
+    await executeKw('crm.lead', 'message_post', [[leadId]], {
+      body: `<p><b>PORTAL_PI_DRAFT_CREATED</b>: draft PI created by ${escapeHtml(adminEmail)}.</p>`,
+      subtype_xmlid: 'mail.mt_note',
+    });
+  } catch (e) {
+    console.error('[pi] failed to post draft-created note for lead', leadId, e instanceof Error ? e.message : e);
+  }
+
+  const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
+  return buildDraftSOInfo(sos[0]);
+}
+
+export async function createDraftPI(
+  leadId: number, mainProductPrice: number, authz: Authz, adminEmail: string,
+): Promise<PIDraftInfo> {
+  if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can create a PI.');
+  await assertCultFitLead(leadId);
+
+  const existing = await findActiveDraftSO(leadId);
+  if (existing) throw new PIWorkflowError('An active draft PI already exists for this request. Use "Create Revision" to replace it.');
+
+  return buildAndCreateSO(leadId, mainProductPrice, authz, adminEmail);
+}
+
+export async function createPIRevision(
+  leadId: number, mainProductPrice: number, authz: Authz, adminEmail: string,
+): Promise<PIDraftInfo> {
+  if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can create a PI revision.');
+  await assertCultFitLead(leadId);
+
+  const existing = await findActiveDraftSO(leadId);
+  if (!existing) throw new PIWorkflowError('No active PI exists to revise — use Create Draft PI instead.');
+
+  await executeKw('sale.order', 'write', [[existing.id], { state: 'cancel' }]);
+  try {
+    await executeKw('crm.lead', 'message_post', [[leadId]], {
+      body: `<p><b>PORTAL_PI_SUPERSEDED</b>: ${escapeHtml(existing.name)} cancelled by ${escapeHtml(adminEmail)} to create a revision.</p>`,
+      subtype_xmlid: 'mail.mt_note',
+    });
+  } catch (e) {
+    console.error('[pi] failed to post superseded note for lead', leadId, e instanceof Error ? e.message : e);
+  }
+
+  return buildAndCreateSO(leadId, mainProductPrice, authz, adminEmail);
+}
+
+export interface PIDraftUpdate {
+  mainProductPrice?: number;
+  validityDate?: string;
+}
+
+export async function updatePIDraft(
+  leadId: number, soId: number, updates: PIDraftUpdate, authz: Authz,
+): Promise<PIDraftInfo> {
+  if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can edit a PI.');
+  await assertCultFitLead(leadId);
+
+  const so = await verifySOBelongsToLead(leadId, soId);
+  if (so.state === 'cancel') throw new PIWorkflowError('This PI has been superseded and can no longer be edited.');
+
+  if (updates.validityDate !== undefined) {
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(updates.validityDate) || updates.validityDate < new Date().toISOString().slice(0, 10)) {
+      throw new PIWorkflowError('Validity date must be a valid date, not in the past.');
+    }
+    await executeKw('sale.order', 'write', [[soId], { validity_date: updates.validityDate }]);
+  }
+
+  if (updates.mainProductPrice !== undefined) {
+    const price = requirePositivePrice(updates.mainProductPrice);
+    const mainLine = so.lines.find(l => l.unitPrice > 0) ?? so.lines[0];
+    if (!mainLine) throw new PIWorkflowError('This PI has no line items.');
+    await executeKw('sale.order.line', 'write', [[mainLine.id], { price_unit: price }]);
+  }
+
+  const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
+  return buildDraftSOInfo(sos[0]);
+}
+
+interface PISnapshotLineItem {
+  code: string;
+  name: string;
+  quantity: number;
+  unitPrice: number;
+  taxLabel: string;
+  taxTotal: number;
+  untaxedTotal: number;
+}
+
+export interface PIPublishedSnapshot {
+  version: number;
+  quotationId: number;
+  quotationNumber: string;
+  publishedDate: string;
+  publishedBy: string;
+  attachmentId: number;
+  requestReference: string;
+  cultfitCompanyName: string;
+  deliveryAddress: string;
+  cocoFofo: 'COCO' | 'FOFO';
+  preferredDeliveryDate: string | null;
+  salespersonName: string;
+  lineItems: PISnapshotLineItem[];
+  untaxedAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+  validityDate: string;
+}
+
+interface PIResponseRecord {
+  version: number;
+  action: 'confirm' | 'request_correction';
+  comment: string;
+  respondedAt: string;
+  respondedBy: string;
+}
+
+const PI_PUBLISHED_MARKER = 'PORTAL_PI_PUBLISHED';
+const PI_RESPONSE_MARKER = 'PORTAL_PI_CUSTOMER_RESPONSE';
+
+function encodeMarkerData(prefix: string, data: unknown): string {
+  return `<!--${prefix}:${Buffer.from(JSON.stringify(data)).toString('base64')}-->`;
+}
+
+function decodeMarkerData<T>(prefix: string, body: unknown): T | null {
+  if (typeof body !== 'string') return null;
+  const m = body.match(new RegExp(`<!--${prefix}:([A-Za-z0-9+/=]+)-->`));
+  if (!m) return null;
+  try {
+    return JSON.parse(Buffer.from(m[1], 'base64').toString('utf8')) as T;
+  } catch {
+    return null;
+  }
+}
+
+function piStatusFrom(snapshot: PIPublishedSnapshot | null, response: PIResponseRecord | null, hasActiveDraft: boolean): PIStatus {
+  if (!snapshot) return hasActiveDraft ? 'draft' : 'not_created';
+  if (response?.action === 'confirm') return 'confirmed';
+  if (response?.action === 'request_correction') return 'correction_requested';
+  return 'awaiting_confirmation';
+}
+
+// Reads every publish/response marker ever posted on this lead's chatter and
+// picks the latest published version by its own version number (not message
+// order) plus any response matching that same version — order-independent,
+// so it's correct regardless of how mail.message ids/dates interleave.
+async function fetchLatestPISnapshotAndResponse(leadId: number): Promise<{ snapshot: PIPublishedSnapshot | null; response: PIResponseRecord | null }> {
+  const messages = await executeKw('mail.message', 'search_read', [[
+    ['res_id', '=', leadId], ['model', '=', 'crm.lead'],
+    '|', ['body', 'ilike', PI_PUBLISHED_MARKER], ['body', 'ilike', PI_RESPONSE_MARKER],
+  ]], { fields: ['body'] }) as { body: string }[];
+
+  const snapshots: PIPublishedSnapshot[] = [];
+  const responses: PIResponseRecord[] = [];
+  for (const m of messages) {
+    const s = decodeMarkerData<PIPublishedSnapshot>(PI_PUBLISHED_MARKER, m.body);
+    if (s) { snapshots.push(s); continue; }
+    const r = decodeMarkerData<PIResponseRecord>(PI_RESPONSE_MARKER, m.body);
+    if (r) responses.push(r);
+  }
+  if (!snapshots.length) return { snapshot: null, response: null };
+  const latest = snapshots.reduce((a, b) => (b.version > a.version ? b : a));
+  const response = responses.find(r => r.version === latest.version) ?? null;
+  return { snapshot: latest, response };
+}
+
+export async function publishPI(leadId: number, soId: number, authz: Authz, adminEmail: string): Promise<PIPublishedSnapshot> {
+  if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can publish a PI.');
+  await assertCultFitLead(leadId);
+
+  const so = await verifySOBelongsToLead(leadId, soId);
+  if (so.state === 'cancel') throw new PIWorkflowError('This PI has been superseded and cannot be published.');
+
+  const leads = await executeKw('crm.lead', 'read', [[leadId]], { fields: ['description', 'user_id', 'order_ids'] }) as Record<string, unknown>[];
+  const lead = leads[0];
+  const details = decodeRequestDetails(lead.description);
+  if (!details) throw new PIWorkflowError('Request details missing — cannot publish.');
+
+  const userVal = lead.user_id as OdooTuple;
+  if (!userVal) throw new PIWorkflowError('Assign a salesperson before publishing.');
+
+  const mainLine = so.lines.find(l => l.unitPrice > 0);
+  if (!mainLine) throw new PIWorkflowError('Set the main product price before publishing.');
+  if (!so.validityDate) throw new PIWorkflowError('Set a validity date before publishing.');
+
+  const partnerId = resolveCultFitPartnerId(authz);
+  const partnerRead = await executeKw('res.partner', 'read', [[partnerId]], { fields: ['name'] }) as { name: string }[];
+  const companyName = partnerRead[0]?.name ?? details.cultfitCompany ?? 'CultFit';
+
+  const version = ((lead.order_ids as number[]) || []).length;
+  const publishedDate = new Date().toISOString().slice(0, 10);
+  const warrantyYears = WARRANTY_YEARS_MAP[details.mainProduct.id] ?? null;
+
+  const pdfLineItems: PILineItem[] = so.lines.map(l => ({
+    code: l.code, description: l.name, quantity: l.quantity, unitPrice: l.unitPrice,
+    taxLabel: l.taxLabel, taxAmount: l.taxTotal, lineTotal: l.untaxedTotal,
+  }));
+
+  const pdfBuffer = await generatePIPdf({
+    quotationNumber: so.name, version, requestReference: `REQ-${leadId}`,
+    cultfitCompanyName: companyName, deliveryAddress: details.deliveryAddress,
+    cocoFofo: details.cocoFofo, preferredDeliveryDate: details.preferredDeliveryDate,
+    salespersonName: userVal[1], warrantyYears, lineItems: pdfLineItems,
+    untaxedAmount: so.untaxedAmount, taxAmount: so.taxAmount, totalAmount: so.totalAmount,
+    validityDate: so.validityDate, publishedDate,
+  });
+
+  const filename = `PI-${so.name}-V${version}.pdf`;
+  const attachmentId = await executeKw('ir.attachment', 'create', [{
+    name: filename,
+    datas: pdfBuffer.toString('base64'),
+    res_model: 'sale.order',
+    res_id: soId,
+    mimetype: 'application/pdf',
+    type: 'binary',
+    public: false,
+  }]) as number;
+
+  const snapshot: PIPublishedSnapshot = {
+    version, quotationId: soId, quotationNumber: so.name,
+    publishedDate, publishedBy: adminEmail, attachmentId,
+    requestReference: `REQ-${leadId}`, cultfitCompanyName: companyName,
+    deliveryAddress: details.deliveryAddress, cocoFofo: details.cocoFofo,
+    preferredDeliveryDate: details.preferredDeliveryDate, salespersonName: userVal[1],
+    lineItems: so.lines.map(l => ({
+      code: l.code, name: l.name, quantity: l.quantity, unitPrice: l.unitPrice,
+      taxLabel: l.taxLabel, taxTotal: l.taxTotal, untaxedTotal: l.untaxedTotal,
+    })),
+    untaxedAmount: so.untaxedAmount, taxAmount: so.taxAmount, totalAmount: so.totalAmount,
+    validityDate: so.validityDate,
+  };
+
+  // Not wrapped in try/catch like the other audit-only chatter posts above —
+  // this note IS the publish record (the customer-facing PI status is
+  // derived entirely from it), so a failure here must surface as a failed
+  // publish, not be silently swallowed.
+  await executeKw('crm.lead', 'message_post', [[leadId]], {
+    body: `<p><b>${PI_PUBLISHED_MARKER}</b>: ${escapeHtml(so.name)} (v${version}) published by ${escapeHtml(adminEmail)}. Status: Awaiting Customer Confirmation.</p>`
+      + encodeMarkerData(PI_PUBLISHED_MARKER, snapshot),
+    subtype_xmlid: 'mail.mt_note',
+  });
+
+  return snapshot;
+}
+
+export interface AdminRequestSummary extends PortalRequestSummary {
+  piStatus: PIStatus;
+}
+
+export interface AdminRequestDetail extends PortalRequestDetail {
+  piStatus: PIStatus;
+  draftPI: PIDraftInfo | null;
+  publishedPI: PIPublishedSnapshot | null;
+}
+
+// Batched across every lead in the list in a single pair of extra round
+// trips (chatter search + sale.order state read), not one query per lead —
+// same batching discipline as fetchSoAggregates above.
+async function fetchPIStatusMap(leadIds: number[]): Promise<Map<number, PIStatus>> {
+  const result = new Map<number, PIStatus>();
+  if (!leadIds.length) return result;
+
+  const messages = await executeKw('mail.message', 'search_read', [[
+    ['res_id', 'in', leadIds], ['model', '=', 'crm.lead'],
+    '|', ['body', 'ilike', PI_PUBLISHED_MARKER], ['body', 'ilike', PI_RESPONSE_MARKER],
+  ]], { fields: ['res_id', 'body'] }) as { res_id: number; body: string }[];
+
+  const snapshotsByLead = new Map<number, PIPublishedSnapshot[]>();
+  const responsesByLead = new Map<number, PIResponseRecord[]>();
+  for (const m of messages) {
+    const s = decodeMarkerData<PIPublishedSnapshot>(PI_PUBLISHED_MARKER, m.body);
+    if (s) { (snapshotsByLead.get(m.res_id) ?? snapshotsByLead.set(m.res_id, []).get(m.res_id)!).push(s); continue; }
+    const r = decodeMarkerData<PIResponseRecord>(PI_RESPONSE_MARKER, m.body);
+    if (r) (responsesByLead.get(m.res_id) ?? responsesByLead.set(m.res_id, []).get(m.res_id)!).push(r);
+  }
+
+  const draftLeadIds = leadIds.filter(id => !snapshotsByLead.has(id));
+  const hasActiveDraftMap = new Map<number, boolean>();
+  if (draftLeadIds.length) {
+    const leadsWithOrders = await executeKw('crm.lead', 'read', [draftLeadIds], { fields: ['id', 'order_ids'] }) as { id: number; order_ids: number[] }[];
+    const allSoIds = [...new Set(leadsWithOrders.flatMap(l => l.order_ids || []))];
+    if (allSoIds.length) {
+      const sos = await executeKw('sale.order', 'read', [allSoIds], { fields: ['id', 'state'] }) as { id: number; state: string }[];
+      const soStateMap = new Map(sos.map(s => [s.id, s.state]));
+      for (const l of leadsWithOrders) {
+        hasActiveDraftMap.set(l.id, (l.order_ids || []).some(soId => soStateMap.get(soId) !== 'cancel'));
+      }
+    }
+  }
+
+  for (const leadId of leadIds) {
+    const snaps = snapshotsByLead.get(leadId) || [];
+    const latest = snaps.length ? snaps.reduce((a, b) => (b.version > a.version ? b : a)) : null;
+    const response = latest ? (responsesByLead.get(leadId) || []).find(r => r.version === latest.version) ?? null : null;
+    result.set(leadId, piStatusFrom(latest, response, hasActiveDraftMap.get(leadId) ?? false));
+  }
+  return result;
+}
+
+export async function fetchAdminRequestList(authz: Authz): Promise<AdminRequestSummary[]> {
+  if (authz.role !== 'admin') throw new PIWorkflowError('Admin access required.');
+  const base = await fetchPortalOrderRequests(authz);
+  const statusMap = await fetchPIStatusMap(base.map(r => r.id));
+  return base.map(r => ({ ...r, piStatus: statusMap.get(r.id) ?? 'not_created' }));
+}
+
+export async function fetchAdminRequestDetail(id: number, authz: Authz): Promise<AdminRequestDetail | null> {
+  if (authz.role !== 'admin') throw new PIWorkflowError('Admin access required.');
+  const base = await fetchPortalOrderRequestById(id, authz);
+  if (!base) return null;
+
+  const draftPI = await findActiveDraftSO(id);
+  const { snapshot, response } = await fetchLatestPISnapshotAndResponse(id);
+  const piStatus = piStatusFrom(snapshot, response, !!draftPI);
+  return { ...base, piStatus, draftPI, publishedPI: snapshot };
+}
+
+// Never looks at a draft sale.order — only ever returns a published
+// snapshot, so a customer can never see a PI before it's published, by
+// construction (there is nothing in this function's data path that reads
+// draft-only fields).
+export async function fetchCustomerPublishedPI(
+  leadId: number, authz: Authz,
+): Promise<{ status: PIStatus; snapshot: PIPublishedSnapshot | null }> {
+  const domain = [['id', '=', leadId], ...authzDomain(authz), ['description', 'ilike', PORTAL_REQUEST_MARKER]];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: ['id'] }) as { id: number }[];
+  if (!leads.length) throw new LeadNotFoundError();
+
+  const { snapshot, response } = await fetchLatestPISnapshotAndResponse(leadId);
+  const status = piStatusFrom(snapshot, response, false);
+  return { status, snapshot };
+}
+
+export async function respondToPublishedPI(
+  leadId: number, action: unknown, comment: unknown, authz: Authz, customerEmail: string,
+): Promise<{ status: PIStatus }> {
+  if (authz.role !== 'customer') throw new InvalidRequestError('Only a customer can respond to a PI.');
+  if (action !== 'confirm' && action !== 'request_correction') throw new InvalidRequestError('Invalid action.');
+
+  const commentText = typeof comment === 'string' ? comment.trim().slice(0, 1000) : '';
+  if (action === 'request_correction' && !commentText) {
+    throw new InvalidRequestError('Please describe what needs correcting.');
+  }
+
+  const domain = [['id', '=', leadId], ...authzDomain(authz), ['description', 'ilike', PORTAL_REQUEST_MARKER]];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: ['id'] }) as { id: number }[];
+  if (!leads.length) throw new LeadNotFoundError();
+
+  const { snapshot, response } = await fetchLatestPISnapshotAndResponse(leadId);
+  if (!snapshot) throw new InvalidRequestError('No published PI to respond to.');
+  if (response) throw new InvalidRequestError('This PI has already received a response.');
+
+  const record: PIResponseRecord = {
+    version: snapshot.version, action, comment: commentText,
+    respondedAt: new Date().toISOString(), respondedBy: customerEmail,
+  };
+  const label = action === 'confirm' ? 'Confirmed' : 'Correction Requested';
+  await executeKw('crm.lead', 'message_post', [[leadId]], {
+    body: `<p><b>${PI_RESPONSE_MARKER}</b>: Customer ${label} for PI ${escapeHtml(snapshot.quotationNumber)} (v${snapshot.version}).`
+      + (commentText ? ` Comment: ${escapeHtml(commentText)}` : '') + '</p>'
+      + encodeMarkerData(PI_RESPONSE_MARKER, record),
+    subtype_xmlid: 'mail.mt_note',
+  });
+
+  return { status: action === 'confirm' ? 'confirmed' : 'correction_requested' };
+}
+
+// Secure download for the customer — mirrors fetchAttachmentData's
+// ownership-check pattern: the attachment id comes only from our own
+// published snapshot (never a client-supplied id), and is still re-verified
+// against Odoo directly before its bytes are read.
+export async function fetchPIPdfData(leadId: number, authz: Authz): Promise<{ data: Buffer; filename: string }> {
+  const domain = [['id', '=', leadId], ...authzDomain(authz), ['description', 'ilike', PORTAL_REQUEST_MARKER]];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: ['id'] }) as { id: number }[];
+  if (!leads.length) throw new LeadNotFoundError();
+
+  const { snapshot } = await fetchLatestPISnapshotAndResponse(leadId);
+  if (!snapshot) throw new LeadNotFoundError();
+
+  const count = await executeKw('ir.attachment', 'search_count', [[
+    ['id', '=', snapshot.attachmentId], ['res_model', '=', 'sale.order'], ['res_id', '=', snapshot.quotationId],
+  ]]) as number;
+  if (!count) throw new LeadNotFoundError();
+
+  const records = await executeKw('ir.attachment', 'read', [[snapshot.attachmentId]], { fields: ['name', 'datas'] }) as Record<string, unknown>[];
+  if (!records.length || !records[0].datas) throw new LeadNotFoundError();
+  return {
+    data: Buffer.from(records[0].datas as string, 'base64'),
+    filename: (records[0].name as string) || `PI-${snapshot.quotationNumber}.pdf`,
+  };
 }
