@@ -12,13 +12,32 @@
 // same file, to intermittently throw "bad XRef entry" on a perfectly valid
 // PDF — a real, non-deterministic reliability bug, not a fluke. Current
 // pdfjs-dist (6.x) parsed the identical file correctly 10/10 times.
+//
+// IMPORTANT: pdfjs-dist is imported dynamically INSIDE extractRawText, not
+// at module top level. Verified live on Vercel Preview: a top-level import
+// crashed EVERY route in the app (including ones with nothing to do with
+// PDFs, like /api/health) with "ReferenceError: DOMMatrix is not defined"
+// — pdfjs-dist's legacy Node build references a browser-only global at
+// import time, which exists on this project's local dev machine but not
+// in Vercel's actual serverless runtime. We never render/rasterize a page
+// (no page.render(), only getTextContent()), so a real DOMMatrix/Path2D
+// implementation is never needed — the two-line stub below only exists to
+// satisfy that top-level reference. The dynamic import also means routes
+// that never touch a PDF (the vast majority of the app) never pay this
+// module's load cost at all.
 
 import 'server-only';
-import * as pdfjsLib from 'pdfjs-dist/legacy/build/pdf.mjs';
 
 interface PdfTextItem { str: string; transform: number[] }
 
 async function extractRawText(buf: Buffer): Promise<string> {
+  if (typeof (globalThis as Record<string, unknown>).DOMMatrix === 'undefined') {
+    (globalThis as Record<string, unknown>).DOMMatrix = class DOMMatrix {};
+  }
+  if (typeof (globalThis as Record<string, unknown>).Path2D === 'undefined') {
+    (globalThis as Record<string, unknown>).Path2D = class Path2D {};
+  }
+  const pdfjsLib = await import('pdfjs-dist/legacy/build/pdf.mjs');
   const doc = await pdfjsLib.getDocument({
     data: new Uint8Array(buf), useWorkerFetch: false,
     disableFontFace: true, verbosity: 0,
