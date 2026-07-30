@@ -127,3 +127,19 @@ export const PI_STATUS_VARIANT: Record<string, ChipVariant> = {
   confirmed: 'success',
   correction_requested: 'danger',
 };
+
+// Phase 3 PO workflow status — same display-only pattern as PI_STATUS_LABELS
+// above, mapping the PoStatus values computed server-side in lib/odoo-server.ts.
+export const PO_STATUS_LABELS: Record<string, string> = {
+  awaiting_upload: 'Awaiting PO',
+  submitted: 'PO Submitted',
+  correction_requested: 'PO Correction Requested',
+  approved: 'PO Approved',
+};
+
+export const PO_STATUS_VARIANT: Record<string, ChipVariant> = {
+  awaiting_upload: 'neutral',
+  submitted: 'info',
+  correction_requested: 'danger',
+  approved: 'success',
+};
