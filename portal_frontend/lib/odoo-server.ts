@@ -5,6 +5,9 @@ import 'server-only';
 import type { CustomerScope } from '@/lib/auth-server';
 import { STAGE_LABELS, STAGE_KEYS, REQUEST_STAGE_LABELS } from '@/lib/stage-config';
 import { generatePIPdf, type PILineItem } from '@/lib/pi-pdf';
+import { extractPoDataFromPdf, validatePdfBytes, type ExtractedPoData } from '@/lib/po-pdf-parser';
+import { comparePoToPi, type ComparisonResult } from '@/lib/po-comparison';
+import { validatePoSubmission, validateCorrectionComment, type PortalPoData } from '@/lib/po-validation';
 
 const ODOO_URL  = (process.env.ODOO_BASE_URL  ?? '').replace(/\/$/, '');
 const ODOO_DB   = process.env.ODOO_DB          ?? '';
@@ -1785,12 +1788,14 @@ export async function publishPI(leadId: number, soId: number, authz: Authz, admi
 
 export interface AdminRequestSummary extends PortalRequestSummary {
   piStatus: PIStatus;
+  poStatus: PoStatus;
 }
 
 export interface AdminRequestDetail extends PortalRequestDetail {
   piStatus: PIStatus;
   draftPI: PIDraftInfo | null;
   publishedPI: PIPublishedSnapshot | null;
+  po: PoAdminView;
 }
 
 // Batched across every lead in the list in a single pair of extra round
@@ -1837,11 +1842,33 @@ async function fetchPIStatusMap(leadIds: number[]): Promise<Map<number, PIStatus
   return result;
 }
 
+// Batched the same way as fetchPIStatusMap — one query for every lead in
+// the list rather than one per lead.
+async function fetchPOStatusMap(leadIds: number[]): Promise<Map<number, PoStatus>> {
+  const result = new Map<number, PoStatus>();
+  if (!leadIds.length) return result;
+
+  const messages = await executeKw('mail.message', 'search_read', [[
+    ['res_id', 'in', leadIds], ['model', '=', 'crm.lead'],
+    '|', '|', ['body', 'ilike', PO_SUBMITTED_MARKER], ['body', 'ilike', PO_CORRECTION_MARKER], ['body', 'ilike', PO_APPROVED_MARKER],
+  ]], { fields: ['res_id', 'body'] }) as { res_id: number; body: string }[];
+
+  const byLead = new Map<number, { body: string }[]>();
+  for (const m of messages) (byLead.get(m.res_id) ?? byLead.set(m.res_id, []).get(m.res_id)!).push({ body: m.body });
+
+  for (const leadId of leadIds) {
+    const { submissions, corrections, approvals } = groupPoMarkers(byLead.get(leadId) ?? []);
+    result.set(leadId, poStatusFrom(submissions, corrections, approvals).status);
+  }
+  return result;
+}
+
 export async function fetchAdminRequestList(authz: Authz): Promise<AdminRequestSummary[]> {
   if (authz.role !== 'admin') throw new PIWorkflowError('Admin access required.');
   const base = await fetchPortalOrderRequests(authz);
-  const statusMap = await fetchPIStatusMap(base.map(r => r.id));
-  return base.map(r => ({ ...r, piStatus: statusMap.get(r.id) ?? 'not_created' }));
+  const leadIds = base.map(r => r.id);
+  const [piMap, poMap] = await Promise.all([fetchPIStatusMap(leadIds), fetchPOStatusMap(leadIds)]);
+  return base.map(r => ({ ...r, piStatus: piMap.get(r.id) ?? 'not_created', poStatus: poMap.get(r.id) ?? 'awaiting_upload' }));
 }
 
 export async function fetchAdminRequestDetail(id: number, authz: Authz): Promise<AdminRequestDetail | null> {
@@ -1852,7 +1879,8 @@ export async function fetchAdminRequestDetail(id: number, authz: Authz): Promise
   const draftPI = await findActiveDraftSO(id);
   const { snapshot, response } = await fetchLatestPISnapshotAndResponse(id);
   const piStatus = piStatusFrom(snapshot, response, !!draftPI);
-  return { ...base, piStatus, draftPI, publishedPI: snapshot };
+  const po = await fetchAdminPoDetail(id, authz);
+  return { ...base, piStatus, draftPI, publishedPI: snapshot, po };
 }
 
 // Never looks at a draft sale.order — only ever returns a published
@@ -1969,4 +1997,355 @@ export async function fetchPIPdfData(leadId: number, authz: Authz): Promise<{ da
     data: Buffer.from(records[0].datas as string, 'base64'),
     filename: (records[0].name as string) || `PI-${snapshot.quotationNumber}.pdf`,
   };
+}
+
+// ──── PO workflow (Phase 3) ────────────────────────────────────────────────
+// The uploaded PO PDF is NEVER persisted anywhere — not to Odoo (no
+// ir.attachment), not to disk, not to any store. It exists only as a Buffer
+// for the duration of the extract request (see lib/po-pdf-parser.ts) and is
+// discarded when that request completes. Only the customer-reviewed,
+// server-validated STRUCTURED DATA is ever saved, and only in structured
+// chatter markers on the Opportunity — same zero-new-infrastructure pattern
+// as Phase 1/2 (no new Odoo field/model, except the two verified-unused
+// native fields written on approval; see approvePoData below).
+
+export class PoWorkflowError extends Error {
+  constructor(message: string) { super(message); this.name = 'PoWorkflowError'; }
+}
+
+export type PoStatus = 'awaiting_upload' | 'submitted' | 'correction_requested' | 'approved';
+
+export interface PoSubmissionRecord {
+  version: number;
+  data: PortalPoData;
+  comparisonWarnings: ComparisonResult[];
+  relatedPiVersion: number;
+  relatedPiNumber: string;
+  submittedAt: string;
+  submittedBy: string;
+}
+
+export interface PoCorrectionRecord {
+  version: number;
+  comment: string;
+  requestedAt: string;
+  requestedBy: string;
+}
+
+export interface PoApprovalRecord {
+  version: number;
+  approvedAt: string;
+  approvedBy: string;
+  poNumberSavedToOdoo: boolean;
+  expectedDeliveryDateSavedToOdoo: boolean;
+}
+
+const PO_SUBMITTED_MARKER = 'PORTAL_PO_SUBMITTED';
+const PO_CORRECTION_MARKER = 'PORTAL_PO_CORRECTION_REQUESTED';
+const PO_APPROVED_MARKER = 'PORTAL_PO_APPROVED';
+
+async function fetchPoMarkers(leadId: number): Promise<{
+  submissions: PoSubmissionRecord[]; corrections: PoCorrectionRecord[]; approvals: PoApprovalRecord[];
+}> {
+  const messages = await executeKw('mail.message', 'search_read', [[
+    ['res_id', '=', leadId], ['model', '=', 'crm.lead'],
+    '|', '|', ['body', 'ilike', PO_SUBMITTED_MARKER], ['body', 'ilike', PO_CORRECTION_MARKER], ['body', 'ilike', PO_APPROVED_MARKER],
+  ]], { fields: ['body'] }) as { body: string }[];
+  return groupPoMarkers(messages);
+}
+
+function groupPoMarkers(messages: { body: string }[]): {
+  submissions: PoSubmissionRecord[]; corrections: PoCorrectionRecord[]; approvals: PoApprovalRecord[];
+} {
+  const submissions: PoSubmissionRecord[] = [];
+  const corrections: PoCorrectionRecord[] = [];
+  const approvals: PoApprovalRecord[] = [];
+  for (const m of messages) {
+    const s = decodeMarkerData<PoSubmissionRecord>(PO_SUBMITTED_MARKER, m.body);
+    if (s) { submissions.push(s); continue; }
+    const c = decodeMarkerData<PoCorrectionRecord>(PO_CORRECTION_MARKER, m.body);
+    if (c) { corrections.push(c); continue; }
+    const a = decodeMarkerData<PoApprovalRecord>(PO_APPROVED_MARKER, m.body);
+    if (a) approvals.push(a);
+  }
+  return { submissions, corrections, approvals };
+}
+
+// Version-independent status derivation — mirrors piStatusFrom's philosophy:
+// the latest SUBMITTED version is "the" PO; a correction only "sticks" if it
+// targets that same version (a fresh submission always supersedes an older
+// correction request, the same way createPIRevision supersedes a response).
+function poStatusFrom(
+  submissions: PoSubmissionRecord[], corrections: PoCorrectionRecord[], approvals: PoApprovalRecord[],
+): { status: PoStatus; latestSubmission: PoSubmissionRecord | null; latestCorrection: PoCorrectionRecord | null; latestApproval: PoApprovalRecord | null } {
+  if (approvals.length) {
+    const latestApproval = approvals.reduce((a, b) => (b.version > a.version ? b : a));
+    const latestSubmission = submissions.find(s => s.version === latestApproval.version) ?? null;
+    return { status: 'approved', latestSubmission, latestCorrection: null, latestApproval };
+  }
+  if (!submissions.length) return { status: 'awaiting_upload', latestSubmission: null, latestCorrection: null, latestApproval: null };
+  const latestSubmission = submissions.reduce((a, b) => (b.version > a.version ? b : a));
+  const latestCorrection = corrections.find(c => c.version === latestSubmission.version) ?? null;
+  return { status: latestCorrection ? 'correction_requested' : 'submitted', latestSubmission, latestCorrection, latestApproval: null };
+}
+
+export interface PoPiSummary {
+  quotationNumber: string;
+  version: number;
+  requestName: string;
+  mainProduct: string;
+  deliveryAddress: string;
+  untaxedAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+}
+
+export interface PoCustomerView {
+  status: PoStatus;
+  version: number;
+  latestSubmission: PoSubmissionRecord | null;
+  latestCorrection: PoCorrectionRecord | null;
+  piConfirmed: boolean;
+  piSummary: PoPiSummary | null;
+}
+
+// Read-only — used by the customer GET status route, the eligibility check
+// below, AND the extraction step (extraction must never write to Odoo).
+async function loadPoContext(leadId: number, authz: Authz): Promise<PoCustomerView & { requestName: string }> {
+  const domain = [['id', '=', leadId], ...authzDomain(authz), ['description', 'ilike', PORTAL_REQUEST_MARKER]];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: ['id', 'name', 'description'] }) as Record<string, unknown>[];
+  if (!leads.length) throw new LeadNotFoundError();
+  const details = decodeRequestDetails(leads[0].description);
+
+  const { snapshot: pi, response } = await fetchLatestPISnapshotAndResponse(leadId);
+  const piConfirmed = !!pi && response?.action === 'confirm';
+
+  const { submissions, corrections, approvals } = await fetchPoMarkers(leadId);
+  const { status, latestSubmission, latestCorrection } = poStatusFrom(submissions, corrections, approvals);
+
+  const piSummary: PoPiSummary | null = pi ? {
+    quotationNumber: pi.quotationNumber, version: pi.version,
+    requestName: details?.requestName ?? (leads[0].name as string),
+    mainProduct: details ? `${details.mainProduct.name} × ${details.quantity}` : '',
+    deliveryAddress: pi.deliveryAddress,
+    untaxedAmount: pi.untaxedAmount, taxAmount: pi.taxAmount, totalAmount: pi.totalAmount,
+  } : null;
+
+  return {
+    status, version: latestSubmission?.version ?? 0, latestSubmission, latestCorrection,
+    piConfirmed, piSummary, requestName: details?.requestName ?? (leads[0].name as string),
+  };
+}
+
+export async function fetchCustomerPoStatus(leadId: number, authz: Authz): Promise<PoCustomerView> {
+  const ctx = await loadPoContext(leadId, authz);
+  return ctx;
+}
+
+// The single gate every write path (extract AND submit) goes through.
+// Extraction is read-only against Odoo but still must not be reachable
+// before the PI is confirmed or after the PO is approved/awaiting review —
+// the eligibility rule is the same for both steps, per spec §6.
+async function assertPoEligibleForWrite(leadId: number, authz: Authz): Promise<{ pi: PIPublishedSnapshot; nextVersion: number }> {
+  const ctx = await loadPoContext(leadId, authz);
+  if (!ctx.piConfirmed) throw new PoWorkflowError('The PI must be confirmed before uploading a PO.');
+  if (ctx.status === 'approved') throw new PoWorkflowError('This PO has already been approved.');
+  if (ctx.status === 'submitted') throw new PoWorkflowError('A PO submission is already awaiting InBody review.');
+
+  const { snapshot: pi } = await fetchLatestPISnapshotAndResponse(leadId);
+  if (!pi) throw new PoWorkflowError('The PI must be confirmed before uploading a PO.'); // defensive; ctx.piConfirmed already covers this
+  return { pi, nextVersion: (ctx.version ?? 0) + 1 };
+}
+
+// Step A — extraction only. No Odoo write occurs anywhere in this function.
+export async function extractPoPdf(
+  leadId: number, fileBuffer: Buffer, filename: string, authz: Authz,
+): Promise<ExtractedPoData> {
+  if (authz.role !== 'customer') throw new PoWorkflowError('Only a customer can upload a PO.');
+  await assertPoEligibleForWrite(leadId, authz);
+  validatePdfBytes(fileBuffer, filename);
+  return extractPoDataFromPdf(fileBuffer);
+}
+
+export interface PoSubmitResult {
+  status: PoStatus;
+  version: number;
+  comparisonWarnings: ComparisonResult[];
+}
+
+// Step B — the only place PO data is ever written. `rawInput` is the
+// customer's reviewed/corrected values; validatePoSubmission re-checks every
+// field from scratch (see lib/po-validation.ts) — nothing from the
+// extraction step is trusted just because it round-tripped through the
+// browser unedited.
+export async function submitPoData(
+  leadId: number, rawInput: Record<string, unknown>, authz: Authz, customerEmail: string,
+): Promise<PoSubmitResult> {
+  if (authz.role !== 'customer') throw new PoWorkflowError('Only a customer can submit PO data.');
+  const { pi, nextVersion } = await assertPoEligibleForWrite(leadId, authz);
+  const data = validatePoSubmission(rawInput);
+  const comparisonWarnings = comparePoToPi(data, pi);
+
+  const record: PoSubmissionRecord = {
+    version: nextVersion, data, comparisonWarnings,
+    relatedPiVersion: pi.version, relatedPiNumber: pi.quotationNumber,
+    submittedAt: new Date().toISOString(), submittedBy: customerEmail,
+  };
+
+  const warningCount = comparisonWarnings.filter(w => w.severity !== 'match').length;
+  await executeKw('crm.lead', 'message_post', [[leadId]], {
+    body: `<p><b>${PO_SUBMITTED_MARKER}</b>: PO ${escapeHtml(data.poNumber)} submitted (v${nextVersion}) by ${escapeHtml(customerEmail)} `
+      + `against confirmed PI ${escapeHtml(pi.quotationNumber)} (v${pi.version}). ${warningCount} comparison warning(s).</p>`
+      + encodeMarkerData(PO_SUBMITTED_MARKER, record),
+    subtype_xmlid: 'mail.mt_note',
+  });
+
+  return { status: 'submitted', version: nextVersion, comparisonWarnings };
+}
+
+export interface PoAdminView extends PoCustomerView {
+  latestApproval: PoApprovalRecord | null;
+  allSubmissions: PoSubmissionRecord[];
+  salespersonAssigned: boolean;
+}
+
+export async function fetchAdminPoDetail(leadId: number, authz: Authz): Promise<PoAdminView> {
+  if (authz.role !== 'admin') throw new PoWorkflowError('Admin access required.');
+  await assertCultFitLead(leadId);
+
+  const { snapshot: pi, response } = await fetchLatestPISnapshotAndResponse(leadId);
+  const piConfirmed = !!pi && response?.action === 'confirm';
+  const { submissions, corrections, approvals } = await fetchPoMarkers(leadId);
+  const { status, latestSubmission, latestCorrection, latestApproval } = poStatusFrom(submissions, corrections, approvals);
+
+  const leads = await executeKw('crm.lead', 'read', [[leadId]], { fields: ['name', 'description', 'user_id'] }) as Record<string, unknown>[];
+  const details = decodeRequestDetails(leads[0]?.description);
+  const piSummary: PoPiSummary | null = pi ? {
+    quotationNumber: pi.quotationNumber, version: pi.version,
+    requestName: details?.requestName ?? (leads[0]?.name as string ?? ''),
+    mainProduct: details ? `${details.mainProduct.name} × ${details.quantity}` : '',
+    deliveryAddress: pi.deliveryAddress,
+    untaxedAmount: pi.untaxedAmount, taxAmount: pi.taxAmount, totalAmount: pi.totalAmount,
+  } : null;
+
+  return {
+    status, version: latestSubmission?.version ?? 0, latestSubmission, latestCorrection, latestApproval,
+    piConfirmed, piSummary, allSubmissions: submissions.sort((a, b) => a.version - b.version),
+    salespersonAssigned: !!(leads[0]?.user_id as OdooTuple),
+  };
+}
+
+export interface PoApproveResult {
+  status: PoStatus;
+  poNumberSaved: boolean;
+  expectedDeliveryDateSaved: boolean;
+}
+
+// Never confirms the sale order, never creates an invoice/picking/delivery —
+// only writes two verified-unused native fields (see §2 investigation notes
+// in CULTFIT_PORTAL_MASTER_CONTEXT.md) and records the approval marker.
+export async function approvePoData(leadId: number, authz: Authz, adminEmail: string): Promise<PoApproveResult> {
+  if (authz.role !== 'admin') throw new PoWorkflowError('Admin access required.');
+  await assertCultFitLead(leadId);
+
+  const { snapshot: pi, response } = await fetchLatestPISnapshotAndResponse(leadId);
+  if (!pi || response?.action !== 'confirm') throw new PoWorkflowError('The PI must be confirmed before approving a PO.');
+
+  const { submissions, corrections, approvals } = await fetchPoMarkers(leadId);
+  const { status, latestSubmission } = poStatusFrom(submissions, corrections, approvals);
+  if (status === 'approved') throw new PoWorkflowError('This PO has already been approved.');
+  if (status !== 'submitted' || !latestSubmission) throw new PoWorkflowError('No PO submission is awaiting approval.');
+
+  // Best-effort: the approval record is the substantive event here — a
+  // failure to write the two native fields must not block recording it, but
+  // it IS surfaced in the response so the admin isn't left thinking the
+  // fields were saved when they weren't.
+  let poNumberSaved = false, expectedDeliveryDateSaved = false;
+  try {
+    const writeVals: Record<string, unknown> = { client_order_ref: latestSubmission.data.poNumber };
+    if (latestSubmission.data.expectedDeliveryDate) {
+      writeVals.commitment_date = `${latestSubmission.data.expectedDeliveryDate} 00:00:00`;
+    }
+    await executeKw('sale.order', 'write', [[pi.quotationId], writeVals]);
+    poNumberSaved = true;
+    expectedDeliveryDateSaved = !!latestSubmission.data.expectedDeliveryDate;
+  } catch (e) {
+    console.error('[po-approve] failed to write client_order_ref/commitment_date for SO', pi.quotationId, e instanceof Error ? e.message : e);
+  }
+
+  const record: PoApprovalRecord = {
+    version: latestSubmission.version, approvedAt: new Date().toISOString(), approvedBy: adminEmail,
+    poNumberSavedToOdoo: poNumberSaved, expectedDeliveryDateSavedToOdoo: expectedDeliveryDateSaved,
+  };
+  await executeKw('crm.lead', 'message_post', [[leadId]], {
+    body: `<p><b>${PO_APPROVED_MARKER}</b>: PO ${escapeHtml(latestSubmission.data.poNumber)} (v${latestSubmission.version}) approved by ${escapeHtml(adminEmail)}.</p>`
+      + encodeMarkerData(PO_APPROVED_MARKER, record),
+    subtype_xmlid: 'mail.mt_note',
+  });
+
+  return { status: 'approved', poNumberSaved, expectedDeliveryDateSaved };
+}
+
+export interface PoCorrectionResult {
+  status: PoStatus;
+  activityCreated: boolean;
+  warning: string | null;
+}
+
+export async function requestPoCorrection(
+  leadId: number, rawComment: unknown, authz: Authz, adminEmail: string,
+): Promise<PoCorrectionResult> {
+  if (authz.role !== 'admin') throw new PoWorkflowError('Admin access required.');
+  await assertCultFitLead(leadId);
+  const comment = validateCorrectionComment(rawComment);
+
+  const { submissions, corrections, approvals } = await fetchPoMarkers(leadId);
+  const { status, latestSubmission } = poStatusFrom(submissions, corrections, approvals);
+  if (status === 'approved') throw new PoWorkflowError('This PO has already been approved.');
+  if (!latestSubmission) throw new PoWorkflowError('No PO submission to correct.');
+  if (status === 'correction_requested') throw new PoWorkflowError('A correction has already been requested for this PO version.');
+
+  // The marker is the substantive record — posted unconditionally, before
+  // the best-effort activity attempt below, so a missing salesperson or an
+  // activity-creation fault can never cause the correction request itself
+  // to go unrecorded.
+  const record: PoCorrectionRecord = {
+    version: latestSubmission.version, comment, requestedAt: new Date().toISOString(), requestedBy: adminEmail,
+  };
+  await executeKw('crm.lead', 'message_post', [[leadId]], {
+    body: `<p><b>${PO_CORRECTION_MARKER}</b>: Correction requested on PO v${latestSubmission.version} by ${escapeHtml(adminEmail)}. Comment: ${escapeHtml(comment)}</p>`
+      + encodeMarkerData(PO_CORRECTION_MARKER, record),
+    subtype_xmlid: 'mail.mt_note',
+  });
+
+  const leads = await executeKw('crm.lead', 'read', [[leadId]], { fields: ['user_id'] }) as Record<string, unknown>[];
+  const userVal = leads[0]?.user_id as OdooTuple;
+  let activityCreated = false;
+  let warning: string | null = null;
+  if (!userVal) {
+    warning = 'No salesperson is assigned to this request — the correction was recorded, but no follow-up activity could be scheduled.';
+  } else {
+    try {
+      const [todoTypes, leadModels] = await Promise.all([
+        executeKw('mail.activity.type', 'search_read', [[['name', '=', 'To-Do']]], { fields: ['id'], limit: 1 }) as Promise<{ id: number }[]>,
+        executeKw('ir.model', 'search_read', [[['model', '=', 'crm.lead']]], { fields: ['id'], limit: 1 }) as Promise<{ id: number }[]>,
+      ]);
+      if (todoTypes.length && leadModels.length) {
+        await executeKw('mail.activity', 'create', [{
+          res_model_id: leadModels[0].id, res_model: 'crm.lead', res_id: leadId,
+          activity_type_id: todoTypes[0].id,
+          summary: `PO correction requested — v${latestSubmission.version}`,
+          note: escapeHtml(comment),
+          user_id: userVal[0],
+          date_deadline: new Date().toISOString().slice(0, 10),
+        }]);
+        activityCreated = true;
+      }
+    } catch (e) {
+      console.error('[po-correction] failed to schedule activity for lead', leadId, e instanceof Error ? e.message : e);
+      warning = 'The correction was recorded, but the follow-up activity could not be created.';
+    }
+  }
+
+  return { status: 'correction_requested', activityCreated, warning };
 }

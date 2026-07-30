@@ -5,7 +5,7 @@ in-progress order-request workflow. Read this before making changes — it
 exists so a future session (human or AI) doesn't have to re-derive any of
 this from scratch. No secret values appear anywhere in this document.
 
-Last updated: 2026-07-29, alongside the Phase 2 PI workflow build
+Last updated: 2026-07-30, alongside the Phase 3 PO workflow build
 (`feature/pi-workflow-v2`) described in §11.
 
 ---
@@ -465,12 +465,109 @@ published snapshot exactly; customer confirm flips status correctly and a
 second response is correctly rejected (400); admin list/detail and customer
 view agree on status throughout.
 
-**Phase 3 — PO:** Customer uploads the official PO PDF as `ir.attachment`
-(create rights already confirmed on this model). InBody verifies the PO. PO
-status and document history. Attachment authorization must follow the same
-ownership-check pattern already used for downloads (verify the attachment
-genuinely belongs to a sale order/invoice reachable from the authorized
-lead before accepting/serving it).
+**Phase 3 — PO: BUILT** (`feature/po-workflow-v3`, not yet merged/deployed —
+see §13). Superseded the original plan of storing the PO as an
+`ir.attachment`: the actual requirement (confirmed explicitly) is the
+opposite — **the uploaded PO PDF is never persisted anywhere.** It exists
+only as a `Buffer` for the duration of one request (`POST
+.../po/extract`), is parsed synchronously, and goes out of scope when the
+handler returns. No `ir.attachment`, no disk, no database, no logging of
+its contents.
+
+Flow: PI confirmed → customer uploads a PO PDF → server extracts structured
+data (`lib/po-pdf-parser.ts`) → customer reviews/corrects the extracted
+fields in the browser (nothing saved yet) → customer submits → server
+re-validates every field from scratch (`lib/po-validation.ts`, nothing from
+the extraction step is trusted just because it round-tripped unedited) →
+compares the submission against the latest confirmed PI
+(`lib/po-comparison.ts`) → admin reviews and Approves or Requests
+Correction.
+
+**PDF text extraction — library choice, verified live:**
+- `pdf-parse` (the obvious first choice) was tried and **rejected**: its
+  1.1.1 line (pinned initially for having zero native/binary deps, unlike
+  2.x which pulls in `@napi-rs/canvas`) wraps a bundled pdf.js from **2017**
+  (v1.10.100). Verified live: parsing the *same* synthetic PDF 10 times in a
+  row intermittently threw `bad XRef entry` — a real, non-deterministic
+  reliability bug, not a fluke, not an artifact of the test harness.
+- Switched to **`pdfjs-dist` directly** (current, 6.x — also zero native
+  deps), calling `getDocument()` + `getTextContent()` per page and grouping
+  text items into lines by Y-transform (the same logic pdf-parse used
+  internally, just against a maintained parser). Verified live: 10/10
+  successful, byte-identical extractions on the same file.
+- Marked `serverExternalPackages: ["pdfkit", "pdfjs-dist"]` in
+  `next.config.ts` — same fix as pdfkit needed in Phase 2 (keeps it a real
+  runtime import rather than something Turbopack tries to bundle).
+- No OCR. Scanned/image-only PDFs correctly fail extraction with a clear
+  error rather than silently returning nothing.
+
+**Extraction is a best-effort, label-proximity text parser** (PO Number,
+PO Date, Expected Delivery Date, Payment Terms, billing/shipping
+company/address/city/state/PIN/GSTIN, product lines, totals, PI reference,
+vendor, delivery contact, notes) — there is no real customer PO template to
+calibrate against, so this was built and tested against synthetic PDFs, not
+real InBody-received POs. **Known limitations, found and left as
+documented limitations (the two-step review flow is the intended safety
+net for exactly this):**
+- City/state splitting from a single `"City, State, PIN"` address line is a
+  loose heuristic and can mis-split — never blocks submission, always
+  editable before the customer submits.
+- Product-line table parsing is layout-sensitive: it locates the row region
+  between a header row (`description`/`item` + `qty`/`quantity`) and a
+  totals row, then classifies each row by whitespace **token** type
+  (numeric vs. a short recognized unit word like "Nos"/"Pcs" vs. text) —
+  deliberately NOT a digit-substring scan, because an early version of this
+  matched digits *inside* a product code like `I9F300001` and produced
+  garbage. Tables with very different column layouts than InBody's own
+  quotations may still parse partially or not at all; missing columns are
+  left `null`, never guessed.
+- GSTIN uses the correct 15-character format regex (2-digit state + 10-char
+  PAN + entity digit + literal `Z` + checksum) — an earlier version of this
+  regex had one extra character class and silently matched nothing; fixed
+  and verified against real-shaped test GSTINs.
+
+**Odoo fields — verified live, read-only investigation, no guessing:**
+- No dedicated PO number, PO date, or billing/shipping **text** field
+  exists anywhere reachable. `crm.lead.billing_address_id` /
+  `shipping_address_id` exist but are `many2one` to `res.partner` — usable
+  only by pointing at an *existing* partner/contact, which is explicitly
+  forbidden here (no new `res.partner`, no new child contacts, never touch
+  partner 1822 or `sale.order.partner_invoice_id`/`partner_shipping_id`).
+  So: PO data lives in structured chatter markers on the Opportunity — same
+  zero-new-infrastructure pattern as Phase 1/2.
+- Two **verified-unused** native fields are written, but only on admin
+  approval, and only two: `sale.order.client_order_ref` (Customer
+  Reference, char — confirmed empty on every sampled historical CultFit
+  order) for the PO number, and `sale.order.commitment_date` (Delivery
+  Date, datetime — also confirmed empty) for the expected delivery date.
+  Nothing else on `sale.order`/`crm.lead` is touched by Phase 3.
+
+**Markers** (base64 JSON in an HTML comment, same encoding as Phase 1/2):
+`PORTAL_PO_SUBMITTED`, `PORTAL_PO_CORRECTION_REQUESTED`,
+`PORTAL_PO_APPROVED`. Version = 1-indexed count of submissions so far
+(never reused); a correction only "sticks" to the status if it targets the
+*current latest* submission's version — a fresh resubmission always
+supersedes an older pending correction, mirroring how `createPIRevision`
+supersedes a stale PI response in Phase 2. Comparison warnings (product/
+quantity/amount/tax mismatches vs. the confirmed PI) are computed at
+submission time and frozen into that version's marker — **always shown,
+never blocking submission**, per explicit business rule.
+
+**PI eligibility gate** (shared by both the extract and submit steps):
+latest PI must be published AND customer-confirmed; PO must not already be
+`approved`; PO must not currently be `submitted` (awaiting review) — a
+correction request from admin is what re-opens the ability to submit a new
+version. Enforced in one function (`assertPoEligibleForWrite`), not
+duplicated per route.
+
+**Correction activity** reuses the exact fix already shipped in PR #3 for
+PI corrections (`mail.activity.create` with resolved `activity_type_id`
+via `mail.activity.type` lookup and `res_model_id` via `ir.model` lookup —
+`activity_schedule()`'s convenience-method signature did not match this
+Odoo 19 instance). If no salesperson is assigned, the correction marker is
+still posted unconditionally (the record of the correction request must
+never be lost); the missing-activity condition is surfaced back to the
+admin as a warning, not silently swallowed.
 
 **Phase 4 — Dispatch & invoice:** Dispatch status from `stock.picking`
 (confirmed readable: `carrier_id`, `carrier_tracking_ref`,
@@ -528,6 +625,20 @@ devices for the shared login) until Phase 6.
   reading it (same ownership-check pattern as the existing quotation/invoice
   attachment downloads). Unpublished/nonexistent PI returns an identical
   safe 404 either way.
+- Phase 3: the uploaded PO PDF is never persisted — no `ir.attachment`, no
+  disk, no database, no logging of its bytes or extracted raw text; it lives
+  only as a `Buffer` for the extract request's duration. Every field in the
+  customer's final submission is re-validated server-side
+  (`lib/po-validation.ts`) regardless of what extraction returned. Customer
+  can never supply/change partner id, salesperson id, PI version, quotation
+  id, or attachment id in the PO flow either — the respond/submit/approve
+  routes only ever read the specific fields they whitelist. PDF upload is
+  validated by magic bytes (not just declared MIME/extension), capped at
+  4MB (safely under Vercel's 4.5MB hard platform limit), and
+  encrypted/malformed PDFs fail with a clear, generic error — never a raw
+  parser stack trace. PO extraction/submission is gated by the same
+  eligibility check as either action (PI confirmed, not already approved,
+  not already awaiting review) — enforced once, not duplicated per route.
 
 ---
 
@@ -553,3 +664,9 @@ devices for the shared login) until Phase 6.
   applies before release: a real `sale.order`/PI/attachment/chatter marker
   should only be created against production Odoo with explicit approval,
   verified field-by-field, then archived/cancelled if it was purely a test.
+- Phase 3 work happens on `feature/po-workflow-v3` (branched from `main`
+  after Phase 2 and the PI-correction-activity fix (PR #3) were merged/
+  deployed). Same controlled-test discipline — a real PO submission
+  (chatter markers only; no PDF is ever persisted regardless) should only
+  be created against production Odoo with explicit approval, verified
+  field-by-field, then archived/cancelled if it was purely a test.

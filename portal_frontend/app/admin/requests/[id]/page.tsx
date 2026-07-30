@@ -7,9 +7,10 @@ import {
   createDraftPI, createPIRevision, updatePIDraft, publishPI,
 } from '@/lib/api';
 import { fetchCurrentUser, isInBodyStaff, logout } from '@/lib/auth';
-import { PI_STATUS_LABELS, PI_STATUS_VARIANT, STAGE_VARIANT } from '@/lib/stage-config';
+import { PI_STATUS_LABELS, PI_STATUS_VARIANT, PO_STATUS_LABELS, PO_STATUS_VARIANT, STAGE_VARIANT } from '@/lib/stage-config';
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
+import AdminPoSection from '@/components/AdminPoSection';
 import type { AdminRequestDetail, EligibleSalesperson } from '@/types';
 
 function fmtDate(d: string | null | undefined): string {
@@ -182,6 +183,7 @@ export default function AdminRequestDetailPage() {
                 <h1 className="text-2xl font-bold text-slate-900 font-mono">REQ-{request.id}</h1>
                 <StatusChip label={request.portal_stage_label} variant={STAGE_VARIANT[request.portal_stage] ?? 'neutral'} />
                 <StatusChip label={PI_STATUS_LABELS[request.piStatus]} variant={PI_STATUS_VARIANT[request.piStatus]} />
+                <StatusChip label={PO_STATUS_LABELS[request.po.status]} variant={PO_STATUS_VARIANT[request.po.status]} />
               </div>
               <p className="text-slate-700 font-medium mt-2">{request.name}</p>
               {d && <p className="text-slate-500 text-sm mt-0.5">{d.deliveryAddress}</p>}
@@ -380,6 +382,9 @@ export default function AdminRequestDetailPage() {
                 </div>
               )}
             </div>
+
+            {/* PO review (Phase 3) */}
+            <AdminPoSection requestId={request.id} po={request.po} onChange={load} />
 
             {request.timeline.length > 0 && (
               <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">

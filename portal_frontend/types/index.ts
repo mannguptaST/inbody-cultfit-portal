@@ -219,17 +219,184 @@ export interface PIPublishedSnapshot {
   validityDate: string;
 }
 
+export interface CustomerPIView {
+  status: PIStatus;
+  snapshot: PIPublishedSnapshot | null;
+}
+
+// ── Phase 3: PO workflow (temporary PDF extraction, customer submits,
+// admin reviews) ──────────────────────────────────────────────────────────
+
+export interface ExtractedPoLineItem {
+  description: string | null;
+  code: string | null;
+  quantity: number | null;
+  unit: string | null;
+  unitPrice: number | null;
+  baseValue: number | null;
+  taxRate: number | null;
+  taxAmount: number | null;
+  lineTotal: number | null;
+}
+
+export interface ExtractedPoData {
+  poNumber: string | null;
+  poDate: string | null;
+  expectedDeliveryDate: string | null;
+  paymentTerms: string | null;
+  currency: string | null;
+  requesterName: string | null;
+  createdBy: string | null;
+  approvedBy: string | null;
+  billingCompany: string | null;
+  billingAddress: string | null;
+  billingCity: string | null;
+  billingState: string | null;
+  billingPin: string | null;
+  billingGstin: string | null;
+  shippingCompany: string | null;
+  shippingAddress: string | null;
+  shippingCity: string | null;
+  shippingState: string | null;
+  shippingPin: string | null;
+  shippingGstin: string | null;
+  lineItems: ExtractedPoLineItem[];
+  untaxedAmount: number | null;
+  taxAmount: number | null;
+  grandTotal: number | null;
+  amountInWords: string | null;
+  piReference: string | null;
+  vendorName: string | null;
+  deliveryContact: string | null;
+  notesToSupplier: string | null;
+}
+
+// The customer-confirmed, server-validated version of ExtractedPoData — same
+// shape, but poNumber/poDate/billingAddress/shippingAddress/grandTotal are
+// guaranteed non-null (validated required before submission is accepted).
+export type PortalPoLineItem = ExtractedPoLineItem;
+
+export interface PortalPoData {
+  poNumber: string;
+  poDate: string;
+  expectedDeliveryDate: string | null;
+  paymentTerms: string | null;
+  currency: string | null;
+  requesterName: string | null;
+  createdBy: string | null;
+  approvedBy: string | null;
+  billingCompany: string | null;
+  billingAddress: string;
+  billingCity: string | null;
+  billingState: string | null;
+  billingPin: string | null;
+  billingGstin: string | null;
+  shippingCompany: string | null;
+  shippingAddress: string;
+  shippingCity: string | null;
+  shippingState: string | null;
+  shippingPin: string | null;
+  shippingGstin: string | null;
+  lineItems: PortalPoLineItem[];
+  untaxedAmount: number | null;
+  taxAmount: number | null;
+  grandTotal: number;
+  amountInWords: string | null;
+  piReference: string | null;
+  vendorName: string | null;
+  deliveryContact: string | null;
+  notesToSupplier: string | null;
+}
+
+export type ComparisonSeverity =
+  | 'match' | 'warning' | 'missing_from_po' | 'extra_in_po'
+  | 'amount_mismatch' | 'quantity_mismatch' | 'product_mismatch' | 'tax_mismatch';
+
+export interface ComparisonResult {
+  field: string;
+  severity: ComparisonSeverity;
+  message: string;
+}
+
+export type PoStatus = 'awaiting_upload' | 'submitted' | 'correction_requested' | 'approved';
+
+export interface PoSubmissionRecord {
+  version: number;
+  data: PortalPoData;
+  comparisonWarnings: ComparisonResult[];
+  relatedPiVersion: number;
+  relatedPiNumber: string;
+  submittedAt: string;
+  submittedBy: string;
+}
+
+export interface PoCorrectionRecord {
+  version: number;
+  comment: string;
+  requestedAt: string;
+  requestedBy: string;
+}
+
+export interface PoApprovalRecord {
+  version: number;
+  approvedAt: string;
+  approvedBy: string;
+  poNumberSavedToOdoo: boolean;
+  expectedDeliveryDateSavedToOdoo: boolean;
+}
+
+export interface PoPiSummary {
+  quotationNumber: string;
+  version: number;
+  requestName: string;
+  mainProduct: string;
+  deliveryAddress: string;
+  untaxedAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+}
+
+export interface PoCustomerView {
+  status: PoStatus;
+  version: number;
+  latestSubmission: PoSubmissionRecord | null;
+  latestCorrection: PoCorrectionRecord | null;
+  piConfirmed: boolean;
+  piSummary: PoPiSummary | null;
+}
+
+export interface PoAdminView extends PoCustomerView {
+  latestApproval: PoApprovalRecord | null;
+  allSubmissions: PoSubmissionRecord[];
+  salespersonAssigned: boolean;
+}
+
+export interface PoSubmitResult {
+  status: PoStatus;
+  version: number;
+  comparisonWarnings: ComparisonResult[];
+}
+
+export interface PoApproveResult {
+  status: PoStatus;
+  poNumberSaved: boolean;
+  expectedDeliveryDateSaved: boolean;
+}
+
+export interface PoCorrectionResult {
+  status: PoStatus;
+  activityCreated: boolean;
+  warning: string | null;
+}
+
 export interface AdminRequestSummary extends PortalRequestSummary {
   piStatus: PIStatus;
+  poStatus: PoStatus;
 }
 
 export interface AdminRequestDetail extends PortalRequestDetail {
   piStatus: PIStatus;
   draftPI: PIDraftInfo | null;
   publishedPI: PIPublishedSnapshot | null;
-}
-
-export interface CustomerPIView {
-  status: PIStatus;
-  snapshot: PIPublishedSnapshot | null;
+  po: PoAdminView;
 }

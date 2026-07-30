@@ -4,7 +4,7 @@ import { useEffect, useState, useCallback } from 'react';
 import { useRouter } from 'next/navigation';
 import { getAdminRequests } from '@/lib/api';
 import { fetchCurrentUser, isInBodyStaff, logout } from '@/lib/auth';
-import { PI_STATUS_LABELS, PI_STATUS_VARIANT } from '@/lib/stage-config';
+import { PI_STATUS_LABELS, PI_STATUS_VARIANT, PO_STATUS_LABELS, PO_STATUS_VARIANT } from '@/lib/stage-config';
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
 import type { AdminRequestSummary, User } from '@/types';
@@ -109,7 +109,7 @@ export default function AdminRequestsPage() {
         {!loading && !error && requests.length > 0 && (
           <div className="bg-white border border-slate-200 rounded-xl shadow-sm overflow-hidden">
             <div className="overflow-x-auto">
-              <table className="w-full text-sm" style={{ minWidth: '1100px' }}>
+              <table className="w-full text-sm" style={{ minWidth: '1250px' }}>
                 <thead>
                   <tr className="border-b border-slate-200 bg-slate-50 text-left">
                     <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Reference</th>
@@ -118,6 +118,7 @@ export default function AdminRequestsPage() {
                     <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">COCO/FOFO</th>
                     <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Created</th>
                     <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">PI Status</th>
+                    <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">PO Status</th>
                     <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap">Salesperson</th>
                     <th className="px-5 py-3 text-xs font-semibold text-slate-500 uppercase tracking-wider whitespace-nowrap"></th>
                   </tr>
@@ -148,6 +149,9 @@ export default function AdminRequestsPage() {
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap">
                         <StatusChip label={PI_STATUS_LABELS[req.piStatus]} variant={PI_STATUS_VARIANT[req.piStatus]} />
+                      </td>
+                      <td className="px-5 py-3.5 whitespace-nowrap">
+                        <StatusChip label={PO_STATUS_LABELS[req.poStatus]} variant={PO_STATUS_VARIANT[req.poStatus]} />
                       </td>
                       <td className="px-5 py-3.5 whitespace-nowrap text-slate-500 text-xs">
                         {req.salesperson ?? 'Not yet assigned'}

@@ -17,6 +17,13 @@ import type {
   PIPublishedSnapshot,
   CustomerPIView,
   PIStatus,
+  ExtractedPoData,
+  PortalPoData,
+  PoCustomerView,
+  PoAdminView,
+  PoSubmitResult,
+  PoApproveResult,
+  PoCorrectionResult,
 } from '@/types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '/api';
@@ -191,5 +198,50 @@ export async function publishPI(id: number, soId: number): Promise<PIPublishedSn
   return apiFetch(`/admin/cultfit/requests/${id}/pi/publish`, {
     method: 'POST',
     body: JSON.stringify({ soId }),
+  });
+}
+
+// ── Phase 3: PO workflow ──────────────────────────────────────────────────────
+
+export async function getCustomerPoStatus(id: number): Promise<PoCustomerView> {
+  return apiFetch(`/portal/cultfit/requests/${id}/po`);
+}
+
+// Multipart upload — bypasses apiFetch (which always sets
+// Content-Type: application/json) since the browser must set its own
+// multipart boundary header.
+export async function extractPoPdf(id: number, file: File): Promise<{ extracted: ExtractedPoData }> {
+  const formData = new FormData();
+  formData.append('file', file);
+  const res = await fetch(`${API_BASE}/portal/cultfit/requests/${id}/po/extract`, {
+    method: 'POST',
+    body: formData,
+  });
+  if (!res.ok) {
+    const body = await res.json().catch(() => ({}));
+    throw new ApiError('PO_EXTRACT_FAILED', body?.detail ?? `HTTP ${res.status}`);
+  }
+  return res.json();
+}
+
+export async function submitPoData(id: number, data: PortalPoData): Promise<PoSubmitResult> {
+  return apiFetch(`/portal/cultfit/requests/${id}/po/submit`, {
+    method: 'POST',
+    body: JSON.stringify(data),
+  });
+}
+
+export async function getAdminPoDetail(id: number): Promise<PoAdminView> {
+  return apiFetch(`/admin/cultfit/requests/${id}/po`);
+}
+
+export async function approvePo(id: number): Promise<PoApproveResult> {
+  return apiFetch(`/admin/cultfit/requests/${id}/po/approve`, { method: 'POST' });
+}
+
+export async function requestPoCorrection(id: number, comment: string): Promise<PoCorrectionResult> {
+  return apiFetch(`/admin/cultfit/requests/${id}/po/request-correction`, {
+    method: 'POST',
+    body: JSON.stringify({ comment }),
   });
 }

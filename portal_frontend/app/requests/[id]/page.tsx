@@ -7,6 +7,7 @@ import { fetchCurrentUser, isInBodyStaff, logout } from '@/lib/auth';
 import { STAGE_VARIANT, PI_STATUS_LABELS, PI_STATUS_VARIANT } from '@/lib/stage-config';
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
+import PoSection from '@/components/PoSection';
 import type { PortalRequestDetail, CustomerPIView } from '@/types';
 
 function digitsOnly(phone: string): string {
@@ -29,7 +30,6 @@ function fmtDateTime(d: string | null | undefined): string {
 }
 
 const FUTURE_SECTIONS = [
-  { key: 'po', label: 'Purchase Order (PO)' },
   { key: 'dispatch', label: 'Dispatch' },
   { key: 'invoice', label: 'Invoice' },
   { key: 'installation', label: 'Installation' },
@@ -341,6 +341,9 @@ export default function RequestDetailPage() {
                 </div>
               )}
             </div>
+
+            {/* Purchase Order (Phase 3) */}
+            <PoSection requestId={request.id} />
 
             {/* Future sections — disabled placeholders, no fake data */}
             <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
