@@ -2621,7 +2621,7 @@ export async function fetchLogisticsOrderList(authz: Authz): Promise<LogisticsOr
   const outgoingPickings = allSoIds.length
     ? await executeKw('stock.picking', 'search_read', [[
       ['sale_id', 'in', allSoIds], ['picking_type_id.code', '=', 'outgoing'],
-    ]], { fields: ['id', 'sale_id', 'carrier_tracking_ref', 'carrier_tracking_url', 'scheduled_date'], order: 'id desc' }) as Record<string, unknown>[]
+    ]], { fields: ['id', 'sale_id', 'state', 'date_done', 'carrier_tracking_ref', 'carrier_tracking_url', 'scheduled_date'], order: 'id desc' }) as Record<string, unknown>[]
     : [];
   const pickingBySoId = new Map<number, Record<string, unknown>>();
   for (const p of outgoingPickings) {
