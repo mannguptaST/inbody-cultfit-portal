@@ -445,6 +445,7 @@ export interface LogisticsOrderSummary {
   mainProduct: string | null;
   salesperson: string | null;
   poStatus: PoStatus;
+  isPortalRequest: boolean;
   invoiceStatus: InvoiceStatus;
   deliveryStatus: DeliveryStatus;
   courier: string | null;

@@ -16,10 +16,20 @@ function fmtDate(d: string | null | undefined): string {
 
 interface SummaryCard { key: string; label: string; count: number }
 
+// Most real CultFit orders predate the portal and were never submitted
+// through its PO flow — poStatus for those is technically 'awaiting_upload'
+// (no portal submission exists), but showing "Awaiting PO" on an order that
+// may already be fully delivered would be actively misleading to logistics.
+// This only affects display; the underlying poStatus value is untouched.
+function poDisplay(o: Pick<LogisticsOrderSummary, 'poStatus' | 'isPortalRequest'>): { label: string; variant: 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'teal' | 'indigo' | 'orange' | 'purple' } {
+  if (!o.isPortalRequest && o.poStatus === 'awaiting_upload') return { label: 'Not Tracked', variant: 'neutral' };
+  return { label: PO_STATUS_LABELS[o.poStatus], variant: PO_STATUS_VARIANT[o.poStatus] };
+}
+
 function computeSummary(orders: LogisticsOrderSummary[]): SummaryCard[] {
   return [
     { key: 'total', label: 'Total Orders', count: orders.length },
-    { key: 'awaiting_po', label: 'Awaiting PO Approval', count: orders.filter(o => o.poStatus !== 'approved').length },
+    { key: 'awaiting_po', label: 'Awaiting PO Approval', count: orders.filter(o => o.isPortalRequest && o.poStatus !== 'approved').length },
     { key: 'ready', label: 'Ready for Logistics', count: orders.filter(o => o.poStatus === 'approved' && o.deliveryStatus === 'not_started').length },
     { key: 'invoice_pending', label: 'Invoice Pending', count: orders.filter(o => o.invoiceStatus !== 'available').length },
     { key: 'dispatch_pending', label: 'Dispatch Pending', count: orders.filter(o => ['not_started', 'logistics_processing', 'ready_to_dispatch'].includes(o.deliveryStatus)).length },
@@ -204,7 +214,7 @@ export default function LogisticsDashboardPage() {
                       <td className="px-4 py-3 text-slate-700" style={{ maxWidth: '200px' }}><span className="line-clamp-1">{o.customer ?? '—'}</span></td>
                       <td className="px-4 py-3 text-slate-600" style={{ maxWidth: '200px' }}><span className="line-clamp-1">{o.mainProduct ?? '—'}</span></td>
                       <td className="px-4 py-3 text-slate-500 text-xs whitespace-nowrap">{o.salesperson ?? 'Not assigned'}</td>
-                      <td className="px-4 py-3 whitespace-nowrap"><StatusChip label={PO_STATUS_LABELS[o.poStatus]} variant={PO_STATUS_VARIANT[o.poStatus]} /></td>
+                      <td className="px-4 py-3 whitespace-nowrap"><StatusChip label={poDisplay(o).label} variant={poDisplay(o).variant} /></td>
                       <td className="px-4 py-3 whitespace-nowrap"><StatusChip label={INVOICE_STATUS_LABELS[o.invoiceStatus]} variant={INVOICE_STATUS_VARIANT[o.invoiceStatus]} /></td>
                       <td className="px-4 py-3 whitespace-nowrap"><StatusChip label={DELIVERY_STATUS_LABELS[o.deliveryStatus]} variant={DELIVERY_STATUS_VARIANT[o.deliveryStatus]} /></td>
                       <td className="px-4 py-3 text-slate-500 text-xs whitespace-nowrap">{[o.courier, o.awb].filter(Boolean).join(' · ') || '—'}</td>
@@ -235,7 +245,7 @@ export default function LogisticsDashboardPage() {
                 <p className="text-sm text-slate-700 font-medium">{o.customer ?? '—'}</p>
                 <p className="text-xs text-slate-500 mt-0.5">{o.mainProduct ?? '—'}</p>
                 <div className="flex flex-wrap gap-1.5 mt-2">
-                  <StatusChip label={PO_STATUS_LABELS[o.poStatus]} variant={PO_STATUS_VARIANT[o.poStatus]} />
+                  <StatusChip label={poDisplay(o).label} variant={poDisplay(o).variant} />
                   <StatusChip label={INVOICE_STATUS_LABELS[o.invoiceStatus]} variant={INVOICE_STATUS_VARIANT[o.invoiceStatus]} />
                 </div>
                 <div className="flex items-center justify-between mt-3 text-xs text-slate-400">

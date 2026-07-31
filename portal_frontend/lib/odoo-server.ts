@@ -2529,7 +2529,12 @@ function buildDispatchInfo(picking: Record<string, unknown> | null, meta: Dispat
     trackingUrl: (picking?.carrier_tracking_url as string) || meta?.trackingUrl || null,
     expectedDeliveryDate: parseDate(picking?.scheduled_date) ?? meta?.expectedDeliveryDate ?? null,
     actualDeliveryDate: meta?.actualDeliveryDate ?? parseDate(picking?.date_done),
-    deliveryStatus: meta?.deliveryStatus ?? 'not_started',
+    // A completed real picking is hard evidence the order was actually
+    // delivered, even if no logistics user has ever touched this order in
+    // the portal (true for most historical orders) — defaulting to
+    // 'not_started' here previously contradicted the actualDeliveryDate
+    // above, which already read the same picking.date_done.
+    deliveryStatus: meta?.deliveryStatus ?? (picking?.state === 'done' ? 'delivered' : 'not_started'),
     logisticsNote: meta?.logisticsNote ?? null,
     updatedAt: meta?.updatedAt ?? null,
     updatedBy: meta?.updatedBy ?? null,
@@ -2568,6 +2573,15 @@ export interface LogisticsOrderSummary {
   mainProduct: string | null;
   salesperson: string | null;
   poStatus: PoStatus;
+  // True only when this order was actually submitted through the portal's
+  // own New Order Request / PO flow. Most real CultFit orders predate the
+  // portal and were never expected to go through it — for those,
+  // poStatus is technically 'awaiting_upload' (no portal submission ever
+  // happened) but displaying that as "Awaiting PO" would wrongly suggest
+  // action is needed on an order that may already be fully delivered.
+  // The UI uses this flag to show a neutral "Not tracked in portal" state
+  // instead, for historical orders only — poStatus itself is untouched.
+  isPortalRequest: boolean;
   invoiceStatus: 'not_created' | 'needs_selection' | 'available';
   deliveryStatus: DeliveryStatus;
   courier: string | null;
@@ -2639,6 +2653,7 @@ export async function fetchLogisticsOrderList(authz: Authz): Promise<LogisticsOr
       mainProduct: details?.mainProduct.name ?? (soAggMap.get(leadId)?.modelNames.join(', ') || null),
       salesperson: built.salesperson as string | null,
       poStatus: poMap.get(leadId) ?? 'awaiting_upload',
+      isPortalRequest: details !== null,
       invoiceStatus,
       deliveryStatus: dispatch.deliveryStatus,
       courier: dispatch.courier,

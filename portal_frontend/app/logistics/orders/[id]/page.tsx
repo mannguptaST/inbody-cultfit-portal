@@ -18,6 +18,14 @@ function fmtInr(n: number | null | undefined): string {
   return '₹' + n.toLocaleString('en-IN', { maximumFractionDigits: 2 });
 }
 
+// See the matching helper in app/logistics/page.tsx — an order with no
+// requestDetails never went through the portal's own PO flow, so
+// 'awaiting_upload' means "not tracked here", not "action needed".
+function poDisplay(order: LogisticsOrderDetail): { label: string; variant: 'neutral' | 'info' | 'success' | 'warning' | 'danger' | 'teal' | 'indigo' | 'orange' | 'purple' } {
+  if (!order.requestDetails && order.poStatus === 'awaiting_upload') return { label: 'Not Tracked', variant: 'neutral' };
+  return { label: PO_STATUS_LABELS[order.poStatus], variant: PO_STATUS_VARIANT[order.poStatus] };
+}
+
 const DELIVERY_STATUS_OPTIONS: DeliveryStatus[] = [
   'not_started', 'logistics_processing', 'ready_to_dispatch', 'dispatched', 'in_transit', 'delivered', 'delivery_issue',
 ];
@@ -158,7 +166,7 @@ export default function LogisticsOrderDetailPage() {
             <div className="min-w-0">
               <div className="flex items-center gap-3 flex-wrap">
                 <h1 className="text-2xl font-bold text-slate-900 font-mono">REQ-{order.id}</h1>
-                <StatusChip label={PO_STATUS_LABELS[order.poStatus]} variant={PO_STATUS_VARIANT[order.poStatus]} />
+                <StatusChip label={poDisplay(order).label} variant={poDisplay(order).variant} />
                 <StatusChip label={DELIVERY_STATUS_LABELS[order.dispatch.deliveryStatus]} variant={DELIVERY_STATUS_VARIANT[order.dispatch.deliveryStatus]} />
               </div>
               <p className="text-slate-700 font-medium mt-2">{order.name}</p>
@@ -311,7 +319,7 @@ export default function LogisticsOrderDetailPage() {
             <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
               <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Status</h2>
               <div className="space-y-2">
-                <StatusChip label={PO_STATUS_LABELS[order.poStatus]} variant={PO_STATUS_VARIANT[order.poStatus]} />
+                <StatusChip label={poDisplay(order).label} variant={poDisplay(order).variant} />
                 <br />
                 <StatusChip label={DELIVERY_STATUS_LABELS[order.dispatch.deliveryStatus]} variant={DELIVERY_STATUS_VARIANT[order.dispatch.deliveryStatus]} />
               </div>
