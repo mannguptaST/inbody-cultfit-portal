@@ -30,6 +30,11 @@ import type {
   DispatchInfo,
   DispatchUpdatePayload,
   CustomerLogisticsView,
+  CsOrderSummary,
+  CsOrderDetail,
+  InstallationInfo,
+  InstallationUpdatePayload,
+  CustomerInstallationView,
 } from '@/types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '/api';
@@ -282,4 +287,25 @@ export async function getCustomerLogisticsView(id: number): Promise<CustomerLogi
 
 export function getInvoiceDownloadUrl(id: number): string {
   return `${API_BASE}/portal/cultfit/requests/${id}/invoice/pdf`;
+}
+
+// ── Phase 5: Installation (CS) ─────────────────────────────────────────────────
+
+export async function getCsOrders(): Promise<{ orders: CsOrderSummary[] }> {
+  return apiFetch('/cs/cultfit/orders');
+}
+
+export async function getCsOrderDetail(id: number): Promise<CsOrderDetail> {
+  return apiFetch(`/cs/cultfit/orders/${id}`);
+}
+
+export async function updateCsInstallation(id: number, payload: InstallationUpdatePayload): Promise<InstallationInfo> {
+  return apiFetch(`/cs/cultfit/orders/${id}/installation`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getCustomerInstallationView(id: number): Promise<CustomerInstallationView> {
+  return apiFetch(`/portal/cultfit/requests/${id}/installation`);
 }

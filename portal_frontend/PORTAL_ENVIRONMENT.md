@@ -86,6 +86,29 @@ PORTAL_LOGISTICS_PASS=
   Vercel Production before the logistics role can be used in each of those
   environments — same operational pattern as `CULTFIT_PARTNER_ID`.
 
+## `PORTAL_CS_EMAIL` / `PORTAL_CS_PASS` (optional — Phase 5)
+
+```
+PORTAL_CS_EMAIL=
+PORTAL_CS_PASS=
+```
+
+- **What it is:** credentials for one shared `cs` (Customer Care) portal
+  role — installation scheduling and tracking, see §Phase 5 in
+  `CULTFIT_PORTAL_MASTER_CONTEXT.md`. Same shared-login model as
+  `PORTAL_LOGISTICS_EMAIL`/`PASS` — one account for the whole CS team, not
+  per-individual.
+- **Server-only.** Read only in `lib/auth-server.ts` (`import 'server-only'`),
+  never sent to the browser.
+- **Fails closed if missing — same rule as logistics.** The CS account is
+  only added to the in-memory user list when **both** variables are
+  non-empty. Missing/partial config disables only CS login — never throws,
+  never 500s, never touches admin/customer/logistics login.
+- **No default password**, for the same reason as `PORTAL_LOGISTICS_PASS`.
+- **Must be added manually** to local `.env.local`, Vercel Preview, and
+  Vercel Production before the CS role can be used in each of those
+  environments.
+
 ## Operational notes (not new env vars, just documented behavior)
 
 - **`industry_id` is mandatory on `crm.lead` in this Odoo instance** (an
@@ -113,6 +136,15 @@ PORTAL_LOGISTICS_PASS=
   as portal metadata text instead). Everything else lives in structured
   chatter markers on the Opportunity. See §Phase 4 in
   `CULTFIT_PORTAL_MASTER_CONTEXT.md` for the full field-by-field rationale.
+- **Phase 5 CS installation writes zero native Odoo fields.** Read-only
+  investigation found `crm.lead.cs_person` (a real, correctly-named "CS
+  Person" field) but it's unpopulated on every real CultFit order checked —
+  writing to it from the portal would be the first thing to ever touch it
+  operationally, with no visibility into what else might react to it, so it
+  stays read-only/unused. `stock.picking.is_installation_required` is read
+  as display-only context. Status/schedule/notes/completion live entirely in
+  structured chatter markers, same pattern as Phase 4 dispatch. See §Phase 5
+  in `CULTFIT_PORTAL_MASTER_CONTEXT.md` for the full investigation findings.
 
 ## Why this file exists instead of `.env.example`
 

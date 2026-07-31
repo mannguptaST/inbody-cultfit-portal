@@ -178,3 +178,19 @@ export const INVOICE_STATUS_VARIANT: Record<string, ChipVariant> = {
   needs_selection: 'warning',
   available: 'success',
 };
+
+export const INSTALLATION_STATUS_LABELS: Record<string, string> = {
+  not_scheduled: 'Not Scheduled',
+  scheduled: 'Scheduled',
+  in_progress: 'In Progress',
+  installed: 'Installed',
+  completed: 'Completed',
+};
+
+export const INSTALLATION_STATUS_VARIANT: Record<string, ChipVariant> = {
+  not_scheduled: 'neutral',
+  scheduled: 'warning',
+  in_progress: 'info',
+  installed: 'teal',
+  completed: 'success',
+};

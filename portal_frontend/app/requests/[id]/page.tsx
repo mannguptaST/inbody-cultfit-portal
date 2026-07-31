@@ -8,6 +8,7 @@ import { STAGE_VARIANT, PI_STATUS_LABELS, PI_STATUS_VARIANT } from '@/lib/stage-
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
 import PoSection from '@/components/PoSection';
+import CustomerInstallationSection from '@/components/CustomerInstallationSection';
 import CustomerLogisticsSection from '@/components/CustomerLogisticsSection';
 import type { PortalRequestDetail, CustomerPIView } from '@/types';
 
@@ -29,10 +30,6 @@ function fmtDateTime(d: string | null | undefined): string {
   if (!d) return '—';
   return new Date(d).toLocaleString('en-IN', { day: 'numeric', month: 'short', year: 'numeric', hour: 'numeric', minute: '2-digit' });
 }
-
-const FUTURE_SECTIONS = [
-  { key: 'installation', label: 'Installation' },
-];
 
 export default function RequestDetailPage() {
   const router = useRouter();
@@ -347,21 +344,8 @@ export default function RequestDetailPage() {
             {/* Logistics & Delivery (Phase 4) */}
             <CustomerLogisticsSection requestId={request.id} />
 
-            {/* Future sections — disabled placeholders, no fake data */}
-            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-              <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Order Progress</h2>
-              <div className="space-y-2">
-                {FUTURE_SECTIONS.map(s => (
-                  <div
-                    key={s.key}
-                    className="flex items-center justify-between px-4 py-3 bg-slate-50 border border-slate-100 rounded-lg opacity-60"
-                  >
-                    <span className="text-sm font-medium text-slate-500">{s.label}</span>
-                    <span className="text-xs text-slate-400">Available after InBody processes the request.</span>
-                  </div>
-                ))}
-              </div>
-            </div>
+            {/* Installation (Phase 5) */}
+            <CustomerInstallationSection requestId={request.id} />
 
             {/* Timeline */}
             {request.timeline.length > 0 && (

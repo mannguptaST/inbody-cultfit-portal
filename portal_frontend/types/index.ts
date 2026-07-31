@@ -4,7 +4,7 @@
 export interface User {
   name: string;
   email: string | false;
-  role: 'admin' | 'inbody_manager' | 'inbody_user' | 'customer' | 'logistics';
+  role: 'admin' | 'inbody_manager' | 'inbody_user' | 'customer' | 'logistics' | 'cs';
   company?: string;
 }
 
@@ -485,4 +485,59 @@ export interface CustomerLogisticsView {
   invoice: LogisticsInvoiceSummary | null;
   invoiceStatus: InvoiceStatus;
   dispatch: DispatchInfo;
+}
+
+// ── Phase 5: Installation (CS — Customer Care) ────────────────────────────────
+
+export type InstallationStatus = 'not_scheduled' | 'scheduled' | 'in_progress' | 'installed' | 'completed';
+
+export interface InstallationInfo {
+  status: InstallationStatus;
+  scheduledDate: string | null;
+  scheduledTime: string | null;
+  assignedCs: string | null;
+  installationNotes: string | null;
+  completedOn: string | null;
+  completionNotes: string | null;
+  installationRequired: boolean | null; // read-only context from stock.picking.is_installation_required, when known
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
+export interface CsOrderSummary {
+  id: number;
+  name: string;
+  customer: string | null;
+  mainProduct: string | null;
+  salesperson: string | null;
+  deliveryStatus: DeliveryStatus;
+  installationStatus: InstallationStatus;
+  assignedCs: string | null;
+  scheduledDate: string | null;
+  lastUpdated: string | null;
+}
+
+export interface CsOrderDetail {
+  id: number;
+  name: string;
+  customer: string | null;
+  requestDetails: PortalRequestDetails | null;
+  salesperson: string | null;
+  crmStage: string | null;
+  dispatch: DispatchInfo;
+  installation: InstallationInfo;
+  timeline: PortalRequestTimelineEntry[];
+}
+
+export interface InstallationUpdatePayload {
+  status: InstallationStatus;
+  scheduledDate?: string | null;
+  scheduledTime?: string | null;
+  installationNotes?: string | null;
+  completedOn?: string | null;
+  completionNotes?: string | null;
+}
+
+export interface CustomerInstallationView {
+  installation: InstallationInfo;
 }

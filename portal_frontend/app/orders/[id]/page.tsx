@@ -8,6 +8,7 @@ import {
 } from '@/lib/api';
 import { fetchCurrentUser, isInBodyStaff, logout } from '@/lib/auth';
 import { STAGE_LABELS, STAGE_DEFS, CULTFIT_STAGE_MAP, DELIVERY_VARIANT, INVOICE_VARIANT } from '@/lib/stage-config';
+import CustomerInstallationSection from '@/components/CustomerInstallationSection';
 import CustomerLogisticsSection from '@/components/CustomerLogisticsSection';
 import OrderTimeline from '@/components/OrderTimeline';
 import PaymentCountdown from '@/components/PaymentCountdown';
@@ -470,6 +471,13 @@ export default function OrderDetailPage() {
         {!isStaff && (
           <div className="mt-6">
             <CustomerLogisticsSection requestId={order.id} />
+          </div>
+        )}
+
+        {/* ── Installation (customer-only — the API 403s for staff) ────────── */}
+        {!isStaff && (
+          <div className="mt-6">
+            <CustomerInstallationSection requestId={order.id} />
           </div>
         )}
 

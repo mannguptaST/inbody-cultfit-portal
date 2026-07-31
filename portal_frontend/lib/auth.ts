@@ -32,3 +32,7 @@ export function isInBodyStaff(role: string | null | undefined): boolean {
 export function isLogistics(role: string | null | undefined): boolean {
   return role === 'logistics';
 }
+
+export function isCs(role: string | null | undefined): boolean {
+  return role === 'cs';
+}

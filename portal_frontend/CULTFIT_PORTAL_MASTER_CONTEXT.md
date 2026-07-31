@@ -5,8 +5,8 @@ in-progress order-request workflow. Read this before making changes — it
 exists so a future session (human or AI) doesn't have to re-derive any of
 this from scratch. No secret values appear anywhere in this document.
 
-Last updated: 2026-07-30, alongside the Phase 3 PO workflow build
-(`feature/pi-workflow-v2`) described in §11.
+Last updated: 2026-07-31, alongside the Phase 5 installation workflow build
+(`feature/installation-workflow-v5`) described in §11.
 
 ---
 
@@ -68,22 +68,25 @@ Key server-only files:
 2. Every protected route calls `requireAuthUser(req)`, which re-resolves role
    and scope fresh from `PORTAL_USERS` by email on every request — a config
    change takes effect on the very next request, not after token expiry.
-3. Three accounts can exist: `admin@inbody.com` (role `admin`),
-   `cultfit@curefit.com` (role `customer`, scope `cultfit_domain`), and an
+3. Up to four accounts can exist: `admin@inbody.com` (role `admin`),
+   `cultfit@curefit.com` (role `customer`, scope `cultfit_domain`), an
    optional `logistics` account (role `logistics`, Phase 4 — see §11) whose
-   email/password come from `PORTAL_LOGISTICS_EMAIL`/`PORTAL_LOGISTICS_PASS`
-   and which is only added to the user list at all when **both** are
-   configured (fail closed — see `PORTAL_ENVIRONMENT.md`). All three are
-   **shared** logins for the whole relevant team, not per-individual — see
-   §11 Phase 6 for the planned fix.
+   email/password come from `PORTAL_LOGISTICS_EMAIL`/`PORTAL_LOGISTICS_PASS`,
+   and an optional `cs` account (role `cs`, Customer Care, Phase 5 — see
+   §11) whose email/password come from `PORTAL_CS_EMAIL`/`PORTAL_CS_PASS`.
+   Logistics and CS are each only added to the user list at all when
+   **both** of their env vars are configured (fail closed — see
+   `PORTAL_ENVIRONMENT.md`). All four are **shared** logins for the whole
+   relevant team, not per-individual — see §11 Phase 6 for the planned fix.
 4. Customer access must always fail closed — a customer with no/invalid scope
-   gets 403, never a fallback to broad access. Logistics reads share the
-   exact same CultFit-domain resolution as admin (`authzDomain()` in
-   `lib/odoo-server.ts` treats `admin` and `logistics` identically for
-   reads); every write-gated function still explicitly checks for `admin`
-   (or `admin`/`logistics` where Phase 4 intentionally allows both — see
-   §11), so a role this file doesn't explicitly grant a capability to is
-   rejected by construction, not by omission.
+   gets 403, never a fallback to broad access. Logistics and CS reads share
+   the exact same CultFit-domain resolution as admin (`authzDomain()` in
+   `lib/odoo-server.ts` treats `admin`, `logistics` and `cs` identically for
+   reads); every write-gated function still explicitly checks for the exact
+   role(s) it should allow (e.g. dispatch writes: `admin`/`logistics` only;
+   installation writes: `admin`/`cs` only), so a role this file doesn't
+   explicitly grant a capability to is rejected by construction, not by
+   omission.
 
 ### CultFit identification — id-based, not name-based
 
@@ -133,7 +136,7 @@ on `OdooUnavailableError`.
 ## 4. Business objective — full intended workflow
 
 The portal is meant to eventually replace the entire email-based CultFit
-order process. **Phases 1-4 are built.** The full intended flow:
+order process. **Phases 1-5 are built.** The full intended flow:
 
 ```
 New Request
@@ -146,9 +149,9 @@ New Request
   → InBody verifies the PO                                        [BUILT — Phase 3]
   → Logistics processes dispatch                                  [BUILT — Phase 4]
   → Customer sees invoice, dispatch and tracking details           [BUILT — Phase 4]
-  → Installation is scheduled                                     [Phase 5]
-  → Installation update/report is added                           [Phase 5]
-  → Order is marked completed                                     [Phase 5]
+  → CS schedules installation                                     [BUILT — Phase 5]
+  → CS updates installation status/notes through to completion     [BUILT — Phase 5]
+  → Customer sees installation status read-only                    [BUILT — Phase 5]
 ```
 
 See §11 for the full phase-by-phase roadmap. **Do not build future phases
@@ -647,12 +650,70 @@ read-only order context every other role sees (customer, product bundle,
 salesperson, confirmed PI, approved PO incl. its billing/shipping
 addresses) plus the editable invoice-selection and dispatch sections.
 
-**Phase 5 — Installation:** Blocked until a reliable order link exists.
-`installation.data` is a real model (installer, date, checklist, signatures)
-but has almost no production usage (1 record system-wide as of the last
-check) and no direct link to `crm.lead`/`sale.order` (only `partner_id` +
-`lot_id`/serial number). **Do not build installation integration until a
-reliable link and an approved operational process exist.**
+**Phase 5 — Installation (CS — Customer Care): BUILT**
+(`feature/installation-workflow-v5`, not yet merged/deployed at time of
+writing — see §13). A new shared `cs` role can see every CultFit order
+(same domain as logistics/admin) and schedule/track installation through
+to completion. Admin can also view/manage everything CS can.
+
+**Read-only investigation confirmed no reliable, already-used native
+mechanism exists for installation tracking on CultFit orders specifically**
+— the original assessment above (`installation.data` unreliable, only 1
+record system-wide, no crm.lead/sale.order link) was re-verified live and
+still holds, plus several more candidates were checked and ruled out:
+- `crm.lead.cs_person` (many2one `res.users`, "CS Person") is real and
+  semantically exactly "Assigned CS" — but is `false`/empty on every real
+  CultFit order checked (verified across 4 real orders with completed
+  deliveries). Never populated in practice. **Not written from the
+  portal** — writing to a core, heavily-automated model's user-assignment
+  field with zero visibility into what else might react to it (activity
+  creation, notifications) is a real risk the Phase 4 dispatch precedent
+  explicitly avoids for its own narrow fields; "Assigned CS" is instead
+  whoever last touched the portal's own installation metadata for that
+  order — read-only in the customer view, informational in the CS view.
+- `crm.lead.x_studio_machine_installed_at` looks installation-related by
+  name but is actually a location-**type** classifier (Gym, Clinic,
+  Hospital, Home, School/College, ...) — completely unrelated to
+  installation status. A real false lead the live re-verification caught.
+- `stock.picking.is_installation_required` (boolean) is real and `true` on
+  every real CultFit outgoing delivery checked — reused as read-only
+  display context only (`InstallationInfo.installationRequired`), never
+  written.
+- `stock.picking.installation_count` is `0` on every real CultFit order
+  checked — it counts linked `project.task` records, and zero exist.
+- `project.task` is a real, actively-used Odoo model (364 records
+  system-wide, genuine `sale_order_id` FK) — but **zero** are linked to
+  any real CultFit sale order checked. Auto-creating one from the portal
+  would be creating a new Odoo business record, which the spec explicitly
+  disallows; not integrated.
+- `account.move.is_sale_installed` (boolean) is real and `true` on the
+  real CultFit invoices checked — a reasonable coarse signal, but
+  boolean-only (no date/installer/notes), so it can't carry the full
+  status/schedule/notes model this phase needs. Not integrated.
+- `maintenance.equipment`/`maintenance.request` don't exist in this Odoo
+  instance (Maintenance app not installed). `calendar.event` exists and is
+  heavily used elsewhere (5,532 records) but not for CultFit installation
+  — not integrated, to avoid a second scheduling surface beyond the
+  portal's own Scheduled Date/Time fields.
+
+**Conclusion, same pattern as Phase 4 dispatch:** no native field is both
+reliably linked to crm.lead/sale.order AND safe to write, so installation
+status/schedule/notes/completion live entirely in structured chatter
+metadata (`PORTAL_INSTALLATION_SCHEDULED` / `_UPDATED` / `_STARTED` /
+`_COMPLETED`, versioned, latest-by-date wins on read — identical mechanics
+to `DispatchMetadataRecord`). `InstallationStatus` is exactly the 5 states
+requested: `not_scheduled` → `scheduled` → `in_progress` → `installed` →
+`completed`. No new Odoo model, no new field, no new activity, no
+`project.task`/`installation.data`/`calendar.event` record ever created by
+the portal.
+
+CS dashboard (`/cs`) mirrors the logistics dashboard exactly (summary
+cards, filters, desktop table + mobile cards). `/cs/orders/[id]` shows the
+same read-only order context (customer, product, salesperson, CRM stage,
+delivery status) plus the editable Installation panel (status, date, time,
+notes, completion notes). Customer view (`CustomerInstallationSection`,
+added to both `/orders/[id]` and `/requests/[id]`, same
+fail-silently-on-error pattern as `CustomerLogisticsSection`) is read-only.
 
 **Phase 6 — Per-user accounts:** Replace the single shared
 `cultfit@curefit.com` login with per-individual CultFit accounts,
@@ -734,6 +795,22 @@ devices for the shared login) until Phase 6.
   customer's own linked sale order and to `CULTFIT_PARTNER_ID` before
   reading any `ir.attachment` bytes — same pattern as the existing PI PDF
   download.
+- Phase 5: `PORTAL_CS_EMAIL`/`PORTAL_CS_PASS` fail closed exactly like the
+  logistics pair — missing either one disables CS login only, never
+  widens/narrows any other role's access, never throws. `authzDomain()`
+  treats `admin`, `logistics`, and `cs` identically for reads;
+  `proxy.ts` gates `/cs/*` to `cs`/`admin` only, every other route's
+  gating is unaffected. The installation mutation route whitelists an
+  exact, named field set (`status`, `scheduledDate`, `scheduledTime`,
+  `installationNotes`, `completedOn`, `completionNotes`) — no arbitrary
+  Odoo model/field/method ever reaches `executeKw` from client input, and
+  no partner/salesperson/product/CRM-stage field is ever accepted from
+  either the CS or customer side. Customer cannot access `/cs/*` pages or
+  call the installation-update route (customer role is rejected there by
+  construction, same as every other role-gated route). The portal never
+  writes any native Odoo field for installation (see §11) — every write
+  is a chatter marker only, so there is no risk of an unverified write
+  interacting with existing Odoo automation on `crm.lead`.
 
 ---
 
@@ -765,14 +842,19 @@ devices for the shared login) until Phase 6.
   (chatter markers only; no PDF is ever persisted regardless) should only
   be created against production Odoo with explicit approval, verified
   field-by-field, then archived/cancelled if it was purely a test.
-- Phase 4 work happens on `feature/logistics-workflow-v4` (branched from
-  `main` after Phase 3 was merged/deployed). Not yet merged or deployed.
-  `PORTAL_LOGISTICS_EMAIL`/`PORTAL_LOGISTICS_PASS` must be added manually
-  to local `.env.local`, Vercel Preview, and Vercel Production before the
-  logistics role works in each environment (see `PORTAL_ENVIRONMENT.md`) —
-  same operational pattern as `CULTFIT_PARTNER_ID`. Same controlled-test
-  discipline applies before release: linking a test invoice and saving
-  dispatch info against production Odoo should only happen with explicit
-  approval, verified field-by-field (including that picking `state` and
-  the sale order itself did not change), then the test's chatter markers
-  cleaned up afterward.
+- Phase 4 work happened on `feature/logistics-workflow-v4` (branched from
+  `main` after Phase 3 was merged/deployed), plus a follow-up fix branch
+  `fix/phase4-production-verification`. Merged and deployed to Production;
+  `PORTAL_LOGISTICS_EMAIL`/`PORTAL_LOGISTICS_PASS` are configured in local
+  `.env.local`, Vercel Preview, and Vercel Production.
+- Phase 5 work happens on `feature/installation-workflow-v5` (branched
+  from `main` after Phase 4 was merged/deployed). Not yet merged or
+  deployed. `PORTAL_CS_EMAIL`/`PORTAL_CS_PASS` must be added manually to
+  local `.env.local`, Vercel Preview, and Vercel Production before the CS
+  role works in each environment (see `PORTAL_ENVIRONMENT.md`) — same
+  operational pattern as the logistics pair. Same controlled-test
+  discipline applies before release: scheduling/updating installation
+  status against production Odoo should only happen with explicit
+  approval, verified field-by-field (including that no native Odoo field
+  was written and no `project.task`/`installation.data` record was
+  created), then the test's chatter markers cleaned up afterward.

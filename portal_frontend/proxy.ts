@@ -10,10 +10,12 @@ import { requireAuthUser } from '@/lib/auth-server';
 const STAFF_HOME = '/admin';
 const CUSTOMER_HOME = '/dashboard';
 const LOGISTICS_HOME = '/logistics';
+const CS_HOME = '/cs';
 
 function homeFor(role: string): string {
   if (role === 'admin') return STAFF_HOME;
   if (role === 'logistics') return LOGISTICS_HOME;
+  if (role === 'cs') return CS_HOME;
   return CUSTOMER_HOME;
 }
 
@@ -41,6 +43,11 @@ export function proxy(req: NextRequest) {
     return NextResponse.redirect(new URL(homeFor(user.role), req.url));
   }
 
+  // Same pattern for CS (Phase 5) — admin may also view/manage installation.
+  if (pathname.startsWith('/cs') && user.role !== 'cs' && user.role !== 'admin') {
+    return NextResponse.redirect(new URL(homeFor(user.role), req.url));
+  }
+
   if ((pathname.startsWith('/dashboard') || pathname.startsWith('/requests')) && user.role !== 'customer') {
     return NextResponse.redirect(new URL(homeFor(user.role), req.url));
   }
@@ -49,5 +56,5 @@ export function proxy(req: NextRequest) {
 }
 
 export const config = {
-  matcher: ['/admin/:path*', '/dashboard/:path*', '/orders/:path*', '/requests/:path*', '/logistics/:path*'],
+  matcher: ['/admin/:path*', '/dashboard/:path*', '/orders/:path*', '/requests/:path*', '/logistics/:path*', '/cs/:path*'],
 };

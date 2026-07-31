@@ -315,20 +315,22 @@ export class PartnerNotMappedError extends Error {
 export type Authz =
   | { role: 'admin' }
   | { role: 'logistics' }
+  | { role: 'cs' }
   | { role: 'customer'; scope: CustomerScope | undefined };
 
 // Every CultFit fetch — list AND single-record — resolves its domain from
-// this function only. It always includes the CultFit domain, even for admin
-// and logistics, so no authenticated user of any role can ever read a
+// this function only. It always includes the CultFit domain, even for admin,
+// logistics and CS, so no authenticated user of any role can ever read a
 // crm.lead outside the CultFit family through these functions, and a
 // customer with no (or an empty) scope gets a hard 403 rather than any
-// fallback to broad access. Logistics is granted the same READ domain as
-// admin (see §3 of the Phase 4 spec: "logistics must see all CultFit
-// orders") — every function that must stay admin-only for WRITES already
-// gates on `authz.role !== 'admin'` explicitly, which correctly rejects
-// 'logistics' too without needing separate handling per call site.
+// fallback to broad access. Logistics and CS are each granted the same READ
+// domain as admin (see §3 of the Phase 4 spec and the equivalent Phase 5
+// rule: "CS must see all CultFit orders") — every function that must stay
+// admin-only, or admin/logistics-only, for WRITES already gates on
+// `authz.role !== 'admin'` (etc.) explicitly, which correctly rejects 'cs'
+// too without needing separate handling per call site.
 function authzDomain(authz: Authz): unknown[] {
-  if (authz.role === 'admin' || authz.role === 'logistics') return cultfitDomain();
+  if (authz.role === 'admin' || authz.role === 'logistics' || authz.role === 'cs') return cultfitDomain();
 
   const scope = authz.scope;
   if (!scope) throw new PartnerNotMappedError();
@@ -2927,4 +2929,339 @@ export async function fetchInvoicePdfData(leadId: number, authz: Authz): Promise
     data: Buffer.from(atts[0].datas, 'base64'),
     filename: `Invoice-${view.invoice.name.replace(/[^A-Za-z0-9-]/g, '')}.pdf`,
   };
+}
+
+// ──── Installation workflow (Phase 5 — CS / Customer Care) ────────────────────
+//
+// Read-only investigation before writing any of this (see PORTAL_ENVIRONMENT.md
+// / CULTFIT_PORTAL_MASTER_CONTEXT.md for the full findings) confirmed there is
+// no reliable, already-used native mechanism for installation tracking on
+// CultFit orders specifically:
+//   - crm.lead.cs_person (many2one res.users, "CS Person") is real and
+//     semantically exactly this, but is empty on every real CultFit order
+//     checked — never populated in practice. Writing to it from the portal
+//     would be the first thing to ever touch this field operationally, with
+//     no visibility into whether other automation (activity assignment,
+//     notifications) reacts to it. Left read-only/unused rather than risking
+//     a surprise side effect on a core, heavily-automated model.
+//   - crm.lead.x_studio_machine_installed_at looks installation-related by
+//     name but is actually a location-TYPE classifier (Gym/Clinic/Hospital/
+//     Home/...), unrelated to installation status. Not used.
+//   - stock.picking.is_installation_required (boolean) is real and populated
+//     true on every real CultFit outgoing delivery checked — reused below as
+//     read-only context only, never written.
+//   - stock.picking.installation_count is always 0 on every real CultFit
+//     order — it counts linked project.task records, and none exist.
+//   - project.task has a genuine sale_order_id FK and is actively used
+//     elsewhere in this Odoo instance (364 records), but zero are linked to
+//     any real CultFit sale order — not the mechanism actually used here,
+//     and auto-creating one from the portal would be creating a new Odoo
+//     business record, which the spec explicitly disallows.
+//   - account.move.is_sale_installed (boolean) is real and true on the real
+//     CultFit invoices checked — a reasonable coarse hint, but boolean-only
+//     (no date/installer/notes), so it can't carry the full status/schedule/
+//     notes model this phase needs. Not integrated.
+//   - installation.data is a real, purpose-built physical-installation
+//     checklist model (installer name, date, LCD/adapter/grounding checks),
+//     but only 1 record exists system-wide and it links only via partner_id
+//     + lot_id/serial number — no crm.lead/sale.order FK at all. Too
+//     unreliable to build on.
+//   - maintenance.equipment / maintenance.request don't exist (Maintenance
+//     app not installed). calendar.event exists and is heavily used
+//     elsewhere, but not for CultFit installation — not integrated, to avoid
+//     introducing a second scheduling surface beyond the portal's own
+//     Scheduled Date/Time fields.
+//
+// Conclusion: same pattern as Phase 4 dispatch — no native field is both
+// reliably linked AND safe to write, so status/schedule/notes/completion
+// live entirely in structured chatter metadata, versioned and never
+// overwritten (latest-by-date wins on read, same as dispatch metadata).
+// is_installation_required is read from the linked picking purely as
+// display context.
+
+export class CsWorkflowError extends Error {
+  constructor(message: string) { super(message); this.name = 'CsWorkflowError'; }
+}
+
+export type InstallationStatus = 'not_scheduled' | 'scheduled' | 'in_progress' | 'installed' | 'completed';
+
+const VALID_INSTALLATION_STATUSES: InstallationStatus[] = [
+  'not_scheduled', 'scheduled', 'in_progress', 'installed', 'completed',
+];
+
+export interface InstallationInfo {
+  status: InstallationStatus;
+  scheduledDate: string | null;
+  scheduledTime: string | null;
+  assignedCs: string | null;
+  installationNotes: string | null;
+  completedOn: string | null;
+  completionNotes: string | null;
+  installationRequired: boolean | null;
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
+interface InstallationMetadataRecord {
+  status: InstallationStatus;
+  scheduledDate: string | null;
+  scheduledTime: string | null;
+  assignedCs: string | null;
+  installationNotes: string | null;
+  completedOn: string | null;
+  completionNotes: string | null;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+const INSTALLATION_SCHEDULED_MARKER = 'PORTAL_INSTALLATION_SCHEDULED';
+const INSTALLATION_UPDATED_MARKER = 'PORTAL_INSTALLATION_UPDATED';
+const INSTALLATION_STARTED_MARKER = 'PORTAL_INSTALLATION_STARTED';
+const INSTALLATION_COMPLETED_MARKER = 'PORTAL_INSTALLATION_COMPLETED';
+
+async function fetchInstallationMetadata(leadId: number): Promise<InstallationMetadataRecord | null> {
+  const messages = await executeKw('mail.message', 'search_read', [[
+    ['res_id', '=', leadId], ['model', '=', 'crm.lead'],
+    '|', '|', '|',
+    ['body', 'ilike', INSTALLATION_SCHEDULED_MARKER], ['body', 'ilike', INSTALLATION_UPDATED_MARKER],
+    ['body', 'ilike', INSTALLATION_STARTED_MARKER], ['body', 'ilike', INSTALLATION_COMPLETED_MARKER],
+  ]], { fields: ['body', 'date'] }) as { body: string; date: string }[];
+
+  let latest: InstallationMetadataRecord | null = null;
+  let latestDate = '';
+  for (const m of messages) {
+    const rec = decodeMarkerData<InstallationMetadataRecord>(INSTALLATION_SCHEDULED_MARKER, m.body)
+      ?? decodeMarkerData<InstallationMetadataRecord>(INSTALLATION_UPDATED_MARKER, m.body)
+      ?? decodeMarkerData<InstallationMetadataRecord>(INSTALLATION_STARTED_MARKER, m.body)
+      ?? decodeMarkerData<InstallationMetadataRecord>(INSTALLATION_COMPLETED_MARKER, m.body);
+    if (rec && m.date > latestDate) { latest = rec; latestDate = m.date; }
+  }
+  return latest;
+}
+
+function buildInstallationInfo(picking: Record<string, unknown> | null, meta: InstallationMetadataRecord | null): InstallationInfo {
+  return {
+    status: meta?.status ?? 'not_scheduled',
+    scheduledDate: meta?.scheduledDate ?? null,
+    scheduledTime: meta?.scheduledTime ?? null,
+    assignedCs: meta?.assignedCs ?? null,
+    installationNotes: meta?.installationNotes ?? null,
+    completedOn: meta?.completedOn ?? null,
+    completionNotes: meta?.completionNotes ?? null,
+    installationRequired: picking ? Boolean(picking.is_installation_required) : null,
+    updatedAt: meta?.updatedAt ?? null,
+    updatedBy: meta?.updatedBy ?? null,
+  };
+}
+
+// Same batched-picking-fields need as fetchOutgoingPicking, plus the one
+// read-only installation context field.
+async function fetchOutgoingPickingForInstallation(soIds: number[]): Promise<Record<string, unknown> | null> {
+  if (!soIds.length) return null;
+  const pickings = await executeKw('stock.picking', 'search_read', [[
+    ['sale_id', 'in', soIds], ['picking_type_id.code', '=', 'outgoing'],
+  ]], { fields: ['id', 'name', 'state', 'is_installation_required'], order: 'id desc', limit: 1 }) as Record<string, unknown>[];
+  return pickings[0] ?? null;
+}
+
+export interface CsOrderSummary {
+  id: number;
+  name: string;
+  customer: string | null;
+  mainProduct: string | null;
+  salesperson: string | null;
+  deliveryStatus: DeliveryStatus;
+  installationStatus: InstallationStatus;
+  assignedCs: string | null;
+  scheduledDate: string | null;
+  lastUpdated: string | null;
+}
+
+export async function fetchCsOrderList(authz: Authz): Promise<CsOrderSummary[]> {
+  if (authz.role !== 'admin' && authz.role !== 'cs') throw new CsWorkflowError('CS access required.');
+  const domain = authzDomain(authz);
+  const leads = await executeKw('crm.lead', 'search_read', [domain], {
+    fields: LEAD_FIELDS, order: 'id desc', limit: 500,
+  }) as Record<string, unknown>[];
+
+  const soAggMap = await fetchSoAggregates(leads);
+  const leadIds = leads.map(l => l.id as number);
+
+  const allSoIds = [...new Set(leads.flatMap(l => (l.order_ids as number[]) || []))];
+  const outgoingPickings = allSoIds.length
+    ? await executeKw('stock.picking', 'search_read', [[
+      ['sale_id', 'in', allSoIds], ['picking_type_id.code', '=', 'outgoing'],
+    ]], { fields: ['id', 'sale_id', 'state', 'date_done', 'is_installation_required'], order: 'id desc' }) as Record<string, unknown>[]
+    : [];
+  const pickingBySoId = new Map<number, Record<string, unknown>>();
+  for (const p of outgoingPickings) {
+    const soId = (p.sale_id as OdooTuple) ? (p.sale_id as [number, string])[0] : null;
+    if (soId && !pickingBySoId.has(soId)) pickingBySoId.set(soId, p);
+  }
+
+  const dispatchMetaEntries = await Promise.all(leadIds.map(id => fetchDispatchMetadata(id).then(m => [id, m] as const)));
+  const dispatchMetaMap = new Map(dispatchMetaEntries);
+  const installMetaEntries = await Promise.all(leadIds.map(id => fetchInstallationMetadata(id).then(m => [id, m] as const)));
+  const installMetaMap = new Map(installMetaEntries);
+
+  return leads.map(lead => {
+    const leadId = lead.id as number;
+    const built = buildLead(lead, soAggMap.get(leadId));
+    const soIds = (lead.order_ids as number[]) || [];
+    const picking = soIds.map(id => pickingBySoId.get(id)).find(Boolean) ?? null;
+
+    const dispatch = buildDispatchInfo(picking ?? null, dispatchMetaMap.get(leadId) ?? null);
+    const installation = buildInstallationInfo(picking ?? null, installMetaMap.get(leadId) ?? null);
+
+    return {
+      id: leadId, name: (lead.name as string) || `CRM-${leadId}`,
+      customer: built.customer as string | null,
+      mainProduct: soAggMap.get(leadId)?.modelNames.join(', ') || null,
+      salesperson: built.salesperson as string | null,
+      deliveryStatus: dispatch.deliveryStatus,
+      installationStatus: installation.status,
+      assignedCs: installation.assignedCs,
+      scheduledDate: installation.scheduledDate,
+      lastUpdated: parseDate(lead.write_date),
+    };
+  });
+}
+
+export interface CsOrderDetail {
+  id: number;
+  name: string;
+  customer: string | null;
+  requestDetails: PortalRequestDetails | null;
+  salesperson: string | null;
+  crmStage: string | null;
+  dispatch: DispatchInfo;
+  installation: InstallationInfo;
+  timeline: PortalRequestTimelineEntry[];
+}
+
+export async function fetchCsOrderDetail(id: number, authz: Authz): Promise<CsOrderDetail | null> {
+  if (authz.role !== 'admin' && authz.role !== 'cs') throw new CsWorkflowError('CS access required.');
+  const domain = [['id', '=', id], ...authzDomain(authz)];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: [...LEAD_FIELDS, 'stage_id', 'description'] }) as Record<string, unknown>[];
+  if (!leads.length) return null;
+  const lead = leads[0];
+  const soIds = (lead.order_ids as number[]) || [];
+
+  const [picking, dispatchMeta, installMeta, timelineMessages] = await Promise.all([
+    fetchOutgoingPickingForInstallation(soIds),
+    fetchDispatchMetadata(id),
+    fetchInstallationMetadata(id),
+    executeKw('mail.message', 'search_read', [[['res_id', '=', id], ['model', '=', 'crm.lead']]], { fields: ['date', 'author_id', 'body'], order: 'date desc', limit: 30 }) as Promise<Record<string, unknown>[]>,
+  ]);
+
+  const stageVal = lead.stage_id as OdooTuple;
+  const timeline = timelineMessages
+    .map(m => ({
+      date: m.date ? String(m.date) : null,
+      author: (m.author_id as OdooTuple) ? (m.author_id as [number, string])[1] : 'Odoo',
+      body: stripHtml(String(m.body ?? '')),
+    }))
+    .filter(m => m.body);
+
+  return {
+    id, name: (lead.name as string) || `CRM-${id}`,
+    customer: (lead.partner_id as OdooTuple) ? (lead.partner_id as [number, string])[1] : null,
+    requestDetails: decodeRequestDetails(lead.description),
+    salesperson: (lead.user_id as OdooTuple) ? (lead.user_id as [number, string])[1] : null,
+    crmStage: stageVal ? stageVal[1] : null,
+    dispatch: buildDispatchInfo(picking, dispatchMeta),
+    installation: buildInstallationInfo(picking, installMeta),
+    timeline,
+  };
+}
+
+export interface InstallationUpdateInput {
+  status: unknown;
+  scheduledDate?: unknown;
+  scheduledTime?: unknown;
+  installationNotes?: unknown;
+  completedOn?: unknown;
+  completionNotes?: unknown;
+}
+
+const MAX_INSTALLATION_TEXT = { time: 20, note: 1000 };
+
+function optInstallationTextField(v: unknown, max: number, field: string): string | null {
+  if (v === undefined || v === null || v === '') return null;
+  if (typeof v !== 'string') throw new CsWorkflowError(`${field} must be text.`);
+  const trimmed = v.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > max) throw new CsWorkflowError(`${field} must be ${max} characters or fewer.`);
+  return trimmed;
+}
+
+// The only server-side entry point for any installation write — every field
+// is re-validated from scratch here regardless of what the client sent.
+// Never writes any native Odoo field (see the file-header note above for
+// why); always records the full picture in portal metadata, which is what
+// both the CS and customer views read from. A field omitted from the
+// request (undefined) keeps its previously saved value — same partial-merge
+// semantics as updateDispatchInfo, so a caller that only changes one field
+// can never accidentally blank out the others.
+export async function updateInstallationInfo(
+  leadId: number, input: InstallationUpdateInput, authz: Authz, userEmail: string,
+): Promise<InstallationInfo> {
+  if (authz.role !== 'admin' && authz.role !== 'cs') throw new CsWorkflowError('CS access required.');
+
+  const soIds = await resolveOrderSoIds(leadId, authz);
+  const picking = await fetchOutgoingPickingForInstallation(soIds);
+  const existing = await fetchInstallationMetadata(leadId);
+
+  if (!(typeof input.status === 'string' && VALID_INSTALLATION_STATUSES.includes(input.status as InstallationStatus))) {
+    throw new CsWorkflowError('Invalid installation status.');
+  }
+  const status = input.status as InstallationStatus;
+
+  const record: InstallationMetadataRecord = {
+    status,
+    scheduledDate: mergeField(input.scheduledDate, existing?.scheduledDate ?? null, () => optDateField(input.scheduledDate, 'Scheduled date')),
+    scheduledTime: mergeField(input.scheduledTime, existing?.scheduledTime ?? null, () => optInstallationTextField(input.scheduledTime, MAX_INSTALLATION_TEXT.time, 'Scheduled time')),
+    // Not independently settable (no "assign" action was requested) — it's
+    // simply whoever first touched this order's installation record, so the
+    // customer view has a real, meaningful "Assigned CS" without inventing
+    // a reassignment UI nothing asked for.
+    assignedCs: existing?.assignedCs ?? userEmail,
+    installationNotes: mergeField(input.installationNotes, existing?.installationNotes ?? null, () => optInstallationTextField(input.installationNotes, MAX_INSTALLATION_TEXT.note, 'Installation note')),
+    completedOn: mergeField(input.completedOn, existing?.completedOn ?? null, () => optDateField(input.completedOn, 'Completed on')),
+    completionNotes: mergeField(input.completionNotes, existing?.completionNotes ?? null, () => optInstallationTextField(input.completionNotes, MAX_INSTALLATION_TEXT.note, 'Completion note')),
+    updatedAt: new Date().toISOString(), updatedBy: userEmail,
+  };
+
+  const marker = status === 'completed' ? INSTALLATION_COMPLETED_MARKER
+    : status === 'in_progress' ? INSTALLATION_STARTED_MARKER
+    : status === 'scheduled' && !existing ? INSTALLATION_SCHEDULED_MARKER
+    : INSTALLATION_UPDATED_MARKER;
+  const label = status === 'completed' ? 'Installation completed' : status === 'in_progress' ? 'Installation started' : status === 'scheduled' ? 'Installation scheduled' : 'Installation info updated';
+  await executeKw('crm.lead', 'message_post', [[leadId]], {
+    body: `<p><b>${marker}</b>: ${escapeHtml(label)} by ${escapeHtml(userEmail)}.</p>` + encodeMarkerData(marker, record),
+    subtype_xmlid: 'mail.mt_note',
+  });
+
+  return buildInstallationInfo(picking, record);
+}
+
+export interface CustomerInstallationView {
+  installation: InstallationInfo;
+}
+
+// Same scoping choice as fetchCustomerLogisticsView — not filtered to
+// PORTAL_REQUEST_MARKER, since most real CultFit orders predate the portal.
+// Ownership is still fully enforced by authzDomain(authz) alone.
+export async function fetchCustomerInstallationView(leadId: number, authz: Authz): Promise<CustomerInstallationView> {
+  const domain = [['id', '=', leadId], ...authzDomain(authz)];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: ['order_ids'] }) as { order_ids: number[] }[];
+  if (!leads.length) throw new LeadNotFoundError();
+  const soIds = leads[0].order_ids || [];
+
+  const [picking, meta] = await Promise.all([
+    fetchOutgoingPickingForInstallation(soIds),
+    fetchInstallationMetadata(leadId),
+  ]);
+
+  return { installation: buildInstallationInfo(picking, meta) };
 }
