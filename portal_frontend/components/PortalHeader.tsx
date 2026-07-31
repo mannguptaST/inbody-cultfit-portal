@@ -4,7 +4,7 @@ import Link from 'next/link';
 import { usePathname } from 'next/navigation';
 
 interface Props {
-  role?: 'STAFF' | 'CUSTOMER' | 'ADMIN';
+  role?: 'STAFF' | 'CUSTOMER' | 'ADMIN' | 'LOGISTICS';
   userName?: string;
   search?: string;
   onSearchChange?: (v: string) => void;
@@ -16,9 +16,10 @@ interface Props {
 }
 
 const ROLE_BADGE: Record<string, string> = {
-  STAFF:    'bg-amber-50 text-amber-700 border border-amber-200',
-  ADMIN:    'bg-violet-50 text-violet-700 border border-violet-200',
-  CUSTOMER: 'bg-blue-50 text-blue-700 border border-blue-200',
+  STAFF:      'bg-amber-50 text-amber-700 border border-amber-200',
+  ADMIN:      'bg-violet-50 text-violet-700 border border-violet-200',
+  CUSTOMER:   'bg-blue-50 text-blue-700 border border-blue-200',
+  LOGISTICS:  'bg-teal-50 text-teal-700 border border-teal-200',
 };
 
 const CUSTOMER_NAV = [

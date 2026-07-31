@@ -4,7 +4,7 @@
 export interface User {
   name: string;
   email: string | false;
-  role: 'admin' | 'inbody_manager' | 'inbody_user' | 'customer';
+  role: 'admin' | 'inbody_manager' | 'inbody_user' | 'customer' | 'logistics';
   company?: string;
 }
 
@@ -399,4 +399,89 @@ export interface AdminRequestDetail extends PortalRequestDetail {
   draftPI: PIDraftInfo | null;
   publishedPI: PIPublishedSnapshot | null;
   po: PoAdminView;
+}
+
+// ── Phase 4: Logistics (invoice + dispatch tracking) ─────────────────────────
+
+export type DeliveryStatus =
+  | 'not_started' | 'logistics_processing' | 'ready_to_dispatch'
+  | 'dispatched' | 'in_transit' | 'delivered' | 'delivery_issue';
+
+export interface LogisticsInvoiceSummary {
+  id: number;
+  name: string;
+  invoiceDate: string | null;
+  dueDate: string | null;
+  untaxedAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+  paymentState: string;
+  state: string;
+  currency: string;
+}
+
+export interface DispatchInfo {
+  pickingId: number | null;
+  pickingName: string | null;
+  pickingState: string | null;
+  dispatchDate: string | null;
+  courier: string | null;
+  awb: string | null;
+  trackingUrl: string | null;
+  expectedDeliveryDate: string | null;
+  actualDeliveryDate: string | null;
+  deliveryStatus: DeliveryStatus;
+  logisticsNote: string | null;
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
+export type InvoiceStatus = 'not_created' | 'needs_selection' | 'available';
+
+export interface LogisticsOrderSummary {
+  id: number;
+  name: string;
+  customer: string | null;
+  mainProduct: string | null;
+  salesperson: string | null;
+  poStatus: PoStatus;
+  invoiceStatus: InvoiceStatus;
+  deliveryStatus: DeliveryStatus;
+  courier: string | null;
+  awb: string | null;
+  expectedDeliveryDate: string | null;
+  lastUpdated: string | null;
+}
+
+export interface LogisticsOrderDetail {
+  id: number;
+  name: string;
+  customer: string | null;
+  requestDetails: PortalRequestDetails | null;
+  salesperson: string | null;
+  crmStage: string | null;
+  publishedPI: PIPublishedSnapshot | null;
+  poStatus: PoStatus;
+  approvedPoSummary: PoSubmissionRecord | null;
+  invoiceCandidates: LogisticsInvoiceSummary[];
+  selectedInvoice: LogisticsInvoiceSummary | null;
+  dispatch: DispatchInfo;
+  timeline: PortalRequestTimelineEntry[];
+}
+
+export interface DispatchUpdatePayload {
+  dispatchDate?: string | null;
+  courier?: string | null;
+  awb?: string | null;
+  trackingUrl?: string | null;
+  expectedDeliveryDate?: string | null;
+  actualDeliveryDate?: string | null;
+  deliveryStatus: DeliveryStatus;
+  logisticsNote?: string | null;
+}
+
+export interface CustomerLogisticsView {
+  invoice: LogisticsInvoiceSummary | null;
+  invoiceStatus: InvoiceStatus;
+  dispatch: DispatchInfo;
 }

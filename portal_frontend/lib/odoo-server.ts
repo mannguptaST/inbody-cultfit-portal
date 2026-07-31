@@ -314,15 +314,21 @@ export class PartnerNotMappedError extends Error {
 
 export type Authz =
   | { role: 'admin' }
+  | { role: 'logistics' }
   | { role: 'customer'; scope: CustomerScope | undefined };
 
 // Every CultFit fetch — list AND single-record — resolves its domain from
-// this function only. It always includes the CultFit domain, even for admin,
-// so no authenticated user of any role can ever read a crm.lead outside the
-// CultFit family through these functions, and a customer with no (or an
-// empty) scope gets a hard 403 rather than any fallback to broad access.
+// this function only. It always includes the CultFit domain, even for admin
+// and logistics, so no authenticated user of any role can ever read a
+// crm.lead outside the CultFit family through these functions, and a
+// customer with no (or an empty) scope gets a hard 403 rather than any
+// fallback to broad access. Logistics is granted the same READ domain as
+// admin (see §3 of the Phase 4 spec: "logistics must see all CultFit
+// orders") — every function that must stay admin-only for WRITES already
+// gates on `authz.role !== 'admin'` explicitly, which correctly rejects
+// 'logistics' too without needing separate handling per call site.
 function authzDomain(authz: Authz): unknown[] {
-  if (authz.role === 'admin') return cultfitDomain();
+  if (authz.role === 'admin' || authz.role === 'logistics') return cultfitDomain();
 
   const scope = authz.scope;
   if (!scope) throw new PartnerNotMappedError();
@@ -2348,4 +2354,562 @@ export async function requestPoCorrection(
   }
 
   return { status: 'correction_requested', activityCreated, warning };
+}
+
+// ──── Logistics workflow (Phase 4) ─────────────────────────────────────────
+// account.move (invoices) and stock.picking (dispatch) are the sources of
+// truth — the portal never creates either. Only three native, side-effect-
+// free stock.picking fields are ever written (scheduled_date,
+// carrier_tracking_ref, carrier_tracking_url) — never picking state, never
+// date_done (Odoo sets that itself on real validation, which this portal
+// never triggers), never carrier_id (would require an existing
+// delivery.carrier record; courier name is kept as portal metadata text
+// instead so logistics can enter any real-world courier without one). No
+// sale.order is ever confirmed, no stock is reserved or moved. Everything
+// else (courier name, dispatch date, actual delivery date, the portal's
+// own richer delivery-status enum, logistics note, invoice selection) lives
+// in structured chatter markers on the Opportunity — same zero-new-
+// infrastructure pattern as Phase 1-3.
+
+export class LogisticsWorkflowError extends Error {
+  constructor(message: string) { super(message); this.name = 'LogisticsWorkflowError'; }
+}
+
+export type DeliveryStatus =
+  | 'not_started' | 'logistics_processing' | 'ready_to_dispatch'
+  | 'dispatched' | 'in_transit' | 'delivered' | 'delivery_issue';
+
+const VALID_DELIVERY_STATUSES: DeliveryStatus[] = [
+  'not_started', 'logistics_processing', 'ready_to_dispatch',
+  'dispatched', 'in_transit', 'delivered', 'delivery_issue',
+];
+
+export interface LogisticsInvoiceSummary {
+  id: number;
+  name: string;
+  invoiceDate: string | null;
+  dueDate: string | null;
+  untaxedAmount: number;
+  taxAmount: number;
+  totalAmount: number;
+  paymentState: string;
+  state: string;
+  currency: string;
+}
+
+export interface DispatchInfo {
+  pickingId: number | null;
+  pickingName: string | null;
+  pickingState: string | null; // Odoo's own state — always read-only here
+  dispatchDate: string | null;
+  courier: string | null;
+  awb: string | null;
+  trackingUrl: string | null;
+  expectedDeliveryDate: string | null;
+  actualDeliveryDate: string | null;
+  deliveryStatus: DeliveryStatus;
+  logisticsNote: string | null;
+  updatedAt: string | null;
+  updatedBy: string | null;
+}
+
+interface DispatchMetadataRecord {
+  dispatchDate: string | null;
+  courier: string | null;
+  awb: string | null;
+  trackingUrl: string | null;
+  expectedDeliveryDate: string | null;
+  actualDeliveryDate: string | null;
+  deliveryStatus: DeliveryStatus;
+  logisticsNote: string | null;
+  updatedAt: string;
+  updatedBy: string;
+}
+
+interface InvoiceLinkRecord {
+  invoiceId: number;
+  linkedAt: string;
+  linkedBy: string;
+}
+
+const LOGISTICS_UPDATED_MARKER = 'PORTAL_LOGISTICS_UPDATED';
+const INVOICE_LINKED_MARKER = 'PORTAL_INVOICE_LINKED';
+const DISPATCHED_MARKER = 'PORTAL_DISPATCHED';
+const DELIVERED_MARKER = 'PORTAL_DELIVERED';
+
+// Resolves the sale.order ids reachable from an authorized lead — the same
+// ownership root every invoice/picking lookup below starts from, so a
+// logistics/admin/customer id can never be used to reach a SO outside the
+// caller's authorized lead.
+async function resolveOrderSoIds(leadId: number, authz: Authz): Promise<number[]> {
+  const domain = [['id', '=', leadId], ...authzDomain(authz)];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: ['order_ids'] }) as { order_ids: number[] }[];
+  if (!leads.length) throw new LeadNotFoundError();
+  return leads[0].order_ids || [];
+}
+
+// Only "real" invoices are ever candidates: posted (not draft/cancelled —
+// a draft could still change), out_invoice (never a credit note — a
+// refund is not "the bill" a customer downloads), and independently
+// re-verified against the CultFit commercial partner even though the SO
+// itself is already lead-scoped, since invoice_ids is a many2many that
+// nothing stops Odoo staff from linking unusually.
+async function fetchOrderInvoiceCandidates(soIds: number[], authz: Authz): Promise<LogisticsInvoiceSummary[]> {
+  if (!soIds.length) return [];
+  const sos = await executeKw('sale.order', 'read', [soIds], { fields: ['invoice_ids'] }) as { invoice_ids: number[] }[];
+  const invIds = [...new Set(sos.flatMap(s => s.invoice_ids || []))];
+  if (!invIds.length) return [];
+
+  const partnerId = resolveCultFitPartnerId(authz);
+  const invoices = await executeKw('account.move', 'search_read', [[
+    ['id', 'in', invIds], ['move_type', '=', 'out_invoice'], ['state', '=', 'posted'],
+    ['partner_id.commercial_partner_id', '=', partnerId],
+  ]], {
+    fields: ['id', 'name', 'invoice_date', 'invoice_date_due', 'amount_untaxed', 'amount_tax', 'amount_total', 'payment_state', 'state', 'currency_id'],
+    order: 'invoice_date desc',
+  }) as Record<string, unknown>[];
+
+  return invoices.map(inv => ({
+    id: inv.id as number, name: (inv.name as string) || `INV-${inv.id}`,
+    invoiceDate: parseDate(inv.invoice_date), dueDate: parseDate(inv.invoice_date_due),
+    untaxedAmount: (inv.amount_untaxed as number) || 0, taxAmount: (inv.amount_tax as number) || 0,
+    totalAmount: (inv.amount_total as number) || 0,
+    paymentState: (inv.payment_state as string) || 'not_paid', state: inv.state as string,
+    currency: (inv.currency_id as OdooTuple) ? (inv.currency_id as [number, string])[1] : 'INR',
+  }));
+}
+
+// The real, outgoing (never return/incoming) delivery picking — verified
+// live that a real CultFit sale order can carry both an outgoing delivery
+// AND a separate return picking; only the outgoing one is ever "the"
+// dispatch this feature tracks.
+async function fetchOutgoingPicking(soIds: number[]): Promise<Record<string, unknown> | null> {
+  if (!soIds.length) return null;
+  const pickings = await executeKw('stock.picking', 'search_read', [[
+    ['sale_id', 'in', soIds], ['picking_type_id.code', '=', 'outgoing'],
+  ]], {
+    fields: ['id', 'name', 'state', 'scheduled_date', 'date_done', 'carrier_tracking_ref', 'carrier_tracking_url'],
+    order: 'id desc', limit: 1,
+  }) as Record<string, unknown>[];
+  return pickings[0] ?? null;
+}
+
+async function fetchDispatchMetadata(leadId: number): Promise<DispatchMetadataRecord | null> {
+  const messages = await executeKw('mail.message', 'search_read', [[
+    ['res_id', '=', leadId], ['model', '=', 'crm.lead'],
+    '|', '|', ['body', 'ilike', LOGISTICS_UPDATED_MARKER], ['body', 'ilike', DISPATCHED_MARKER], ['body', 'ilike', DELIVERED_MARKER],
+  ]], { fields: ['body', 'date'] }) as { body: string; date: string }[];
+
+  let latest: DispatchMetadataRecord | null = null;
+  let latestDate = '';
+  for (const m of messages) {
+    const rec = decodeMarkerData<DispatchMetadataRecord>(LOGISTICS_UPDATED_MARKER, m.body)
+      ?? decodeMarkerData<DispatchMetadataRecord>(DISPATCHED_MARKER, m.body)
+      ?? decodeMarkerData<DispatchMetadataRecord>(DELIVERED_MARKER, m.body);
+    if (rec && m.date > latestDate) { latest = rec; latestDate = m.date; }
+  }
+  return latest;
+}
+
+// Merges the native picking (when one exists — always the source of truth
+// for scheduled_date/tracking ref/url and the read-only Odoo state) with
+// portal metadata (source of truth for everything Odoo has no field for:
+// courier name, our own richer delivery-status enum, actual delivery date,
+// the logistics note). Metadata always wins for the fields Odoo doesn't
+// have; the picking always wins for the fields it does, since Odoo staff
+// may also edit a picking directly outside the portal.
+function buildDispatchInfo(picking: Record<string, unknown> | null, meta: DispatchMetadataRecord | null): DispatchInfo {
+  return {
+    pickingId: picking ? (picking.id as number) : null,
+    pickingName: picking ? (picking.name as string) : null,
+    pickingState: picking ? (picking.state as string) : null,
+    dispatchDate: meta?.dispatchDate ?? null,
+    courier: meta?.courier ?? null,
+    awb: (picking?.carrier_tracking_ref as string) || meta?.awb || null,
+    trackingUrl: (picking?.carrier_tracking_url as string) || meta?.trackingUrl || null,
+    expectedDeliveryDate: parseDate(picking?.scheduled_date) ?? meta?.expectedDeliveryDate ?? null,
+    actualDeliveryDate: meta?.actualDeliveryDate ?? parseDate(picking?.date_done),
+    deliveryStatus: meta?.deliveryStatus ?? 'not_started',
+    logisticsNote: meta?.logisticsNote ?? null,
+    updatedAt: meta?.updatedAt ?? null,
+    updatedBy: meta?.updatedBy ?? null,
+  };
+}
+
+async function fetchInvoiceLink(leadId: number): Promise<InvoiceLinkRecord | null> {
+  const messages = await executeKw('mail.message', 'search_read', [[
+    ['res_id', '=', leadId], ['model', '=', 'crm.lead'], ['body', 'ilike', INVOICE_LINKED_MARKER],
+  ]], { fields: ['body', 'date'] }) as { body: string; date: string }[];
+  let latest: InvoiceLinkRecord | null = null;
+  let latestDate = '';
+  for (const m of messages) {
+    const rec = decodeMarkerData<InvoiceLinkRecord>(INVOICE_LINKED_MARKER, m.body);
+    if (rec && m.date > latestDate) { latest = rec; latestDate = m.date; }
+  }
+  return latest;
+}
+
+// Resolution rule: an explicit logistics selection wins as long as it still
+// points at a currently-valid candidate (an invoice can be cancelled after
+// being selected); otherwise, auto-resolve only when unambiguous (exactly
+// one valid candidate) — never guess between two real invoices.
+function resolveSelectedInvoice(candidates: LogisticsInvoiceSummary[], link: InvoiceLinkRecord | null): LogisticsInvoiceSummary | null {
+  if (link) {
+    const linked = candidates.find(c => c.id === link.invoiceId);
+    if (linked) return linked;
+  }
+  return candidates.length === 1 ? candidates[0] : null;
+}
+
+export interface LogisticsOrderSummary {
+  id: number;
+  name: string;
+  customer: string | null;
+  mainProduct: string | null;
+  salesperson: string | null;
+  poStatus: PoStatus;
+  invoiceStatus: 'not_created' | 'needs_selection' | 'available';
+  deliveryStatus: DeliveryStatus;
+  courier: string | null;
+  awb: string | null;
+  expectedDeliveryDate: string | null;
+  lastUpdated: string | null;
+}
+
+export async function fetchLogisticsOrderList(authz: Authz): Promise<LogisticsOrderSummary[]> {
+  if (authz.role !== 'admin' && authz.role !== 'logistics') throw new LogisticsWorkflowError('Logistics access required.');
+  const domain = authzDomain(authz);
+  const leads = await executeKw('crm.lead', 'search_read', [domain], {
+    fields: LEAD_FIELDS, order: 'id desc', limit: 500,
+  }) as Record<string, unknown>[];
+
+  const soAggMap = await fetchSoAggregates(leads);
+  const leadIds = leads.map(l => l.id as number);
+  const [poMap] = await Promise.all([fetchPOStatusMap(leadIds)]);
+
+  // Batched across all leads — one pass over every linked sale.order's
+  // invoice/picking ids rather than a query per lead.
+  const allSoIds = [...new Set(leads.flatMap(l => (l.order_ids as number[]) || []))];
+  const soData = allSoIds.length
+    ? await executeKw('sale.order', 'read', [allSoIds], { fields: ['id', 'invoice_ids'] }) as { id: number; invoice_ids: number[] }[]
+    : [];
+  const soInvoiceMap = new Map(soData.map(s => [s.id, s.invoice_ids || []]));
+
+  const partnerId = resolveCultFitPartnerId(authz);
+  const allInvIds = [...new Set(soData.flatMap(s => s.invoice_ids || []))];
+  const validInvIds = allInvIds.length
+    ? new Set((await executeKw('account.move', 'search_read', [[
+      ['id', 'in', allInvIds], ['move_type', '=', 'out_invoice'], ['state', '=', 'posted'],
+      ['partner_id.commercial_partner_id', '=', partnerId],
+    ]], { fields: ['id'] }) as { id: number }[]).map(i => i.id))
+    : new Set<number>();
+
+  const outgoingPickings = allSoIds.length
+    ? await executeKw('stock.picking', 'search_read', [[
+      ['sale_id', 'in', allSoIds], ['picking_type_id.code', '=', 'outgoing'],
+    ]], { fields: ['id', 'sale_id', 'carrier_tracking_ref', 'carrier_tracking_url', 'scheduled_date'], order: 'id desc' }) as Record<string, unknown>[]
+    : [];
+  const pickingBySoId = new Map<number, Record<string, unknown>>();
+  for (const p of outgoingPickings) {
+    const soId = (p.sale_id as OdooTuple) ? (p.sale_id as [number, string])[0] : null;
+    if (soId && !pickingBySoId.has(soId)) pickingBySoId.set(soId, p);
+  }
+
+  const dispatchMetaEntries = await Promise.all(leadIds.map(id => fetchDispatchMetadata(id).then(m => [id, m] as const)));
+  const dispatchMetaMap = new Map(dispatchMetaEntries);
+
+  return leads.map(lead => {
+    const leadId = lead.id as number;
+    const built = buildLead(lead, soAggMap.get(leadId));
+    const details = decodeRequestDetails(lead.description);
+    const soIds = (lead.order_ids as number[]) || [];
+
+    let invoiceStatus: LogisticsOrderSummary['invoiceStatus'] = 'not_created';
+    const validCount = soIds.flatMap(id => soInvoiceMap.get(id) || []).filter(id => validInvIds.has(id)).length;
+    if (validCount === 1) invoiceStatus = 'available';
+    else if (validCount > 1) invoiceStatus = 'needs_selection';
+
+    const picking = soIds.map(id => pickingBySoId.get(id)).find(Boolean) ?? null;
+    const meta = dispatchMetaMap.get(leadId) ?? null;
+    const dispatch = buildDispatchInfo(picking ?? null, meta ?? null);
+
+    return {
+      id: leadId, name: (lead.name as string) || `CRM-${leadId}`,
+      customer: built.customer as string | null,
+      mainProduct: details?.mainProduct.name ?? (soAggMap.get(leadId)?.modelNames.join(', ') || null),
+      salesperson: built.salesperson as string | null,
+      poStatus: poMap.get(leadId) ?? 'awaiting_upload',
+      invoiceStatus,
+      deliveryStatus: dispatch.deliveryStatus,
+      courier: dispatch.courier,
+      awb: dispatch.awb,
+      expectedDeliveryDate: dispatch.expectedDeliveryDate,
+      lastUpdated: parseDate(lead.write_date),
+    };
+  });
+}
+
+export interface LogisticsOrderDetail {
+  id: number;
+  name: string;
+  customer: string | null;
+  requestDetails: PortalRequestDetails | null;
+  salesperson: string | null;
+  crmStage: string | null;
+  publishedPI: PIPublishedSnapshot | null;
+  poStatus: PoStatus;
+  approvedPoSummary: PoSubmissionRecord | null;
+  invoiceCandidates: LogisticsInvoiceSummary[];
+  selectedInvoice: LogisticsInvoiceSummary | null;
+  dispatch: DispatchInfo;
+  timeline: PortalRequestTimelineEntry[];
+}
+
+export async function fetchLogisticsOrderDetail(id: number, authz: Authz): Promise<LogisticsOrderDetail | null> {
+  if (authz.role !== 'admin' && authz.role !== 'logistics') throw new LogisticsWorkflowError('Logistics access required.');
+  const domain = [['id', '=', id], ...authzDomain(authz)];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: [...LEAD_FIELDS, 'stage_id', 'description'] }) as Record<string, unknown>[];
+  if (!leads.length) return null;
+  const lead = leads[0];
+  const soIds = (lead.order_ids as number[]) || [];
+
+  const [snapshotResp, poCtx, invoiceCandidates, picking, meta, invoiceLink, timelineMessages] = await Promise.all([
+    fetchLatestPISnapshotAndResponse(id),
+    (async () => {
+      const { submissions } = await fetchPoMarkers(id);
+      return submissions.length ? submissions.reduce((a, b) => (b.version > a.version ? b : a)) : null;
+    })(),
+    fetchOrderInvoiceCandidates(soIds, authz),
+    fetchOutgoingPicking(soIds),
+    fetchDispatchMetadata(id),
+    fetchInvoiceLink(id),
+    executeKw('mail.message', 'search_read', [[['res_id', '=', id], ['model', '=', 'crm.lead']]], { fields: ['date', 'author_id', 'body'], order: 'date desc', limit: 30 }) as Promise<Record<string, unknown>[]>,
+  ]);
+
+  const { submissions, corrections, approvals } = await fetchPoMarkers(id);
+  const poStatusResult = poStatusFrom(submissions, corrections, approvals);
+
+  const stageVal = lead.stage_id as OdooTuple;
+  const timeline = timelineMessages
+    .map(m => ({
+      date: m.date ? String(m.date) : null,
+      author: (m.author_id as OdooTuple) ? (m.author_id as [number, string])[1] : 'Odoo',
+      body: stripHtml(String(m.body ?? '')),
+    }))
+    .filter(m => m.body);
+
+  return {
+    id, name: (lead.name as string) || `CRM-${id}`,
+    customer: (lead.partner_id as OdooTuple) ? (lead.partner_id as [number, string])[1] : null,
+    requestDetails: decodeRequestDetails(lead.description),
+    salesperson: (lead.user_id as OdooTuple) ? (lead.user_id as [number, string])[1] : null,
+    crmStage: stageVal ? stageVal[1] : null,
+    publishedPI: snapshotResp.snapshot,
+    poStatus: poStatusResult.status,
+    approvedPoSummary: poCtx,
+    invoiceCandidates,
+    selectedInvoice: resolveSelectedInvoice(invoiceCandidates, invoiceLink),
+    dispatch: buildDispatchInfo(picking, meta),
+    timeline,
+  };
+}
+
+export async function selectOrderInvoice(leadId: number, invoiceId: unknown, authz: Authz, userEmail: string): Promise<LogisticsInvoiceSummary> {
+  if (authz.role !== 'admin' && authz.role !== 'logistics') throw new LogisticsWorkflowError('Logistics access required.');
+  const invId = Number(invoiceId);
+  if (!Number.isInteger(invId) || invId <= 0) throw new LogisticsWorkflowError('A valid invoice ID is required.');
+
+  const soIds = await resolveOrderSoIds(leadId, authz);
+  const candidates = await fetchOrderInvoiceCandidates(soIds, authz);
+  const match = candidates.find(c => c.id === invId);
+  if (!match) throw new LogisticsWorkflowError('That invoice is not linked to this request, or is not a valid posted invoice.');
+
+  const record: InvoiceLinkRecord = { invoiceId: invId, linkedAt: new Date().toISOString(), linkedBy: userEmail };
+  await executeKw('crm.lead', 'message_post', [[leadId]], {
+    body: `<p><b>${INVOICE_LINKED_MARKER}</b>: Invoice ${escapeHtml(match.name)} linked by ${escapeHtml(userEmail)}.</p>`
+      + encodeMarkerData(INVOICE_LINKED_MARKER, record),
+    subtype_xmlid: 'mail.mt_note',
+  });
+  return match;
+}
+
+export interface DispatchUpdateInput {
+  dispatchDate?: unknown;
+  courier?: unknown;
+  awb?: unknown;
+  trackingUrl?: unknown;
+  expectedDeliveryDate?: unknown;
+  actualDeliveryDate?: unknown;
+  deliveryStatus?: unknown;
+  logisticsNote?: unknown;
+}
+
+const MAX_LOGISTICS_TEXT = { courier: 120, awb: 60, note: 1000 };
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function optDateField(v: unknown, field: string): string | null {
+  if (v === undefined || v === null || v === '') return null;
+  if (typeof v !== 'string' || !DATE_RE.test(v)) throw new LogisticsWorkflowError(`${field} must be a valid date.`);
+  return v;
+}
+
+// Rejects text that's too long rather than silently truncating it — matches
+// the convention already established in po-validation.ts. A silent truncate
+// would let a logistics user believe a full note saved when only part of it
+// did.
+function optTextField(v: unknown, max: number, field: string): string | null {
+  if (v === undefined || v === null || v === '') return null;
+  if (typeof v !== 'string') throw new LogisticsWorkflowError(`${field} must be text.`);
+  const trimmed = v.trim();
+  if (!trimmed) return null;
+  if (trimmed.length > max) throw new LogisticsWorkflowError(`${field} must be ${max} characters or fewer.`);
+  return trimmed;
+}
+
+// Only http(s) allowed — rejects javascript:, data:, and any other scheme a
+// malicious tracking URL could use, since this value is later rendered as a
+// clickable link in both the logistics and customer UI.
+function safeTrackingUrl(v: unknown): string | null {
+  const s = optTextField(v, 500, 'Tracking URL');
+  if (!s) return null;
+  try {
+    const u = new URL(s);
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new LogisticsWorkflowError('Tracking URL must be a valid http(s) link.');
+    return u.toString();
+  } catch (e) {
+    if (e instanceof LogisticsWorkflowError) throw e;
+    throw new LogisticsWorkflowError('Tracking URL must be a valid http(s) link.');
+  }
+}
+
+// A field omitted from the request body (undefined) keeps its previously
+// saved value; a field explicitly sent as null/'' clears it. Only a field
+// that's actually present and invalid is rejected. This is what makes
+// updateDispatchInfo a real partial update rather than a full replace that
+// would silently blank out every field the caller didn't happen to send.
+function mergeField<T>(v: unknown, existing: T | null, compute: () => T | null): T | null {
+  return v === undefined ? existing : compute();
+}
+
+// The only server-side entry point for any dispatch write — every field is
+// re-validated from scratch here regardless of what the client sent.
+// Writes the three safe native picking fields when a picking exists
+// (never picking state, never date_done, never carrier_id — see file
+// header), and always records the full picture in portal metadata, which
+// is what both the logistics and customer views actually read from for
+// every field Odoo has no equivalent of.
+export async function updateDispatchInfo(
+  leadId: number, input: DispatchUpdateInput, authz: Authz, userEmail: string,
+): Promise<DispatchInfo> {
+  if (authz.role !== 'admin' && authz.role !== 'logistics') throw new LogisticsWorkflowError('Logistics access required.');
+
+  const soIds = await resolveOrderSoIds(leadId, authz);
+  const picking = await fetchOutgoingPicking(soIds);
+  const existing = await fetchDispatchMetadata(leadId);
+
+  if (input.deliveryStatus !== undefined
+    && !(typeof input.deliveryStatus === 'string' && VALID_DELIVERY_STATUSES.includes(input.deliveryStatus as DeliveryStatus))) {
+    throw new LogisticsWorkflowError('Invalid delivery status.');
+  }
+  const deliveryStatus: DeliveryStatus = input.deliveryStatus === undefined
+    ? (existing?.deliveryStatus ?? 'not_started')
+    : input.deliveryStatus as DeliveryStatus;
+
+  const record: DispatchMetadataRecord = {
+    dispatchDate: mergeField(input.dispatchDate, existing?.dispatchDate ?? null, () => optDateField(input.dispatchDate, 'Dispatch date')),
+    courier: mergeField(input.courier, existing?.courier ?? null, () => optTextField(input.courier, MAX_LOGISTICS_TEXT.courier, 'Courier')),
+    awb: mergeField(input.awb, existing?.awb ?? null, () => optTextField(input.awb, MAX_LOGISTICS_TEXT.awb, 'AWB / tracking number')),
+    trackingUrl: mergeField(input.trackingUrl, existing?.trackingUrl ?? null, () => safeTrackingUrl(input.trackingUrl)),
+    expectedDeliveryDate: mergeField(input.expectedDeliveryDate, existing?.expectedDeliveryDate ?? null, () => optDateField(input.expectedDeliveryDate, 'Expected delivery date')),
+    actualDeliveryDate: mergeField(input.actualDeliveryDate, existing?.actualDeliveryDate ?? null, () => optDateField(input.actualDeliveryDate, 'Actual delivery date')),
+    deliveryStatus,
+    logisticsNote: mergeField(input.logisticsNote, existing?.logisticsNote ?? null, () => optTextField(input.logisticsNote, MAX_LOGISTICS_TEXT.note, 'Logistics note')),
+    updatedAt: new Date().toISOString(), updatedBy: userEmail,
+  };
+
+  // Best-effort native write — a failure here must not lose the portal
+  // metadata update, which is the record both UIs actually read from.
+  if (picking) {
+    try {
+      const writeVals: Record<string, unknown> = {};
+      if (record.awb) writeVals.carrier_tracking_ref = record.awb;
+      if (record.trackingUrl) writeVals.carrier_tracking_url = record.trackingUrl;
+      if (record.expectedDeliveryDate) writeVals.scheduled_date = `${record.expectedDeliveryDate} 00:00:00`;
+      if (Object.keys(writeVals).length) await executeKw('stock.picking', 'write', [[picking.id], writeVals]);
+    } catch (e) {
+      console.error('[logistics] failed to write safe picking fields for SO', leadId, e instanceof Error ? e.message : e);
+    }
+  }
+
+  // Marker choice is presentation/timeline-only (all three decode via the
+  // same DispatchMetadataRecord shape) — DELIVERED/DISPATCHED just make the
+  // chatter/timeline read naturally at those specific transitions.
+  const marker = deliveryStatus === 'delivered' ? DELIVERED_MARKER
+    : (deliveryStatus === 'dispatched' || deliveryStatus === 'in_transit') ? DISPATCHED_MARKER
+    : LOGISTICS_UPDATED_MARKER;
+  const label = deliveryStatus === 'delivered' ? 'Delivered' : deliveryStatus === 'dispatched' ? 'Dispatched' : 'Logistics info updated';
+  await executeKw('crm.lead', 'message_post', [[leadId]], {
+    body: `<p><b>${marker}</b>: ${escapeHtml(label)} by ${escapeHtml(userEmail)}.</p>` + encodeMarkerData(marker, record),
+    subtype_xmlid: 'mail.mt_note',
+  });
+
+  return buildDispatchInfo(picking, record);
+}
+
+export interface CustomerLogisticsView {
+  invoice: LogisticsInvoiceSummary | null;
+  invoiceStatus: 'not_created' | 'needs_selection' | 'available';
+  dispatch: DispatchInfo;
+}
+
+// Deliberately NOT filtered to PORTAL_REQUEST_MARKER (unlike the Phase 1-3
+// "My Requests" fetch) — most real CultFit orders predate the portal and
+// were never submitted through it, but they have real Odoo invoices/
+// pickings all the same. Scoping this to portal-submitted requests only
+// would hide real billing/dispatch data from the customer for the majority
+// of their actual orders. Ownership is still fully enforced by
+// authzDomain(authz) alone, identical to how /orders/[id] itself is scoped.
+export async function fetchCustomerLogisticsView(leadId: number, authz: Authz): Promise<CustomerLogisticsView> {
+  const domain = [['id', '=', leadId], ...authzDomain(authz)];
+  const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: ['order_ids'] }) as { order_ids: number[] }[];
+  if (!leads.length) throw new LeadNotFoundError();
+  const soIds = leads[0].order_ids || [];
+
+  const [candidates, link, picking, meta] = await Promise.all([
+    fetchOrderInvoiceCandidates(soIds, authz),
+    fetchInvoiceLink(leadId),
+    fetchOutgoingPicking(soIds),
+    fetchDispatchMetadata(leadId),
+  ]);
+
+  const selected = resolveSelectedInvoice(candidates, link);
+  return {
+    invoice: selected,
+    invoiceStatus: selected ? 'available' : candidates.length > 1 ? 'needs_selection' : 'not_created',
+    dispatch: buildDispatchInfo(picking, meta),
+  };
+}
+
+// Secure download for the customer — the invoice id comes only from the
+// server-resolved selection (never a client-supplied id), and is still
+// re-verified belongs to this lead's sale order(s) and the CultFit partner
+// before any bytes are read. Reuses the exact same ownership-check
+// discipline as fetchAttachmentData/fetchPIPdfData above.
+export async function fetchInvoicePdfData(leadId: number, authz: Authz): Promise<{ data: Buffer; filename: string }> {
+  const view = await fetchCustomerLogisticsView(leadId, authz);
+  if (!view.invoice) throw new LeadNotFoundError();
+
+  const soIds = await resolveOrderSoIds(leadId, authz);
+  const candidates = await fetchOrderInvoiceCandidates(soIds, authz);
+  if (!candidates.some(c => c.id === view.invoice!.id)) throw new LeadNotFoundError();
+
+  const atts = await executeKw('ir.attachment', 'search_read', [[
+    ['res_model', '=', 'account.move'], ['res_id', '=', view.invoice.id], ['mimetype', '=', 'application/pdf'],
+  ]], { fields: ['id', 'datas'], order: 'id desc', limit: 1 }) as { id: number; datas: string }[];
+  if (!atts.length || !atts[0].datas) throw new LeadNotFoundError();
+
+  return {
+    data: Buffer.from(atts[0].datas, 'base64'),
+    filename: `Invoice-${view.invoice.name.replace(/[^A-Za-z0-9-]/g, '')}.pdf`,
+  };
 }

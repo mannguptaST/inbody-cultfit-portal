@@ -58,8 +58,10 @@ export function verifyJwt(token: string): Record<string, unknown> | null {
   return payload;
 }
 
-const ADMIN_PASS    = process.env.PORTAL_ADMIN_PASS    ?? '';
-const CUSTOMER_PASS = process.env.PORTAL_CUSTOMER_PASS ?? '';
+const ADMIN_PASS     = process.env.PORTAL_ADMIN_PASS     ?? '';
+const CUSTOMER_PASS  = process.env.PORTAL_CUSTOMER_PASS  ?? '';
+const LOGISTICS_EMAIL = process.env.PORTAL_LOGISTICS_EMAIL ?? '';
+const LOGISTICS_PASS  = process.env.PORTAL_LOGISTICS_PASS  ?? '';
 
 // A customer's data access is scoped one of two ways — never by trusting a
 // partner id supplied by the client, always resolved server-side from here:
@@ -78,7 +80,7 @@ export type CustomerScope =
 interface PortalUser {
   id: number;
   email: string;
-  role: 'admin' | 'customer';
+  role: 'admin' | 'customer' | 'logistics';
   name: string;
   password: string;
   // Only meaningful for role === 'customer'. Missing/absent scope for a
@@ -86,9 +88,21 @@ interface PortalUser {
   scope?: CustomerScope;
 }
 
+// The logistics account only exists in this list when BOTH env vars are
+// configured — fail closed. A missing/partial config must never produce a
+// user with an empty-string password (which checkPassword's timing-safe
+// comparison would still technically "check" against, and an empty
+// PORTAL_LOGISTICS_PASS would be trivially guessable) — it must simply not
+// log in at all, the same way an unknown email doesn't, without touching
+// admin/customer login at all.
+const LOGISTICS_USER: PortalUser[] = (LOGISTICS_EMAIL && LOGISTICS_PASS)
+  ? [{ id: 3, email: LOGISTICS_EMAIL, role: 'logistics', name: 'Logistics', password: LOGISTICS_PASS }]
+  : [];
+
 export const PORTAL_USERS: PortalUser[] = [
   { id: 1, email: 'admin@inbody.com',    role: 'admin',    name: 'InBody Admin', password: ADMIN_PASS },
   { id: 2, email: 'cultfit@curefit.com', role: 'customer', name: 'CultFit',      password: CUSTOMER_PASS, scope: { kind: 'cultfit_domain' } },
+  ...LOGISTICS_USER,
 ];
 
 export function findUser(email: string) {
@@ -108,7 +122,7 @@ export function checkPassword(plain: string, stored: string): boolean {
 export interface AuthedUser {
   id: number;
   email: string;
-  role: 'admin' | 'customer';
+  role: 'admin' | 'customer' | 'logistics';
   name: string;
   scope?: CustomerScope;
 }

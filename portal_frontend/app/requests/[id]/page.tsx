@@ -8,6 +8,7 @@ import { STAGE_VARIANT, PI_STATUS_LABELS, PI_STATUS_VARIANT } from '@/lib/stage-
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
 import PoSection from '@/components/PoSection';
+import CustomerLogisticsSection from '@/components/CustomerLogisticsSection';
 import type { PortalRequestDetail, CustomerPIView } from '@/types';
 
 function digitsOnly(phone: string): string {
@@ -30,8 +31,6 @@ function fmtDateTime(d: string | null | undefined): string {
 }
 
 const FUTURE_SECTIONS = [
-  { key: 'dispatch', label: 'Dispatch' },
-  { key: 'invoice', label: 'Invoice' },
   { key: 'installation', label: 'Installation' },
 ];
 
@@ -344,6 +343,9 @@ export default function RequestDetailPage() {
 
             {/* Purchase Order (Phase 3) */}
             <PoSection requestId={request.id} />
+
+            {/* Logistics & Delivery (Phase 4) */}
+            <CustomerLogisticsSection requestId={request.id} />
 
             {/* Future sections — disabled placeholders, no fake data */}
             <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">

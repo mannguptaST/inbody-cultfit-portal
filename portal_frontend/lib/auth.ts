@@ -28,3 +28,7 @@ export async function logout(): Promise<void> {
 export function isInBodyStaff(role: string | null | undefined): boolean {
   return role === 'admin' || role === 'inbody_manager' || role === 'inbody_user';
 }
+
+export function isLogistics(role: string | null | undefined): boolean {
+  return role === 'logistics';
+}

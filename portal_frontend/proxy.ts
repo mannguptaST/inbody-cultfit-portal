@@ -9,6 +9,13 @@ import { requireAuthUser } from '@/lib/auth-server';
 
 const STAFF_HOME = '/admin';
 const CUSTOMER_HOME = '/dashboard';
+const LOGISTICS_HOME = '/logistics';
+
+function homeFor(role: string): string {
+  if (role === 'admin') return STAFF_HOME;
+  if (role === 'logistics') return LOGISTICS_HOME;
+  return CUSTOMER_HOME;
+}
 
 // Server-side page gating so an unauthenticated or wrong-role user is
 // redirected before the page ever renders — not just via the client-side
@@ -25,16 +32,22 @@ export function proxy(req: NextRequest) {
   }
 
   if (pathname.startsWith('/admin') && user.role !== 'admin') {
-    return NextResponse.redirect(new URL(CUSTOMER_HOME, req.url));
+    return NextResponse.redirect(new URL(homeFor(user.role), req.url));
   }
 
-  if ((pathname.startsWith('/dashboard') || pathname.startsWith('/requests')) && user.role === 'admin') {
-    return NextResponse.redirect(new URL(STAFF_HOME, req.url));
+  // Admin may also view logistics information (spec §2) — logistics pages
+  // are gated to 'logistics' OR 'admin', same as the API routes underneath.
+  if (pathname.startsWith('/logistics') && user.role !== 'logistics' && user.role !== 'admin') {
+    return NextResponse.redirect(new URL(homeFor(user.role), req.url));
+  }
+
+  if ((pathname.startsWith('/dashboard') || pathname.startsWith('/requests')) && user.role !== 'customer') {
+    return NextResponse.redirect(new URL(homeFor(user.role), req.url));
   }
 
   return NextResponse.next();
 }
 
 export const config = {
-  matcher: ['/admin/:path*', '/dashboard/:path*', '/orders/:path*', '/requests/:path*'],
+  matcher: ['/admin/:path*', '/dashboard/:path*', '/orders/:path*', '/requests/:path*', '/logistics/:path*'],
 };

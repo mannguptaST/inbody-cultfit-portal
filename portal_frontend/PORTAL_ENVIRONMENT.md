@@ -56,6 +56,36 @@ In Odoo, search `res.partner` for the CultFit company record (`is_company = true
 no `parent_id`) and use its `id` — or, equivalently, take the `commercial_partner_id`
 of any known CultFit-linked `crm.lead`.
 
+## `PORTAL_LOGISTICS_EMAIL` / `PORTAL_LOGISTICS_PASS` (optional — Phase 4)
+
+```
+PORTAL_LOGISTICS_EMAIL=
+PORTAL_LOGISTICS_PASS=
+```
+
+- **What it is:** credentials for one shared `logistics` portal role (invoice
+  and dispatch tracking — see §Phase 4 in `CULTFIT_PORTAL_MASTER_CONTEXT.md`).
+  Same shared-login model as the existing `cultfit@curefit.com` customer
+  account — one account for the whole logistics team, not per-individual.
+- **Server-only.** Read only in `lib/auth-server.ts` (`import 'server-only'`),
+  never sent to the browser.
+- **Fails closed if missing — on purpose, not an oversight.** The logistics
+  account is only added to the in-memory user list when **both** variables
+  are non-empty (`lib/auth-server.ts`). If either is missing, logistics login
+  simply doesn't exist — `findUser()` returns nothing for that email, so the
+  login route responds exactly like an unknown account ("Invalid email or
+  password"), the same generic message used for every failed login. It does
+  **not** throw, does **not** 500, and does **not** touch admin/customer
+  login in any way — a missing/partial logistics config only ever disables
+  logistics login, nothing else.
+- **No default password.** Unlike some scaffolds, there is deliberately no
+  fallback value — an empty `PORTAL_LOGISTICS_PASS` does not produce a
+  logistics account with an empty-string password (which would be trivially
+  guessable); it produces *no* logistics account at all.
+- **Must be added manually** to local `.env.local`, Vercel Preview, and
+  Vercel Production before the logistics role can be used in each of those
+  environments — same operational pattern as `CULTFIT_PARTNER_ID`.
+
 ## Operational notes (not new env vars, just documented behavior)
 
 - **`industry_id` is mandatory on `crm.lead` in this Odoo instance** (an
@@ -75,6 +105,14 @@ of any known CultFit-linked `crm.lead`.
   explicitly sent as `false`, not merely omitted — Odoo's own team/onchange
   defaults will silently auto-assign one if the key is left out entirely). Admin
   assigns the salesperson manually afterward.
+- **Phase 4 logistics only ever writes three native `stock.picking` fields**
+  (`scheduled_date`, `carrier_tracking_ref`, `carrier_tracking_url`) — never
+  picking `state`, never `date_done` (Odoo sets that itself when a picking is
+  actually validated, which this portal never triggers), never `carrier_id`
+  (would require an existing `delivery.carrier` record; courier name is kept
+  as portal metadata text instead). Everything else lives in structured
+  chatter markers on the Opportunity. See §Phase 4 in
+  `CULTFIT_PORTAL_MASTER_CONTEXT.md` for the full field-by-field rationale.
 
 ## Why this file exists instead of `.env.example`
 

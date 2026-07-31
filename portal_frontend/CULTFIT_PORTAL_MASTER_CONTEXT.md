@@ -68,12 +68,22 @@ Key server-only files:
 2. Every protected route calls `requireAuthUser(req)`, which re-resolves role
    and scope fresh from `PORTAL_USERS` by email on every request — a config
    change takes effect on the very next request, not after token expiry.
-3. Exactly two accounts exist today: `admin@inbody.com` (role `admin`) and
-   `cultfit@curefit.com` (role `customer`, scope `cultfit_domain`). This is a
-   **shared** login for the whole CultFit relationship, not per-individual —
-   see §11 Phase 6 for the planned fix.
+3. Three accounts can exist: `admin@inbody.com` (role `admin`),
+   `cultfit@curefit.com` (role `customer`, scope `cultfit_domain`), and an
+   optional `logistics` account (role `logistics`, Phase 4 — see §11) whose
+   email/password come from `PORTAL_LOGISTICS_EMAIL`/`PORTAL_LOGISTICS_PASS`
+   and which is only added to the user list at all when **both** are
+   configured (fail closed — see `PORTAL_ENVIRONMENT.md`). All three are
+   **shared** logins for the whole relevant team, not per-individual — see
+   §11 Phase 6 for the planned fix.
 4. Customer access must always fail closed — a customer with no/invalid scope
-   gets 403, never a fallback to broad access.
+   gets 403, never a fallback to broad access. Logistics reads share the
+   exact same CultFit-domain resolution as admin (`authzDomain()` in
+   `lib/odoo-server.ts` treats `admin` and `logistics` identically for
+   reads); every write-gated function still explicitly checks for `admin`
+   (or `admin`/`logistics` where Phase 4 intentionally allows both — see
+   §11), so a role this file doesn't explicitly grant a capability to is
+   rejected by construction, not by omission.
 
 ### CultFit identification — id-based, not name-based
 
@@ -123,20 +133,19 @@ on `OdooUnavailableError`.
 ## 4. Business objective — full intended workflow
 
 The portal is meant to eventually replace the entire email-based CultFit
-order process. **Only the first stage (New Request) is built today.** The
-full intended flow, for future phases to follow:
+order process. **Phases 1-4 are built.** The full intended flow:
 
 ```
 New Request
-  → CRM Opportunity created in Odoo                              [BUILT]
+  → CRM Opportunity created in Odoo                              [BUILT — Phase 1]
   → InBody reviews the request                                   [manual, Odoo-side]
-  → InBody creates the quotation/PI                               [Phase 2]
-  → Customer views the PI in the portal                           [Phase 2]
-  → Customer confirms PI or requests correction                   [Phase 2]
-  → Customer uploads the official PO                              [Phase 3]
-  → InBody verifies the PO                                        [Phase 3]
-  → Logistics processes dispatch                                  [Phase 4]
-  → Customer sees invoice, dispatch and tracking details           [Phase 4]
+  → InBody creates the quotation/PI                               [BUILT — Phase 2]
+  → Customer views the PI in the portal                           [BUILT — Phase 2]
+  → Customer confirms PI or requests correction                   [BUILT — Phase 2]
+  → Customer uploads the official PO                              [BUILT — Phase 3]
+  → InBody verifies the PO                                        [BUILT — Phase 3]
+  → Logistics processes dispatch                                  [BUILT — Phase 4]
+  → Customer sees invoice, dispatch and tracking details           [BUILT — Phase 4]
   → Installation is scheduled                                     [Phase 5]
   → Installation update/report is added                           [Phase 5]
   → Order is marked completed                                     [Phase 5]
@@ -569,11 +578,74 @@ still posted unconditionally (the record of the correction request must
 never be lost); the missing-activity condition is surfaced back to the
 admin as a warning, not silently swallowed.
 
-**Phase 4 — Dispatch & invoice:** Dispatch status from `stock.picking`
-(confirmed readable: `carrier_id`, `carrier_tracking_ref`,
-`carrier_tracking_url`, `scheduled_date`, `date_done`). Invoice details and
-PDF from `account.move` (already used for the existing order-tracking
-attachment-download feature).
+**Phase 4 — Logistics, billing invoice & dispatch tracking: BUILT**
+(`feature/logistics-workflow-v4`, not yet merged/deployed — see §13). A
+new shared `logistics` role (see §2) can see every CultFit order — not
+just portal-submitted ones, including orders that predate the portal
+entirely — and update invoice/dispatch tracking info. Admin can also view
+everything logistics sees (`authzDomain()`/every logistics function treats
+`admin` and `logistics` identically for reads and for the dispatch/invoice
+writes specifically — see below).
+
+**account.move (invoice) is the only source of truth for billing data —
+the portal never creates one.** A lead's linked sale.order(s) →
+`invoice_ids` are filtered to `move_type = 'out_invoice'` (never a credit
+note) and `state = 'posted'` (never draft/cancelled — a draft could still
+change), re-verified against `CULTFIT_PARTNER_ID` independently of the
+lead-scoping already in place. Verified live: a real CultFit sale order
+had **two** linked invoices — one real `out_invoice` and one `out_refund`
+credit note — confirming the `move_type` filter is load-bearing, not
+theoretical. When exactly one valid invoice exists it's used automatically;
+when more than one exists, logistics must explicitly select the correct
+one (`PORTAL_INVOICE_LINKED` chatter marker) — the selection is re-verified
+server-side against the current candidate list every time, so a
+since-cancelled invoice can never stay "selected." The customer's PDF
+download reuses the existing `ir.attachment` ownership-check pattern
+(`res_model = 'account.move'`, scoped to the resolved invoice id only —
+never a client-supplied one).
+
+**stock.picking (dispatch) is the only source of truth for delivery
+data — the portal never creates, confirms, reserves, or validates one.**
+Verified live: a real CultFit sale order had **two** pickings — an
+outgoing delivery and a separate return — confirming the dispatch tracking
+here must filter to `picking_type_id.code = 'outgoing'` specifically
+(`sale.order.picking_ids` alone is not enough). When an outgoing picking
+exists, only **three** native fields are ever written:
+`scheduled_date`, `carrier_tracking_ref`, `carrier_tracking_url` — never
+picking `state`, never `date_done` (Odoo sets that itself on real
+validation, which this portal never triggers), never `carrier_id` (a
+many2one requiring an existing `delivery.carrier` record — verified live
+that only one generic "Standard delivery" carrier exists in this Odoo
+instance and none of it is realistically usable for actual Indian courier
+names, so courier/transporter is kept as portal metadata text instead).
+Everything else — courier name, dispatch date, actual delivery date, the
+portal's own richer `DeliveryStatus` enum (`not_started` →
+`logistics_processing` → `ready_to_dispatch` → `dispatched` → `in_transit`
+→ `delivered`, plus a parallel `delivery_issue`), and the logistics note —
+lives in structured chatter markers (`PORTAL_LOGISTICS_UPDATED` /
+`PORTAL_DISPATCHED` / `PORTAL_DELIVERED`, chosen only for how the
+chatter/timeline reads at each transition — all three decode identically).
+When no outgoing picking exists yet, every field lives in metadata only;
+once a picking exists, its own state/tracking-ref/tracking-url are
+preferred over metadata for the fields Odoo actually has, while metadata
+stays authoritative for everything Odoo has no field for. Tracking URLs
+are validated to `http`/`https` only (rejects `javascript:` and any other
+scheme) before ever being stored or rendered as a clickable link.
+
+**No new Odoo model, no second CRM stage system** — same
+zero-new-infrastructure pattern as Phase 1-3. `crm.lead.stage_id` remains
+the one overall CRM stage; invoice/dispatch status are their own
+independent, real-data-backed concepts layered on top, not folded into it.
+
+**Logistics dashboard** (`/logistics`) shows every CultFit order (up to
+500, `search_read` limit) with summary counts and filters (search,
+salesperson, PO/invoice/delivery status, courier, sort) computed
+client-side over the already-fetched list — no server-side pagination or
+per-filter query params, since the CultFit order volume (order of ~100)
+doesn't currently warrant it. `/logistics/orders/[id]` shows the same
+read-only order context every other role sees (customer, product bundle,
+salesperson, confirmed PI, approved PO incl. its billing/shipping
+addresses) plus the editable invoice-selection and dispatch sections.
 
 **Phase 5 — Installation:** Blocked until a reliable order link exists.
 `installation.data` is a real model (installer, date, checklist, signatures)
@@ -639,6 +711,29 @@ devices for the shared login) until Phase 6.
   parser stack trace. PO extraction/submission is gated by the same
   eligibility check as either action (PI confirmed, not already approved,
   not already awaiting review) — enforced once, not duplicated per route.
+- Phase 4: `PORTAL_LOGISTICS_EMAIL`/`PORTAL_LOGISTICS_PASS` fail closed
+  exactly like `CULTFIT_PARTNER_ID` — missing either one disables logistics
+  login only, never widens/narrows admin or customer access, never throws.
+  `authzDomain()` and every logistics read/write function treat `admin` and
+  `logistics` identically; `proxy.ts` gates `/logistics/*` to those two
+  roles only, `/admin/*` and `/dashboard|/requests/*` are unaffected. Every
+  logistics mutation route whitelists an exact, named field set from the
+  request body — no arbitrary Odoo model/field/method ever reaches
+  `executeKw` from client input. Invoice selection is re-verified
+  server-side against the live candidate list on every read, not trusted
+  from a stored id alone, so a since-cancelled/reissued invoice can never
+  stay "selected." Dispatch tracking URLs are parsed and restricted to
+  `http`/`https` only (`javascript:`/`data:`/any other scheme rejected)
+  before being stored or rendered. The portal never creates an
+  `account.move` or `stock.picking`, never confirms a sale order, never
+  writes picking `state`/`date_done`, never reserves or validates stock —
+  the only native `stock.picking` writes are `scheduled_date`,
+  `carrier_tracking_ref`, `carrier_tracking_url`, wrapped so a write
+  failure there never loses the corresponding chatter-metadata record. The
+  customer's invoice PDF download re-verifies the invoice belongs to the
+  customer's own linked sale order and to `CULTFIT_PARTNER_ID` before
+  reading any `ir.attachment` bytes — same pattern as the existing PI PDF
+  download.
 
 ---
 
@@ -670,3 +765,14 @@ devices for the shared login) until Phase 6.
   (chatter markers only; no PDF is ever persisted regardless) should only
   be created against production Odoo with explicit approval, verified
   field-by-field, then archived/cancelled if it was purely a test.
+- Phase 4 work happens on `feature/logistics-workflow-v4` (branched from
+  `main` after Phase 3 was merged/deployed). Not yet merged or deployed.
+  `PORTAL_LOGISTICS_EMAIL`/`PORTAL_LOGISTICS_PASS` must be added manually
+  to local `.env.local`, Vercel Preview, and Vercel Production before the
+  logistics role works in each environment (see `PORTAL_ENVIRONMENT.md`) —
+  same operational pattern as `CULTFIT_PARTNER_ID`. Same controlled-test
+  discipline applies before release: linking a test invoice and saving
+  dispatch info against production Odoo should only happen with explicit
+  approval, verified field-by-field (including that picking `state` and
+  the sale order itself did not change), then the test's chatter markers
+  cleaned up afterward.

@@ -24,6 +24,12 @@ import type {
   PoSubmitResult,
   PoApproveResult,
   PoCorrectionResult,
+  LogisticsOrderSummary,
+  LogisticsOrderDetail,
+  LogisticsInvoiceSummary,
+  DispatchInfo,
+  DispatchUpdatePayload,
+  CustomerLogisticsView,
 } from '@/types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '/api';
@@ -244,4 +250,36 @@ export async function requestPoCorrection(id: number, comment: string): Promise<
     method: 'POST',
     body: JSON.stringify({ comment }),
   });
+}
+
+// ── Phase 4: Logistics ────────────────────────────────────────────────────────
+
+export async function getLogisticsOrders(): Promise<{ orders: LogisticsOrderSummary[] }> {
+  return apiFetch('/logistics/cultfit/orders');
+}
+
+export async function getLogisticsOrderDetail(id: number): Promise<LogisticsOrderDetail> {
+  return apiFetch(`/logistics/cultfit/orders/${id}`);
+}
+
+export async function selectLogisticsInvoice(id: number, invoiceId: number): Promise<{ invoice: LogisticsInvoiceSummary }> {
+  return apiFetch(`/logistics/cultfit/orders/${id}/invoice/select`, {
+    method: 'POST',
+    body: JSON.stringify({ invoiceId }),
+  });
+}
+
+export async function updateLogisticsDispatch(id: number, payload: DispatchUpdatePayload): Promise<DispatchInfo> {
+  return apiFetch(`/logistics/cultfit/orders/${id}/dispatch`, {
+    method: 'PATCH',
+    body: JSON.stringify(payload),
+  });
+}
+
+export async function getCustomerLogisticsView(id: number): Promise<CustomerLogisticsView> {
+  return apiFetch(`/portal/cultfit/requests/${id}/logistics`);
+}
+
+export function getInvoiceDownloadUrl(id: number): string {
+  return `${API_BASE}/portal/cultfit/requests/${id}/invoice/pdf`;
 }

@@ -143,3 +143,38 @@ export const PO_STATUS_VARIANT: Record<string, ChipVariant> = {
   correction_requested: 'danger',
   approved: 'success',
 };
+
+// Phase 4 logistics — delivery status is the portal's own richer enum
+// (distinct from Odoo's coarse stock.picking `state`), and invoice status
+// reflects real account.move data, not a portal-invented workflow.
+export const DELIVERY_STATUS_LABELS: Record<string, string> = {
+  not_started: 'Not Started',
+  logistics_processing: 'Logistics Processing',
+  ready_to_dispatch: 'Ready to Dispatch',
+  dispatched: 'Dispatched',
+  in_transit: 'In Transit',
+  delivered: 'Delivered',
+  delivery_issue: 'Delivery Issue',
+};
+
+export const DELIVERY_STATUS_VARIANT: Record<string, ChipVariant> = {
+  not_started: 'neutral',
+  logistics_processing: 'warning',
+  ready_to_dispatch: 'warning',
+  dispatched: 'info',
+  in_transit: 'info',
+  delivered: 'success',
+  delivery_issue: 'danger',
+};
+
+export const INVOICE_STATUS_LABELS: Record<string, string> = {
+  not_created: 'Not Created',
+  needs_selection: 'Needs Selection',
+  available: 'Available',
+};
+
+export const INVOICE_STATUS_VARIANT: Record<string, ChipVariant> = {
+  not_created: 'neutral',
+  needs_selection: 'warning',
+  available: 'success',
+};
