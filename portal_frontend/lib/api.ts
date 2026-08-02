@@ -11,6 +11,8 @@ import type {
   PortalRequestDetail,
   NewOrderRequestPayload,
   EligibleSalesperson,
+  TerritoryOption,
+  AdminProductOption,
   AdminRequestSummary,
   AdminRequestDetail,
   PIDraftInfo,
@@ -209,6 +211,47 @@ export async function publishPI(id: number, soId: number): Promise<PIPublishedSn
   return apiFetch(`/admin/cultfit/requests/${id}/pi/publish`, {
     method: 'POST',
     body: JSON.stringify({ soId }),
+  });
+}
+
+// ── Opportunity defaults / Region / Admin product editor ─────────────────────
+
+export async function getTerritories(): Promise<{ territories: TerritoryOption[] }> {
+  return apiFetch('/admin/cultfit/territories');
+}
+
+export async function updateRequestTerritory(id: number, territoryId: number): Promise<{ territory: TerritoryOption }> {
+  return apiFetch(`/admin/cultfit/requests/${id}/territory`, {
+    method: 'PATCH',
+    body: JSON.stringify({ territoryId }),
+  });
+}
+
+export async function searchAdminProducts(query: string): Promise<{ products: AdminProductOption[] }> {
+  return apiFetch(`/admin/cultfit/products/search?q=${encodeURIComponent(query)}`);
+}
+
+export async function addPILine(
+  id: number, soId: number, productId: number, quantity: number, unitPrice: number,
+): Promise<PIDraftInfo> {
+  return apiFetch(`/admin/cultfit/requests/${id}/pi/lines`, {
+    method: 'POST',
+    body: JSON.stringify({ soId, productId, quantity, unitPrice }),
+  });
+}
+
+export async function updatePILine(
+  id: number, soId: number, lineId: number, updates: { quantity?: number; unitPrice?: number },
+): Promise<PIDraftInfo> {
+  return apiFetch(`/admin/cultfit/requests/${id}/pi/lines/${lineId}`, {
+    method: 'PATCH',
+    body: JSON.stringify({ soId, ...updates }),
+  });
+}
+
+export async function removePILine(id: number, soId: number, lineId: number): Promise<PIDraftInfo> {
+  return apiFetch(`/admin/cultfit/requests/${id}/pi/lines/${lineId}?soId=${soId}`, {
+    method: 'DELETE',
   });
 }
 

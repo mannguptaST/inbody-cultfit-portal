@@ -5,8 +5,9 @@ in-progress order-request workflow. Read this before making changes — it
 exists so a future session (human or AI) doesn't have to re-derive any of
 this from scratch. No secret values appear anywhere in this document.
 
-Last updated: 2026-07-31, alongside the Phase 5 installation workflow build
-(`feature/installation-workflow-v5`) described in §11.
+Last updated: 2026-08-03, alongside the CultFit Opportunity defaults /
+Territory detection / native PI PDF / admin product-editor build
+(`feature/cultfit-defaults-region-pi-products`) described in §11a.
 
 ---
 
@@ -396,8 +397,16 @@ published, they can download the PDF and Confirm or Request Correction.
 Do not build further phases without being explicitly asked to start that
 phase.
 
-**Why the PI PDF is NOT Odoo's native report** — verified live, do not
-re-attempt without a real fix to one of these two blockers:
+**UPDATE (2026-08-03, see §11a): the PI PDF now IS Odoo's native report.**
+The two blockers below are still real for the routes they describe — this
+section is kept for history — but a *third* route was found that isn't
+blocked by either: Odoo's own public customer-portal controller
+(`/my/orders/<id>?report_type=pdf&access_token=...&download=true`), which
+authorizes via a per-`sale.order` `access_token` instead of a backend
+session login. `publishPI()` (`lib/odoo-server.ts`) now fetches the PDF from
+that route instead of rendering one with `pdfkit`. Full detail in §11a.
+
+Original blockers (still true for the routes they describe):
 - Calling `ir.actions.report._render_qweb_pdf` over XML-RPC fails: *"Private
   methods ... cannot be called remotely."* The old public alias
   (`render_qweb_pdf`) no longer exists in this Odoo 19 instance either.
@@ -408,16 +417,11 @@ re-attempt without a real fix to one of these two blockers:
   API/XML-RPC-only (or is using an API key rather than a real password),
   with no backend/web login rights. Not a bug to route around.
 
-So `lib/pi-pdf.ts` renders its own look-alike PDF (via `pdfkit`, no
-headless-browser dependency — deliberately avoided given past Playwright/
-gstack binary-mismatch friction in this dev environment) from data already
-read via XML-RPC: line items, taxes, totals, company/GST details (verified
-live from `res.company` id 1), and the same bank-details/T&C boilerplate
-InBody's real quotations already carry (copied verbatim from live
-historical CultFit orders — see `PI_TERMS` block in `lib/pi-pdf.ts`).
-**Not byte-identical to Odoo's own template.** If InBody later provisions a
-web-login-capable Odoo credential, the render path in `publishPI()`
-(`lib/odoo-server.ts`) is the only place that would need to change.
+`lib/pi-pdf.ts` (the old `pdfkit`-based look-alike renderer, described below
+for history) is no longer called by `publishPI()` as of §11a — left in the
+repo unused so old, already-published PI snapshots (frozen PDF bytes already
+saved as an `ir.attachment`, unaffected either way) have no dependency on it
+disappearing.
 
 **PI status/versioning has no new Odoo field or model** — same
 zero-new-infrastructure approach as Phase 1: a structured JSON blob in an
@@ -715,6 +719,159 @@ notes, completion notes). Customer view (`CustomerInstallationSection`,
 added to both `/orders/[id]` and `/requests/[id]`, same
 fail-silently-on-error pattern as `CustomerLogisticsSection`) is read-only.
 
+---
+
+## 11a. CultFit Opportunity defaults, Territory detection, native PI PDF, admin product editor
+
+(`feature/cultfit-defaults-region-pi-products`, branched from `main` after
+Phase 5 was merged/deployed. Controlled-tested against production Odoo —
+one clearly-named TEST Opportunity, all 8 defaults/Territory/product-editor/
+native-PDF/customer-confirm steps verified field-by-field directly against
+Odoo, then the test `sale.order` cancelled and the test `crm.lead` archived.
+See §13 for the deployment record.) Four related additions to the existing
+Phase 1 (New Order Request) and Phase 2 (PI) flows — no new phase, no new
+Odoo model, Phases 1-5's own architecture is otherwise untouched.
+
+### Standard Opportunity defaults (set at request-creation time, Phase 1)
+
+Every new CultFit `crm.lead` now also gets 6 additional CRM classification
+fields set automatically, alongside the existing `industry_id`/
+`sub_industry_id`. All resolved dynamically by name (cached, same pattern as
+`resolveFitnessIndustryId`) — never hardcoded ids — and all confirmed via a
+live, read-only field/record investigation:
+
+| Field | Model | Value |
+|---|---|---|
+| `key_account_manager` | `res.users` | "Nihal Pawar" |
+| `source_id` | `utm.source` | "Recurring" |
+| `sub_lead_source_id` | `sub.lead.source` | "Franchise" (id 40 — id 39 is a typo'd duplicate "Franhise", exact-match only, never fuzzy-matched) |
+| `ownership_id` | `res.ownership` | "Private" |
+| `medium_id` (labeled "Channel" in the Odoo UI) | `utm.medium` | "Direct" |
+| `account_type` (plain selection field, not a record) | — | `'franchise'` |
+
+None of these 6 are Odoo-required fields (unlike industry/sub-industry), but
+by design an unresolvable default still **blocks the whole request** with a
+clear error rather than creating a lead with a missing/wrong classification
+— same fail-loud philosophy as the pre-existing industry/sub-industry
+resolvers. Salesperson (`user_id`) is untouched — still explicit `false` at
+creation, admin-assigned later.
+
+### Territory detection ("Region")
+
+There is no "Region" model in this Odoo instance — the real field is
+`crm.lead.territory_id` (many2one → `res.territory`, a custom Studio model).
+Configured values (verified live): North, South, West 1, West 2, East,
+Oversea, North East (no id 6; Bihar has no configured territory).
+
+**`crm.lead.city`/`state_id` are not usable for this** — verified live that
+both are constant ("Chennai"/"Tamil Nadu") on every real CultFit lead, since
+they mirror the CultFit *commercial partner's* billing address, not the
+actual gym/opportunity location. Territory is instead derived by parsing the
+free-text request `name` (e.g. "Cult Elite Lakdikapul, Hyd, FOFO, Hybrid -
+InBody 260 S") against alias/locality tables built from real historical
+CultFit request names (`lib/region-resolver.ts`, pure/Odoo-free), resolving
+locality → city → Indian state, then resolving state → Territory **live**
+against `res.territory.state_ids` (`resolveTerritoryIdForState()` in
+`lib/odoo-server.ts`) — not a hardcoded state→territory copy, so a future
+Odoo-side territory reconfiguration is picked up automatically.
+
+If the location is ambiguous or unrecognized, `territory_id` is left unset
+(`false`) — **never guessed** — and the admin UI shows "Region requires
+Admin review." This never blocks request submission or PI creation/publish.
+Admin can review/set/override the Territory at any time
+(`updateRequestTerritory()`), which re-verifies the supplied id against the
+live `res.territory` list before writing and posts a
+`PORTAL_TERRITORY_UPDATED` chatter note (old_value is not tracked, only the
+new value + who + when — same audit-note pattern as every other admin
+mutation in this app). The auto-detection result (matched token, city,
+state, resolved territory name, confidence) is also stored in the request's
+structured `description` metadata (`regionDetection` — optional on
+`PortalRequestDetails`, absent/`undefined` on every record created before
+this) purely as a point-in-time record of what auto-detection found/did;
+the live `crm.lead.territory_id` (exposed as `currentTerritory` in
+`AdminRequestDetail`) is always the source of truth for the current value,
+including after an admin override.
+
+### Native Odoo PI PDF
+
+The customer-facing PI is now Odoo's own natively-generated PDF, not the
+`pdfkit` look-alike (see the corrected note in §11 Phase 2 above for how this
+became possible). Specifically: Odoo's public customer-portal controller,
+`GET <ODOO_BASE_URL>/my/orders/<sale_order_id>?report_type=pdf&access_token=<token>&download=true`,
+authorizes via a per-`sale.order` `access_token` (a plain, `store: True`
+`char` field with no `compute` — confirmed live) instead of a backend
+session login. This route renders report `sale.report_saleorder` (Odoo's
+standard "Quotation" print, id 748 in this instance) — **not** the separate
+"PRO-FORMA Invoice" report (id 749); that report is not reachable through
+any unauthenticated route today. The document heading therefore reads
+"Quotation," not literally "Pro-Forma Invoice" — a known, accepted tradeoff
+for a route that's proven to work with zero Odoo-side changes.
+
+`fetchNativeOdooPdf()` (`lib/odoo-server.ts`, called from `publishPI()`)
+generates and writes a fresh UUID to `access_token` only if it's currently
+empty (fresh portal-created draft orders have none — Odoo normally
+generates one lazily via a private method, `_portal_ensure_token()`, that
+like `_render_qweb_pdf` can't be called remotely). Confirmed live and safe:
+the only two `base.automation` rules on `sale.order` either fire on
+`create` only (irrelevant to a later field write) or are scoped to
+`trigger_field_ids: [order_line, state]` with a `state == 'sale'` filter
+domain — an `access_token`-only write on a `draft` order matches neither, so
+nothing fires, no email, no state change. If the fetch fails or doesn't
+return `application/pdf`, publish fails outright with a clear error (no
+silent fallback to the old `pdfkit` renderer — a financial document is the
+wrong place for the customer to silently see different content than what
+was actually verified). Publish/version/snapshot mechanics (one
+`ir.attachment` per publish, the frozen `PIPublishedSnapshot` chatter
+marker, `V1`/`V2`/`V3`...) are otherwise **unchanged** — only how the PDF
+bytes are produced changed; old, already-published snapshots are untouched
+regardless (already-frozen bytes in an existing `ir.attachment`).
+
+Verified live (controlled test): two independent fetches of the same
+published PDF — one via the portal, one directly against Odoo bypassing the
+app — differed in exactly 3 bytes, all within Odoo's own `/CreationDate`
+metadata timestamp; every other byte (company details, products, taxes,
+totals, terms, bank details) was identical.
+
+### Admin PI product editor
+
+Admin can now add/remove/reprice arbitrary approved products on a still-
+draft PI, not just edit the one main-product price/validity date
+(`updatePIDraft`, pre-existing). New functions in `lib/odoo-server.ts`:
+`searchAdminProducts` (search-by-name-or-code across the full ~1,834
+active/sellable product catalog — broader than the customer-facing
+`fetchCultFitProductCatalog`, which only shows products already used in a
+real CultFit order), `addPIDraftLine`, `removePIDraftLine`,
+`updatePIDraftLine`. Every one re-verifies `soId` belongs to the lead
+(`verifySOBelongsToLead`, pre-existing) and, for line-level ops, that
+`lineId` belongs to that `soId`, and re-validates any client-supplied
+product id against a live active/sellable/non-deprecated check server-side
+— never trusts the client. Deprecated products are excluded two ways: a
+live `name not ilike 'not use'` filter (verified live: covers 5 more real
+deprecated products than the app's pre-existing hardcoded
+`EXCLUDED_PRODUCT_IDS` list alone), plus a small, separately-scoped
+`ADMIN_EDITOR_EXCLUDED_PRODUCT_IDS` (just the one legacy-duplicate 260S
+entry). **Deliberately does NOT reuse `EXCLUDED_PRODUCT_IDS`** — that list
+hides bundle/accessory products (printer, LB WEB, Stand 120, LookinBody,
+etc.) from the *customer's main-product* picker only; those are exactly the
+real accessory products admin must be able to add here by hand.
+
+### Security additions
+
+The 4 new mutating admin routes this feature adds (`PATCH .../territory`,
+`POST .../pi/lines`, `PATCH`/`DELETE .../pi/lines/[lineId]`) carry the same
+same-origin + `Content-Type: application/json` checks as
+`app/api/portal/cultfit/requests/route.ts` (the existing customer-facing
+mutating route) — copied per-route, this codebase has no shared/central
+helper for it. **Known pre-existing gap, not fixed by this change (out of
+scope):** none of the *other* admin mutation routes (`salesperson`, `pi`,
+`pi/publish`, `pi/revise`, `po/approve`, `po/request-correction`, and the
+order `set_stage`/`stage`/`deal_status` routes) have this check either,
+despite §12's checklist claiming it for "every mutating POST route." The
+httpOnly, `SameSite=Lax` session cookie provides a baseline mitigation
+regardless. Worth closing in a future pass.
+
+---
+
 **Phase 6 — Per-user accounts:** Replace the single shared
 `cultfit@curefit.com` login with per-individual CultFit accounts,
 location-based permissions, cross-device portal notifications with unread
@@ -811,6 +968,19 @@ devices for the shared login) until Phase 6.
   writes any native Odoo field for installation (see §11) — every write
   is a chatter marker only, so there is no risk of an unverified write
   interacting with existing Odoo automation on `crm.lead`.
+- §11a: the 6 new Opportunity-default fields and Territory are resolved
+  server-side only (dynamic, cached, name-based lookups) — never trusted
+  from client input, and an unresolvable default blocks the whole request
+  rather than creating a lead with a wrong/missing classification. Territory
+  auto-detection never blocks submission on ambiguity — it just leaves
+  `territory_id` unset and surfaces "Admin review required." Every
+  admin-supplied territory id / product id / line id is re-verified against
+  a live Odoo query before any write. `sale.order.access_token` is the one
+  new field-write this feature introduces beyond existing precedent —
+  confirmed live to have no automation reacting to it and to trigger no
+  email/state change. The 4 new admin mutation routes this feature adds
+  carry same-origin + `Content-Type` checks (see §11a for the pre-existing
+  gap on the *other* admin routes, not fixed by this change).
 
 ---
 
@@ -847,14 +1017,18 @@ devices for the shared login) until Phase 6.
   `fix/phase4-production-verification`. Merged and deployed to Production;
   `PORTAL_LOGISTICS_EMAIL`/`PORTAL_LOGISTICS_PASS` are configured in local
   `.env.local`, Vercel Preview, and Vercel Production.
-- Phase 5 work happens on `feature/installation-workflow-v5` (branched
-  from `main` after Phase 4 was merged/deployed). Not yet merged or
-  deployed. `PORTAL_CS_EMAIL`/`PORTAL_CS_PASS` must be added manually to
+- Phase 5 work happened on `feature/installation-workflow-v5` (branched
+  from `main` after Phase 4 was merged/deployed). Merged and deployed to
+  Production. `PORTAL_CS_EMAIL`/`PORTAL_CS_PASS` must be configured in
   local `.env.local`, Vercel Preview, and Vercel Production before the CS
   role works in each environment (see `PORTAL_ENVIRONMENT.md`) — same
-  operational pattern as the logistics pair. Same controlled-test
-  discipline applies before release: scheduling/updating installation
-  status against production Odoo should only happen with explicit
-  approval, verified field-by-field (including that no native Odoo field
-  was written and no `project.task`/`installation.data` record was
-  created), then the test's chatter markers cleaned up afterward.
+  operational pattern as the logistics pair.
+- §11a (Opportunity defaults / Territory / native PI PDF / admin product
+  editor) work happened on `feature/cultfit-defaults-region-pi-products`
+  (branched from `main` after Phase 5 was merged/deployed). Controlled-test
+  discipline: one clearly-named TEST Opportunity created against production
+  Odoo, every default/Territory/product-editor/native-PDF/customer-confirm
+  step verified field-by-field directly against Odoo (not just the app's
+  own responses), then the test `sale.order` cancelled and the test
+  `crm.lead` archived. No new environment variables introduced. Not yet
+  merged or deployed as of this commit.
