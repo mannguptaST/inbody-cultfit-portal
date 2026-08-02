@@ -1,16 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuthUser } from '@/lib/auth-server';
 import { selectOrderInvoice, LeadNotFoundError, LogisticsWorkflowError, type Authz } from '@/lib/odoo-server';
-
-function isSameOrigin(req: NextRequest): boolean {
-  const origin = req.headers.get('origin');
-  if (!origin) return true;
-  try {
-    return new URL(origin).host === req.nextUrl.host;
-  } catch {
-    return false;
-  }
-}
+import { checkJsonMutation } from '@/lib/route-security';
 
 export async function POST(
   req: NextRequest,
@@ -21,10 +12,8 @@ export async function POST(
   if (user.role !== 'logistics' && user.role !== 'admin') {
     return NextResponse.json({ detail: 'Logistics access required' }, { status: 403 });
   }
-  if (!isSameOrigin(req)) return NextResponse.json({ detail: 'Cross-origin request rejected.' }, { status: 403 });
-  if (!(req.headers.get('content-type') ?? '').includes('application/json')) {
-    return NextResponse.json({ detail: 'Content-Type must be application/json.' }, { status: 400 });
-  }
+  const rejection = checkJsonMutation(req);
+  if (rejection) return NextResponse.json({ detail: rejection.detail }, { status: rejection.status });
 
   const { id } = await params;
   const orderId = parseInt(id, 10);

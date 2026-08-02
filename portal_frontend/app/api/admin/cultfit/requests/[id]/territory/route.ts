@@ -1,20 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuthUser } from '@/lib/auth-server';
 import { updateRequestTerritory, LeadNotFoundError, PIWorkflowError, type Authz } from '@/lib/odoo-server';
-
-// Same pattern as app/api/portal/cultfit/requests/route.ts — only enforced
-// when the browser actually sends an Origin header (always true for
-// same-origin fetch POSTs from this app), so it adds a real check without
-// risking false rejections of legitimate requests that omit it.
-function isSameOrigin(req: NextRequest): boolean {
-  const origin = req.headers.get('origin');
-  if (!origin) return true;
-  try {
-    return new URL(origin).host === req.nextUrl.host;
-  } catch {
-    return false;
-  }
-}
+import { checkJsonMutation } from '@/lib/route-security';
 
 export async function PATCH(
   req: NextRequest,
@@ -24,12 +11,8 @@ export async function PATCH(
   if (!user) return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
   if (user.role !== 'admin') return NextResponse.json({ detail: 'Admin access required' }, { status: 403 });
 
-  if (!isSameOrigin(req)) {
-    return NextResponse.json({ detail: 'Cross-origin request rejected.' }, { status: 403 });
-  }
-  if (!(req.headers.get('content-type') ?? '').includes('application/json')) {
-    return NextResponse.json({ detail: 'Content-Type must be application/json.' }, { status: 400 });
-  }
+  const rejection = checkJsonMutation(req);
+  if (rejection) return NextResponse.json({ detail: rejection.detail }, { status: rejection.status });
 
   const { id } = await params;
   const requestId = parseInt(id, 10);

@@ -144,3 +144,26 @@ Standard Vercel flow — push to `main`, Vercel auto-builds and deploys. No new 
 ## 12. Rollback
 
 Revert the relevant commit(s) via `git revert` and push — since this is a single Next.js app with no database migrations involved, a code rollback is a complete rollback. The one thing rollback does **not** undo: chatter notes already posted to Odoo leads during the period the audit-log feature was live — those are just historical text notes and are harmless to leave in place.
+
+## 13. CSRF / same-origin hardening for mutation routes
+
+`security/admin-route-csrf-hardening` closed a gap where several mutating routes (mostly under `/api/admin/**`) had no same-origin or Content-Type check — some had none at all, some had an ad hoc inline copy that varied route to route. Every mutating (`POST`/`PATCH`/`PUT`/`DELETE`) route now goes through one shared helper, `lib/route-security.ts`:
+
+- `checkJsonMutation(req)` — same-origin + `Content-Type: application/json` required. Used by nearly every JSON-body mutation.
+- `checkMultipartMutation(req)` — same-origin + `Content-Type: multipart/form-data` required. Used only by the PO PDF extraction upload route.
+- `checkBodylessMutation(req)` — same-origin only, no Content-Type requirement. Used by `logout` (a raw `fetch()` with no body/headers in `lib/auth.ts`) and the PI-line `DELETE` (query-param based, no body).
+
+Same-origin check: compares the request's `Origin` header against `req.nextUrl.origin`, plus any extra origins listed in the (pre-existing, previously-unused) `ALLOWED_ORIGINS` env var — a comma-separated list, useful for a Preview deployment's own origin if it needs to be called from elsewhere. A request with **no** `Origin` header is not rejected on origin grounds (normal for same-origin browser navigations/non-CORS requests); it still must satisfy the Content-Type check. Deliberately does **not** trust `X-Forwarded-Host` or any other client-suppliable header — only `Origin` vs. the server's own resolved `nextUrl.origin`, which Vercel's edge routing makes trustworthy per deployment.
+
+Call it first, before auth/role checks, in every mutating handler:
+
+```ts
+const rejection = checkJsonMutation(req);
+if (rejection) return NextResponse.json({ detail: rejection.detail }, { status: rejection.status });
+```
+
+Rejections: `403` for cross-origin, `400` (JSON) or `415` (multipart) for wrong Content-Type. Unsupported HTTP methods need no explicit handling — Next.js's App Router already returns `405` for any method a `route.ts` doesn't export.
+
+Routes covered (all mutating routes in the app as of this pass): `portal/auth/login`, `portal/auth/logout`, `portal/cultfit/requests` (POST), `portal/cultfit/requests/[id]/po/extract` (multipart), `portal/cultfit/requests/[id]/po/submit`, `portal/cultfit/requests/[id]/pi/respond`, `admin/cultfit/orders/[id]/stage`, `admin/cultfit/orders/[id]/set_stage`, `admin/cultfit/orders/[id]/deal_status`, `admin/cultfit/requests/[id]/salesperson`, `admin/cultfit/requests/[id]/territory`, `admin/cultfit/requests/[id]/pi` (POST + PATCH), `admin/cultfit/requests/[id]/pi/publish`, `admin/cultfit/requests/[id]/pi/revise`, `admin/cultfit/requests/[id]/pi/lines` (POST), `admin/cultfit/requests/[id]/pi/lines/[lineId]` (PATCH + DELETE), `admin/cultfit/requests/[id]/po/approve`, `admin/cultfit/requests/[id]/po/request-correction`, `logistics/cultfit/orders/[id]/invoice/select`, `logistics/cultfit/orders/[id]/dispatch`, `cs/cultfit/orders/[id]/installation`. Read-only `GET` routes, PDF download routes, and Next.js's own automatic `405` handling were left untouched.
+
+Existing protections are unchanged and layered underneath this: `requireAuthUser` + role check still run per route (this pass only added the origin/Content-Type layer, it did not touch auth/role logic), server-side ownership checks (`assertCultFitLead`, `verifySOBelongsToLead`, etc.) are untouched, payload whitelisting is untouched, and the httpOnly `SameSite=Lax` cookie is untouched.

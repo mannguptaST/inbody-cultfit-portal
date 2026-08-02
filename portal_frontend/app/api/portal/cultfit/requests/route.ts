@@ -4,20 +4,7 @@ import {
   createPortalOrderRequest, fetchPortalOrderRequests,
   InvalidRequestError, DuplicateRequestError, PartnerNotMappedError, type Authz,
 } from '@/lib/odoo-server';
-
-// Same-origin check for the mutating POST below — only enforced when the
-// browser actually sends an Origin header (it always does for same-origin
-// fetch POSTs from this app), so it adds a real check without risking false
-// rejections of legitimate requests that omit it.
-function isSameOrigin(req: NextRequest): boolean {
-  const origin = req.headers.get('origin');
-  if (!origin) return true;
-  try {
-    return new URL(origin).host === req.nextUrl.host;
-  } catch {
-    return false;
-  }
-}
+import { checkJsonMutation } from '@/lib/route-security';
 
 export async function GET(req: NextRequest) {
   const user = requireAuthUser(req);
@@ -42,12 +29,8 @@ export async function POST(req: NextRequest) {
   if (!user) return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
   if (user.role !== 'customer') return NextResponse.json({ detail: 'Customer access required' }, { status: 403 });
 
-  if (!isSameOrigin(req)) {
-    return NextResponse.json({ detail: 'Cross-origin request rejected.' }, { status: 403 });
-  }
-  if (!(req.headers.get('content-type') ?? '').includes('application/json')) {
-    return NextResponse.json({ detail: 'Content-Type must be application/json.' }, { status: 400 });
-  }
+  const rejection = checkJsonMutation(req);
+  if (rejection) return NextResponse.json({ detail: rejection.detail }, { status: rejection.status });
 
   let body: Record<string, unknown>;
   try {

@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { findUser, checkPassword, signJwt, setSessionCookie } from '@/lib/auth-server';
+import { checkJsonMutation } from '@/lib/route-security';
 
 // Best-effort login rate limiting: an in-memory map keyed by IP+email.
 // Known limitation, documented here and in PORTAL_SECURITY_AND_TESTING.md:
@@ -27,6 +28,9 @@ function clientIp(req: NextRequest): string {
 }
 
 export async function POST(req: NextRequest) {
+  const rejection = checkJsonMutation(req);
+  if (rejection) return NextResponse.json({ detail: rejection.detail }, { status: rejection.status });
+
   try {
     const { email, password } = await req.json();
     if (!email || !password) {

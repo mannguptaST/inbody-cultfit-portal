@@ -861,14 +861,22 @@ The 4 new mutating admin routes this feature adds (`PATCH .../territory`,
 `POST .../pi/lines`, `PATCH`/`DELETE .../pi/lines/[lineId]`) carry the same
 same-origin + `Content-Type: application/json` checks as
 `app/api/portal/cultfit/requests/route.ts` (the existing customer-facing
-mutating route) — copied per-route, this codebase has no shared/central
-helper for it. **Known pre-existing gap, not fixed by this change (out of
-scope):** none of the *other* admin mutation routes (`salesperson`, `pi`,
-`pi/publish`, `pi/revise`, `po/approve`, `po/request-correction`, and the
-order `set_stage`/`stage`/`deal_status` routes) have this check either,
-despite §12's checklist claiming it for "every mutating POST route." The
-httpOnly, `SameSite=Lax` session cookie provides a baseline mitigation
-regardless. Worth closing in a future pass.
+mutating route).
+
+**Update (`security/admin-route-csrf-hardening` branch):** the gap
+previously noted here has been closed. Same-origin + Content-Type checks
+are now centralized in `lib/route-security.ts`
+(`checkJsonMutation`/`checkMultipartMutation`/`checkBodylessMutation`,
+using the deployment's own origin plus the optional `ALLOWED_ORIGINS`
+allowlist) and applied to every mutating route under `/api/admin/**`,
+`/api/portal/**`, `/api/logistics/**`, `/api/cs/**` — including
+`salesperson`, `pi`, `pi/publish`, `pi/revise`, `po/approve`,
+`po/request-correction`, and the order `set_stage`/`stage`/`deal_status`
+routes that were previously gaps, plus `auth/login` and `auth/logout`. The
+4 routes above (and the other 6 that already had inline copies) were
+refactored to call the shared helper instead of duplicating the logic. See
+`PORTAL_SECURITY_AND_TESTING.md` for the full route inventory and test
+matrix.
 
 ---
 

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { requireAuthUser } from '@/lib/auth-server';
 import { approvePoData, LeadNotFoundError, PoWorkflowError, type Authz } from '@/lib/odoo-server';
+import { checkJsonMutation } from '@/lib/route-security';
 
 export async function POST(
   req: NextRequest,
@@ -9,6 +10,9 @@ export async function POST(
   const user = requireAuthUser(req);
   if (!user) return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
   if (user.role !== 'admin') return NextResponse.json({ detail: 'Admin access required' }, { status: 403 });
+
+  const rejection = checkJsonMutation(req);
+  if (rejection) return NextResponse.json({ detail: rejection.detail }, { status: rejection.status });
 
   const { id } = await params;
   const requestId = parseInt(id, 10);

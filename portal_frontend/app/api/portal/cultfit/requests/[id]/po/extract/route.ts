@@ -4,16 +4,7 @@ import {
   extractPoPdf, LeadNotFoundError, PartnerNotMappedError, PoWorkflowError, type Authz,
 } from '@/lib/odoo-server';
 import { InvalidPdfError, EncryptedPdfError, PdfTooLargeError, MAX_PO_PDF_BYTES } from '@/lib/po-pdf-parser';
-
-function isSameOrigin(req: NextRequest): boolean {
-  const origin = req.headers.get('origin');
-  if (!origin) return true;
-  try {
-    return new URL(origin).host === req.nextUrl.host;
-  } catch {
-    return false;
-  }
-}
+import { checkMultipartMutation } from '@/lib/route-security';
 
 // Step A of the two-step PO flow — extraction only, no Odoo write. The PDF
 // is read into a Buffer for this request's lifetime only: never written to
@@ -27,18 +18,12 @@ export async function POST(
   if (!user) return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
   if (user.role !== 'customer') return NextResponse.json({ detail: 'Customer access required' }, { status: 403 });
 
-  if (!isSameOrigin(req)) {
-    return NextResponse.json({ detail: 'Cross-origin request rejected.' }, { status: 403 });
-  }
+  const rejection = checkMultipartMutation(req);
+  if (rejection) return NextResponse.json({ detail: rejection.detail }, { status: rejection.status });
 
   const { id } = await params;
   const requestId = parseInt(id, 10);
   if (isNaN(requestId)) return NextResponse.json({ detail: 'Invalid request ID' }, { status: 400 });
-
-  const contentType = req.headers.get('content-type') ?? '';
-  if (!contentType.includes('multipart/form-data')) {
-    return NextResponse.json({ detail: 'Upload must be multipart/form-data.' }, { status: 400 });
-  }
 
   let formData: FormData;
   try {

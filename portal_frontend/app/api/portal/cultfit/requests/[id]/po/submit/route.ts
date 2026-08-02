@@ -4,16 +4,7 @@ import {
   submitPoData, LeadNotFoundError, PartnerNotMappedError, PoWorkflowError, type Authz,
 } from '@/lib/odoo-server';
 import { PoValidationError } from '@/lib/po-validation';
-
-function isSameOrigin(req: NextRequest): boolean {
-  const origin = req.headers.get('origin');
-  if (!origin) return true;
-  try {
-    return new URL(origin).host === req.nextUrl.host;
-  } catch {
-    return false;
-  }
-}
+import { checkJsonMutation } from '@/lib/route-security';
 
 // Step B — the only place PO data is ever written. Body is the customer's
 // full reviewed/corrected values; every field is re-validated server-side
@@ -26,12 +17,8 @@ export async function POST(
   if (!user) return NextResponse.json({ detail: 'Not authenticated' }, { status: 401 });
   if (user.role !== 'customer') return NextResponse.json({ detail: 'Customer access required' }, { status: 403 });
 
-  if (!isSameOrigin(req)) {
-    return NextResponse.json({ detail: 'Cross-origin request rejected.' }, { status: 403 });
-  }
-  if (!(req.headers.get('content-type') ?? '').includes('application/json')) {
-    return NextResponse.json({ detail: 'Content-Type must be application/json.' }, { status: 400 });
-  }
+  const rejection = checkJsonMutation(req);
+  if (rejection) return NextResponse.json({ detail: rejection.detail }, { status: rejection.status });
 
   const { id } = await params;
   const requestId = parseInt(id, 10);
