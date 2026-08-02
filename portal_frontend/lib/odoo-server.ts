@@ -2,9 +2,10 @@
 // Never import this on the client side.
 
 import 'server-only';
+import { randomUUID } from 'node:crypto';
 import type { CustomerScope } from '@/lib/auth-server';
 import { STAGE_LABELS, STAGE_KEYS, REQUEST_STAGE_LABELS } from '@/lib/stage-config';
-import { generatePIPdf, type PILineItem } from '@/lib/pi-pdf';
+import { resolveRegionFromRequestName } from '@/lib/region-resolver';
 import { extractPoDataFromPdf, validatePdfBytes, type ExtractedPoData } from '@/lib/po-pdf-parser';
 import { comparePoToPi, type ComparisonResult } from '@/lib/po-comparison';
 import { validatePoSubmission, validateCorrectionComment, type PortalPoData } from '@/lib/po-validation';
@@ -794,6 +795,19 @@ export interface PortalRequestDetails {
   // present on records created from this point forward.
   cultfitCompany: string | null;
   contact: ResolvedCultFitContact | null;
+  // Added alongside the standard-defaults/region-detection feature — absent
+  // (undefined) on every record created before this, decoded safely as such.
+  // territoryName is only set when confidence is 'high' and a territory_id
+  // was actually written to the lead; admin can still change territory_id
+  // later via updateRequestTerritory() regardless of what's stored here,
+  // this is a point-in-time record of what auto-detection found/did.
+  regionDetection?: {
+    matchedToken: string | null;
+    city: string | null;
+    state: string | null;
+    territoryName: string | null;
+    confidence: 'high' | 'unclear';
+  };
   // Legacy — only ever present on records created before contact resolution
   // moved server-side (customer used to type these into the form directly).
   // Never written by new code; kept only so decodeRequestDetails and the UI
@@ -835,6 +849,11 @@ function buildRequestDescriptionHtml(details: PortalRequestDetails): string {
     `<p><b>Included (free):</b> ${includedLine}</p>`,
     `<p><b>Delivery address:</b> ${escapeHtml(details.deliveryAddress)}</p>`,
     `<p><b>Contact (from existing Odoo record, source: ${escapeHtml(c?.source ?? 'none')}):</b> ${contactLine}</p>`,
+    details.regionDetection
+      ? `<p><b>Detected region:</b> ${details.regionDetection.territoryName
+          ? `${escapeHtml(details.regionDetection.territoryName)} (from "${escapeHtml(details.regionDetection.matchedToken ?? '')}")`
+          : 'Admin review required — could not confidently detect from the request name'}</p>`
+      : '',
     details.preferredDeliveryDate ? `<p><b>Preferred delivery date:</b> ${escapeHtml(details.preferredDeliveryDate)}</p>` : '',
     details.notes ? `<p><b>Notes:</b> ${escapeHtml(details.notes)}</p>` : '',
     `<!--PORTAL_REQUEST_DATA:${encodeRequestDetails(details)}-->`,
@@ -956,6 +975,131 @@ async function resolveDefaultSubIndustryId(): Promise<number> {
   return _defaultSubIndustryId;
 }
 
+// ──── Standard CultFit Opportunity defaults ────────────────────────────────
+// Every new CultFit Opportunity carries a fixed set of CRM classification
+// values, confirmed live via a read-only field/record investigation (see
+// CULTFIT_PORTAL_MASTER_CONTEXT.md). Same cached-by-name pattern as
+// resolveFitnessIndustryId/resolveDefaultSubIndustryId above — resolved by
+// name every time (never a hardcoded id), so a future rename doesn't
+// silently drift. Each throws if its record can't be found: these values are
+// as load-bearing to a correctly-classified Opportunity as industry/
+// sub-industry, so a request whose defaults can't be resolved must fail
+// loudly rather than create a lead with a missing/wrong classification.
+
+let _keyAccountManagerId: number | null = null;
+async function resolveKeyAccountManagerId(): Promise<number> {
+  if (_keyAccountManagerId) return _keyAccountManagerId;
+  const users = await executeKw('res.users', 'search_read', [[['name', '=', 'Nihal Pawar']]], { fields: ['id'], limit: 1 }) as { id: number }[];
+  if (!users.length) throw new Error("Could not resolve the 'Nihal Pawar' Key Account Manager user in Odoo.");
+  _keyAccountManagerId = users[0].id;
+  return _keyAccountManagerId;
+}
+
+let _recurringSourceId: number | null = null;
+async function resolveSourceId(): Promise<number> {
+  if (_recurringSourceId) return _recurringSourceId;
+  const sources = await executeKw('utm.source', 'search_read', [[['name', '=', 'Recurring']]], { fields: ['id'], limit: 1 }) as { id: number }[];
+  if (!sources.length) throw new Error("Could not resolve the 'Recurring' Source in Odoo.");
+  _recurringSourceId = sources[0].id;
+  return _recurringSourceId;
+}
+
+let _franchiseSubLeadSourceId: number | null = null;
+// Exact-match only — sub.lead.source id 39 is a typo'd duplicate ("Franhise")
+// of the real "Franchise" record (id 40); an ilike/fuzzy match here could
+// silently pick the wrong one.
+async function resolveSubLeadSourceId(): Promise<number> {
+  if (_franchiseSubLeadSourceId) return _franchiseSubLeadSourceId;
+  const sources = await executeKw('sub.lead.source', 'search_read', [[['name', '=', 'Franchise']]], { fields: ['id'], limit: 1 }) as { id: number }[];
+  if (!sources.length) throw new Error("Could not resolve the 'Franchise' Sub Lead Source in Odoo.");
+  _franchiseSubLeadSourceId = sources[0].id;
+  return _franchiseSubLeadSourceId;
+}
+
+let _privateOwnershipId: number | null = null;
+async function resolveOwnershipId(): Promise<number> {
+  if (_privateOwnershipId) return _privateOwnershipId;
+  const records = await executeKw('res.ownership', 'search_read', [[['name', '=', 'Private']]], { fields: ['id'], limit: 1 }) as { id: number }[];
+  if (!records.length) throw new Error("Could not resolve the 'Private' Ownership in Odoo.");
+  _privateOwnershipId = records[0].id;
+  return _privateOwnershipId;
+}
+
+let _directChannelId: number | null = null;
+async function resolveChannelId(): Promise<number> {
+  if (_directChannelId) return _directChannelId;
+  const media = await executeKw('utm.medium', 'search_read', [[['name', '=', 'Direct']]], { fields: ['id'], limit: 1 }) as { id: number }[];
+  if (!media.length) throw new Error("Could not resolve the 'Direct' Channel in Odoo.");
+  _directChannelId = media[0].id;
+  return _directChannelId;
+}
+
+// ──── Territory ("Region") resolution ──────────────────────────────────────
+// There is no "Region" model in this Odoo instance — the real concept is
+// crm.lead.territory_id (many2one -> res.territory), and its state_ids
+// relation already encodes exactly which Indian states fall in which
+// territory. Resolved dynamically (cached) rather than hardcoding territory
+// ids, same reasoning as every other resolver in this file — and it means a
+// future territory reconfiguration in Odoo is picked up automatically rather
+// than silently drifting from a copy baked into this app. crm.lead.city/
+// state_id are NOT usable here (verified live: constant "Chennai"/"Tamil
+// Nadu" on every real CultFit lead, mirroring the CultFit partner's billing
+// address) — see lib/region-resolver.ts for the free-text name parser this
+// combines with.
+
+interface TerritoryConfig {
+  stateNameToTerritoryId: Map<string, number>; // lowercase state name -> territory id
+  idToName: Map<number, string>;
+}
+
+let _territoryConfig: TerritoryConfig | null = null;
+
+async function loadTerritoryConfig(): Promise<TerritoryConfig> {
+  if (_territoryConfig) return _territoryConfig;
+
+  const territories = await executeKw('res.territory', 'search_read', [[]], { fields: ['id', 'name', 'state_ids'] }) as
+    { id: number; name: string; state_ids: number[] }[];
+
+  const allStateIds = [...new Set(territories.flatMap(t => t.state_ids || []))];
+  const states = allStateIds.length
+    ? await executeKw('res.country.state', 'read', [allStateIds], { fields: ['id', 'name'] }) as { id: number; name: string }[]
+    : [];
+  const stateNameById = new Map(states.map(s => [s.id, s.name.toLowerCase()]));
+
+  const stateNameToTerritoryId = new Map<string, number>();
+  for (const t of territories) {
+    for (const stateId of t.state_ids || []) {
+      const name = stateNameById.get(stateId);
+      if (name) stateNameToTerritoryId.set(name, t.id);
+    }
+  }
+
+  _territoryConfig = { stateNameToTerritoryId, idToName: new Map(territories.map(t => [t.id, t.name])) };
+  return _territoryConfig;
+}
+
+export interface TerritoryOption {
+  id: number;
+  name: string;
+}
+
+export async function fetchTerritoryList(): Promise<TerritoryOption[]> {
+  const { idToName } = await loadTerritoryConfig();
+  return [...idToName.entries()]
+    .map(([id, name]) => ({ id, name }))
+    .sort((a, b) => a.name.localeCompare(b.name));
+}
+
+// Returns null (never guesses) if the resolved state has no configured
+// territory in Odoo today (e.g. Bihar — confirmed live to have no territory
+// assignment at all) or if the request name didn't resolve to a known state.
+async function resolveTerritoryIdForState(stateName: string): Promise<{ id: number; name: string } | null> {
+  const { stateNameToTerritoryId, idToName } = await loadTerritoryConfig();
+  const id = stateNameToTerritoryId.get(stateName.toLowerCase());
+  if (!id) return null;
+  return { id, name: idToName.get(id) ?? '' };
+}
+
 // Accessory/bundle-only products, verified live against every historical
 // CultFit order line — never offered as a selectable "main product". Also
 // excludes one deprecated SKU and one legacy duplicate 260S entry.
@@ -968,6 +1112,18 @@ const EXCLUDED_PRODUCT_IDS = new Set([
   10837, // [E01903012] Adapter 3.4A_3rd — accessory, bundle-only
   12343, // [IIPLRS001] Result Sheet Set — accessory
   12277, // G_InBody 260S — legacy duplicate of 12019 (1 historical use, no code prefix)
+]);
+
+// Deliberately NOT reused by the admin product editor below: most of the ids
+// above (printer, LB WEB, Stand 120, LookinBody, adapter, result sheet) are
+// legitimate real accessory/bundle products admin must be able to add to a
+// PI by hand — EXCLUDED_PRODUCT_IDS only hides them from the customer-facing
+// *main product* picker (fetchCultFitProductCatalog), it was never meant to
+// mean "never usable anywhere." Only the genuinely bad records are excluded
+// from the admin editor: the legacy duplicate, and (via a live name filter,
+// not a hardcoded copy) the "Not Use" family.
+const ADMIN_EDITOR_EXCLUDED_PRODUCT_IDS = new Set([
+  12277, // G_InBody 260S — legacy duplicate of 12019
 ]);
 
 // mainProductId -> included free products. Verified against historical
@@ -1135,10 +1291,24 @@ export async function createPortalOrderRequest(
   const includedProducts = BUNDLE_MAP[mainProduct.id] ?? [];
 
   const partnerId = resolveCultFitPartnerId(authz);
-  const stageId = await resolveNewStageId();
-  const industryId = await resolveFitnessIndustryId();
-  const subIndustryId = await resolveDefaultSubIndustryId();
-  const { companyName, contact } = await resolveCultFitParty(authz, portalAccountEmail);
+  const [
+    stageId, industryId, subIndustryId,
+    keyAccountManagerId, sourceId, subLeadSourceId, ownershipId, channelId,
+    { companyName, contact },
+  ] = await Promise.all([
+    resolveNewStageId(), resolveFitnessIndustryId(), resolveDefaultSubIndustryId(),
+    resolveKeyAccountManagerId(), resolveSourceId(), resolveSubLeadSourceId(), resolveOwnershipId(), resolveChannelId(),
+    resolveCultFitParty(authz, portalAccountEmail),
+  ]);
+
+  // Region ("Territory") is the one default that's allowed to come back
+  // empty — an unclear/ambiguous location must never block submission, it
+  // just leaves territory_id unset for admin to review (see
+  // lib/region-resolver.ts and resolveTerritoryIdForState above).
+  const regionMatch = resolveRegionFromRequestName(requestName);
+  const territory = regionMatch.confidence === 'high' && regionMatch.state
+    ? await resolveTerritoryIdForState(regionMatch.state)
+    : null;
 
   if (await findRecentDuplicateRequest(partnerId, requestName, mainProduct.id, quantity, deliveryAddress)) {
     throw new DuplicateRequestError();
@@ -1157,6 +1327,13 @@ export async function createPortalOrderRequest(
     submittedDate: new Date().toISOString().slice(0, 10),
     cultfitCompany: companyName,
     contact,
+    regionDetection: {
+      matchedToken: regionMatch.matchedToken,
+      city: regionMatch.city,
+      state: regionMatch.state,
+      territoryName: territory?.name ?? null,
+      confidence: territory ? 'high' : 'unclear',
+    },
   };
 
   const leadId = await executeKw('crm.lead', 'create', [{
@@ -1166,6 +1343,13 @@ export async function createPortalOrderRequest(
     stage_id: stageId,
     industry_id: industryId,
     sub_industry_id: subIndustryId,
+    key_account_manager: keyAccountManagerId,
+    source_id: sourceId,
+    sub_lead_source_id: subLeadSourceId,
+    ownership_id: ownershipId,
+    medium_id: channelId,
+    account_type: 'franchise',
+    territory_id: territory?.id ?? false,
     // Explicit false, not merely omitted — discovered live that Odoo's own
     // team/onchange defaults silently auto-assign a salesperson on create if
     // this key is left out entirely, which violates "leave salesperson
@@ -1308,14 +1492,18 @@ export async function fetchPortalOrderRequestById(id: number, authz: Authz): Pro
 
 // ──── PI Workflow (Phase 2) ─────────────────────────────────────────────────
 // Admin assigns a salesperson, creates a draft sale.order from the stored
-// request details, edits price/validity, then publishes it. Odoo's own
-// native PDF report cannot be produced by this portal: calling
-// ir.actions.report._render_qweb_pdf over XML-RPC is refused by Odoo itself
-// ("Private methods ... cannot be called remotely" — verified live), and the
-// web /report/pdf/ endpoint needs an interactive session login that this
-// portal's API service account cannot obtain ("Access Denied" — verified
-// live). So this renders its own look-alike PI PDF (lib/pi-pdf.ts) from data
-// already read via XML-RPC, and snapshots it as an ir.attachment on publish.
+// request details, edits price/validity/lines, then publishes it. Publishing
+// now fetches Odoo's own native Quotation PDF (see fetchNativeOdooPdf below)
+// via Odoo's public customer-portal controller — calling
+// ir.actions.report._render_qweb_pdf over XML-RPC is still refused by Odoo
+// itself ("Private methods ... cannot be called remotely"), and the raw
+// /report/pdf/ endpoint still needs a backend session login this portal's
+// API account doesn't have, but the /my/orders/<id> portal route validates
+// via a per-order access_token instead and works with no login (verified
+// live). The old self-rendered PDFKit look-alike (lib/pi-pdf.ts) is no
+// longer used for new publishes — kept in the repo, unused, only so old
+// stored PI snapshots (already-frozen ir.attachment bytes, unaffected by
+// this change either way) have no dependency on it disappearing.
 // No new Odoo field/model exists for PI status or versioning — same
 // zero-new-infrastructure approach as Phase 1: a structured JSON blob
 // embedded in a chatter note on the Opportunity (crm.lead), one marker per
@@ -1372,6 +1560,33 @@ export async function assignSalesperson(
     });
   } catch (e) {
     console.error('[pi] failed to post salesperson-assigned note for lead', leadId, e instanceof Error ? e.message : e);
+  }
+  return match;
+}
+
+// Lets admin review/override the auto-detected Territory at any time — never
+// blocks PI creation/publish (territory_id is not Odoo-required). The
+// supplied id is always re-verified against the live res.territory list
+// before writing, same discipline as assignSalesperson() re-verifying
+// against fetchEligibleSalespeople() — never trust a client-supplied id.
+export async function updateRequestTerritory(
+  leadId: number, territoryId: number, authz: Authz, adminEmail: string,
+): Promise<TerritoryOption> {
+  if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can change the Territory.');
+  await assertCultFitLead(leadId);
+
+  const territories = await fetchTerritoryList();
+  const match = territories.find(t => t.id === Number(territoryId));
+  if (!match) throw new PIWorkflowError('Selected Territory is not a valid Odoo record.');
+
+  await executeKw('crm.lead', 'write', [[leadId], { territory_id: match.id }]);
+  try {
+    await executeKw('crm.lead', 'message_post', [[leadId]], {
+      body: `<p><b>PORTAL_TERRITORY_UPDATED</b>: Territory set to ${escapeHtml(match.name)} by ${escapeHtml(adminEmail)}.</p>`,
+      subtype_xmlid: 'mail.mt_note',
+    });
+  } catch (e) {
+    console.error('[pi] failed to post territory-updated note for lead', leadId, e instanceof Error ? e.message : e);
   }
   return match;
 }
@@ -1471,14 +1686,6 @@ async function verifySOBelongsToLead(leadId: number, soId: number): Promise<PIDr
 const COMPANY_ID = 1; // "InBody India Private Limited" — verified live: every historical CultFit sale.order uses this company (this Odoo instance has a second, unrelated company, id 2)
 const DEFAULT_VALIDITY_DAYS = 30; // matches the ~30-day windows seen on real historical CultFit quotations
 const MAX_PRICE = 100_000_000; // sanity ceiling against a fat-fingered price, not a business rule
-
-// Only verified for these two — every other selectable main product (e.g.
-// NF1500, InBody270S) has no confirmed warranty term, so the PDF prints a
-// generic phrase rather than a guessed number. See BUNDLE_MAP above.
-const WARRANTY_YEARS_MAP: Record<number, number> = {
-  12019: 5, // InBody 260/260S
-  12001: 1, // InBody 120
-};
 
 function requirePositivePrice(v: unknown): number {
   const n = Number(v);
@@ -1628,6 +1835,157 @@ export async function updatePIDraft(
   return buildDraftSOInfo(sos[0]);
 }
 
+// ──── Admin PI product editor ──────────────────────────────────────────────
+// Lets admin add/remove/reprice any approved product on a still-editable
+// draft PI, not just the one main-product price updatePIDraft above handles.
+// Every function here re-verifies soId belongs to the lead (verifySOBelongsToLead)
+// and, for line-level ops, that lineId belongs to that soId — never trusts a
+// client-supplied id. Publishing (publishPI) reads so.lines fresh regardless
+// of how they got there, so these are safe additive operations on the same
+// draft sale.order buildAndCreateSO already created.
+
+function requireNonNegativePrice(v: unknown): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0 || n > MAX_PRICE) throw new PIWorkflowError('Enter a valid unit price.');
+  return n;
+}
+
+function requireValidQuantity(v: unknown): number {
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1 || n > 999) throw new PIWorkflowError('Quantity must be a whole number between 1 and 999.');
+  return n;
+}
+
+export interface AdminProductOption {
+  id: number;
+  code: string;
+  name: string;
+}
+
+// Broader than fetchCultFitProductCatalog (which only surfaces products
+// already used in a real CultFit order) — the full, searchable Odoo catalog
+// (verified live: 1,834 active/sellable products company-wide) so admin can
+// add any approved product. Excludes the same EXCLUDED_PRODUCT_IDS as the
+// customer-facing picker, plus every product matching the real "Not Use"
+// naming convention discovered live (covers 5 more deprecated products than
+// the hardcoded id list alone) — never returns an inactive/non-sellable one.
+export async function searchAdminProducts(query: string): Promise<AdminProductOption[]> {
+  const q = query.trim().slice(0, 100);
+  if (!q) return [];
+  const domain: unknown[] = [
+    ['sale_ok', '=', true], ['active', '=', true], ['name', 'not ilike', 'not use'],
+    '|', ['name', 'ilike', q], ['default_code', 'ilike', q],
+  ];
+  const products = await executeKw('product.product', 'search_read', [domain], {
+    fields: ['id', 'display_name'], limit: 20,
+  }) as { id: number; display_name: string }[];
+  return products
+    .filter(p => !ADMIN_EDITOR_EXCLUDED_PRODUCT_IDS.has(p.id))
+    .map(p => ({ id: p.id, ...parseProductLabel(p.display_name) }));
+}
+
+export async function addPIDraftLine(
+  leadId: number, soId: number, productId: number, quantity: number, unitPrice: number, authz: Authz, adminEmail: string,
+): Promise<PIDraftInfo> {
+  if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can edit a PI.');
+  await assertCultFitLead(leadId);
+
+  const so = await verifySOBelongsToLead(leadId, soId);
+  if (so.state === 'cancel') throw new PIWorkflowError('This PI has been superseded and can no longer be edited.');
+
+  const qty = requireValidQuantity(quantity);
+  const price = requireNonNegativePrice(unitPrice);
+
+  // Never trust a client-supplied product id blindly — re-verify it's a
+  // real, active, sellable, non-excluded/non-deprecated product before using
+  // it in a line, same discipline as createPortalOrderRequest's catalog check.
+  const products = await executeKw('product.product', 'read', [[Number(productId)]], {
+    fields: ['id', 'display_name', 'active', 'sale_ok', 'taxes_id', 'uom_id'],
+  }) as { id: number; display_name: string; active: boolean; sale_ok: boolean; taxes_id: number[]; uom_id: OdooTuple }[];
+  const product = products[0];
+  if (!product || !product.active || !product.sale_ok || ADMIN_EDITOR_EXCLUDED_PRODUCT_IDS.has(product.id) || /not use/i.test(product.display_name)) {
+    throw new PIWorkflowError('Selected product is not a valid, approved Odoo product.');
+  }
+
+  const { code, name } = parseProductLabel(product.display_name);
+  await executeKw('sale.order.line', 'create', [{
+    order_id: soId,
+    product_id: product.id,
+    name: `[${code}] ${name}`,
+    product_uom_qty: qty,
+    price_unit: price,
+    tax_ids: [[6, 0, product.taxes_id || []]],
+    product_uom_id: product.uom_id ? product.uom_id[0] : false,
+  }]);
+
+  try {
+    await executeKw('crm.lead', 'message_post', [[leadId]], {
+      body: `<p><b>PORTAL_PI_LINE_ADDED</b>: [${escapeHtml(code)}] ${escapeHtml(name)} × ${qty} added by ${escapeHtml(adminEmail)}.</p>`,
+      subtype_xmlid: 'mail.mt_note',
+    });
+  } catch (e) {
+    console.error('[pi] failed to post line-added note for lead', leadId, e instanceof Error ? e.message : e);
+  }
+
+  const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
+  return buildDraftSOInfo(sos[0]);
+}
+
+export async function removePIDraftLine(
+  leadId: number, soId: number, lineId: number, authz: Authz, adminEmail: string,
+): Promise<PIDraftInfo> {
+  if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can edit a PI.');
+  await assertCultFitLead(leadId);
+
+  const so = await verifySOBelongsToLead(leadId, soId);
+  if (so.state === 'cancel') throw new PIWorkflowError('This PI has been superseded and can no longer be edited.');
+
+  const line = so.lines.find(l => l.id === Number(lineId));
+  if (!line) throw new PIWorkflowError('That line does not belong to this PI.');
+  if (so.lines.length <= 1) throw new PIWorkflowError('A PI must have at least one line item.');
+
+  await executeKw('sale.order.line', 'unlink', [[line.id]]);
+  try {
+    await executeKw('crm.lead', 'message_post', [[leadId]], {
+      body: `<p><b>PORTAL_PI_LINE_REMOVED</b>: [${escapeHtml(line.code)}] ${escapeHtml(line.name)} removed by ${escapeHtml(adminEmail)}.</p>`,
+      subtype_xmlid: 'mail.mt_note',
+    });
+  } catch (e) {
+    console.error('[pi] failed to post line-removed note for lead', leadId, e instanceof Error ? e.message : e);
+  }
+
+  const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
+  return buildDraftSOInfo(sos[0]);
+}
+
+export interface PIDraftLineUpdate {
+  quantity?: number;
+  unitPrice?: number;
+}
+
+export async function updatePIDraftLine(
+  leadId: number, soId: number, lineId: number, updates: PIDraftLineUpdate, authz: Authz,
+): Promise<PIDraftInfo> {
+  if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can edit a PI.');
+  await assertCultFitLead(leadId);
+
+  const so = await verifySOBelongsToLead(leadId, soId);
+  if (so.state === 'cancel') throw new PIWorkflowError('This PI has been superseded and can no longer be edited.');
+
+  const line = so.lines.find(l => l.id === Number(lineId));
+  if (!line) throw new PIWorkflowError('That line does not belong to this PI.');
+
+  const writeFields: Record<string, unknown> = {};
+  if (updates.quantity !== undefined) writeFields.product_uom_qty = requireValidQuantity(updates.quantity);
+  if (updates.unitPrice !== undefined) writeFields.price_unit = requireNonNegativePrice(updates.unitPrice);
+  if (Object.keys(writeFields).length) {
+    await executeKw('sale.order.line', 'write', [[line.id], writeFields]);
+  }
+
+  const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
+  return buildDraftSOInfo(sos[0]);
+}
+
 interface PISnapshotLineItem {
   code: string;
   name: string;
@@ -1715,6 +2073,46 @@ async function fetchLatestPISnapshotAndResponse(leadId: number): Promise<{ snaps
   return { snapshot: latest, response };
 }
 
+// Fetches Odoo's own native Quotation PDF (report `sale.report_saleorder`,
+// Odoo's standard order-print report — confirmed live as the report this
+// route actually renders; the separate Pro-Forma Invoice report isn't
+// reachable through any unauthenticated route today, see
+// CULTFIT_PORTAL_MASTER_CONTEXT.md §Phase 2) via Odoo's own public
+// customer-portal controller, which validates access via a per-order
+// access_token instead of requiring the backend session login this portal's
+// API account doesn't have — verified live to work with no login.
+// sale.order.access_token is a plain char field Odoo normally generates
+// lazily on first portal view (via a private method that, like
+// _render_qweb_pdf, can't be called remotely); a fresh, portal-created draft
+// order has none yet, so one is generated and written here if empty — this
+// is the ONLY field this function ever writes, and only when missing.
+async function fetchNativeOdooPdf(soId: number): Promise<Buffer> {
+  const sos = await executeKw('sale.order', 'read', [[soId]], { fields: ['access_token'] }) as { access_token: string | false }[];
+  let token = sos[0]?.access_token || '';
+  if (!token) {
+    token = randomUUID();
+    await executeKw('sale.order', 'write', [[soId], { access_token: token }]);
+  }
+
+  const url = `${ODOO_URL}/my/orders/${soId}?report_type=pdf&access_token=${encodeURIComponent(token)}&download=true`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await fetch(url, { signal: controller.signal });
+  } catch (e) {
+    throw new OdooUnavailableError(e);
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const contentType = resp.headers.get('content-type') || '';
+  if (!resp.ok || !contentType.includes('application/pdf')) {
+    throw new PIWorkflowError('Could not generate the native Odoo PI PDF. Please try publishing again.');
+  }
+  return Buffer.from(await resp.arrayBuffer());
+}
+
 export async function publishPI(leadId: number, soId: number, authz: Authz, adminEmail: string): Promise<PIPublishedSnapshot> {
   if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can publish a PI.');
   await assertCultFitLead(leadId);
@@ -1740,21 +2138,8 @@ export async function publishPI(leadId: number, soId: number, authz: Authz, admi
 
   const version = ((lead.order_ids as number[]) || []).length;
   const publishedDate = new Date().toISOString().slice(0, 10);
-  const warrantyYears = WARRANTY_YEARS_MAP[details.mainProduct.id] ?? null;
 
-  const pdfLineItems: PILineItem[] = so.lines.map(l => ({
-    code: l.code, description: l.name, quantity: l.quantity, unitPrice: l.unitPrice,
-    taxLabel: l.taxLabel, taxAmount: l.taxTotal, lineTotal: l.untaxedTotal,
-  }));
-
-  const pdfBuffer = await generatePIPdf({
-    quotationNumber: so.name, version, requestReference: `REQ-${leadId}`,
-    cultfitCompanyName: companyName, deliveryAddress: details.deliveryAddress,
-    cocoFofo: details.cocoFofo, preferredDeliveryDate: details.preferredDeliveryDate,
-    salespersonName: userVal[1], warrantyYears, lineItems: pdfLineItems,
-    untaxedAmount: so.untaxedAmount, taxAmount: so.taxAmount, totalAmount: so.totalAmount,
-    validityDate: so.validityDate, publishedDate,
-  });
+  const pdfBuffer = await fetchNativeOdooPdf(soId);
 
   const filename = `PI-${so.name}-V${version}.pdf`;
   const attachmentId = await executeKw('ir.attachment', 'create', [{
@@ -1804,6 +2189,54 @@ export interface AdminRequestDetail extends PortalRequestDetail {
   draftPI: PIDraftInfo | null;
   publishedPI: PIPublishedSnapshot | null;
   po: PoAdminView;
+  // Live crm.lead.territory_id, not the frozen regionDetection snapshot on
+  // `details` (which only reflects what auto-detection found at creation
+  // time) — this always reflects the current value, including after an
+  // admin override via updateRequestTerritory.
+  currentTerritory: TerritoryOption | null;
+  opportunityDefaults: OpportunityDefaults;
+}
+
+async function fetchCurrentTerritory(leadId: number): Promise<TerritoryOption | null> {
+  const leads = await executeKw('crm.lead', 'read', [[leadId]], { fields: ['territory_id'] }) as { territory_id: OdooTuple }[];
+  const t = leads[0]?.territory_id;
+  return t ? { id: t[0], name: t[1] } : null;
+}
+
+// Read-only display of the standard defaults set at creation (see
+// createPortalOrderRequest) — read live from crm.lead rather than assumed,
+// so a request created before this feature existed correctly shows blank
+// rather than a misleading hardcoded label.
+export interface OpportunityDefaults {
+  keyAccountManager: string | null;
+  industry: string | null;
+  subIndustry: string | null;
+  source: string | null;
+  subLeadSource: string | null;
+  ownership: string | null;
+  channel: string | null;
+  accountType: string | null;
+}
+
+const ACCOUNT_TYPE_LABELS: Record<string, string> = { franchise: 'Franchise', non_franchise: 'Non-Franchise' };
+
+async function fetchOpportunityDefaults(leadId: number): Promise<OpportunityDefaults> {
+  const leads = await executeKw('crm.lead', 'read', [[leadId]], {
+    fields: ['key_account_manager', 'industry_id', 'sub_industry_id', 'source_id', 'sub_lead_source_id', 'ownership_id', 'medium_id', 'account_type'],
+  }) as Record<string, unknown>[];
+  const lead = leads[0] ?? {};
+  const tupleLabel = (v: unknown) => (v ? (v as [number, string])[1] : null);
+  const accountType = lead.account_type as string | false | undefined;
+  return {
+    keyAccountManager: tupleLabel(lead.key_account_manager),
+    industry: tupleLabel(lead.industry_id),
+    subIndustry: tupleLabel(lead.sub_industry_id),
+    source: tupleLabel(lead.source_id),
+    subLeadSource: tupleLabel(lead.sub_lead_source_id),
+    ownership: tupleLabel(lead.ownership_id),
+    channel: tupleLabel(lead.medium_id),
+    accountType: accountType ? (ACCOUNT_TYPE_LABELS[accountType] ?? accountType) : null,
+  };
 }
 
 // Batched across every lead in the list in a single pair of extra round
@@ -1888,7 +2321,10 @@ export async function fetchAdminRequestDetail(id: number, authz: Authz): Promise
   const { snapshot, response } = await fetchLatestPISnapshotAndResponse(id);
   const piStatus = piStatusFrom(snapshot, response, !!draftPI);
   const po = await fetchAdminPoDetail(id, authz);
-  return { ...base, piStatus, draftPI, publishedPI: snapshot, po };
+  const [currentTerritory, opportunityDefaults] = await Promise.all([
+    fetchCurrentTerritory(id), fetchOpportunityDefaults(id),
+  ]);
+  return { ...base, piStatus, draftPI, publishedPI: snapshot, po, currentTerritory, opportunityDefaults };
 }
 
 // Never looks at a draft sale.order — only ever returns a published

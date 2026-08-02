@@ -116,6 +116,15 @@ export interface PortalRequestDetails {
   submittedDate: string;
   cultfitCompany: string | null;
   contact: ResolvedCultFitContact | null;
+  // Absent on records created before the standard-defaults/region-detection
+  // feature — decode safely as undefined for those.
+  regionDetection?: {
+    matchedToken: string | null;
+    city: string | null;
+    state: string | null;
+    territoryName: string | null;
+    confidence: 'high' | 'unclear';
+  };
   // Legacy — only present on records created before contact resolution moved
   // server-side. New records never set these; kept so old records still
   // render. See CULTFIT_PORTAL_MASTER_CONTEXT.md.
@@ -163,6 +172,28 @@ export type PIStatus = 'not_created' | 'draft' | 'awaiting_confirmation' | 'conf
 export interface EligibleSalesperson {
   id: number;
   name: string;
+}
+
+export interface TerritoryOption {
+  id: number;
+  name: string;
+}
+
+export interface AdminProductOption {
+  id: number;
+  code: string;
+  name: string;
+}
+
+export interface OpportunityDefaults {
+  keyAccountManager: string | null;
+  industry: string | null;
+  subIndustry: string | null;
+  source: string | null;
+  subLeadSource: string | null;
+  ownership: string | null;
+  channel: string | null;
+  accountType: string | null;
 }
 
 export interface PIDraftLine {
@@ -399,6 +430,11 @@ export interface AdminRequestDetail extends PortalRequestDetail {
   draftPI: PIDraftInfo | null;
   publishedPI: PIPublishedSnapshot | null;
   po: PoAdminView;
+  // Live crm.lead.territory_id — always current, including after an admin
+  // override, unlike details.regionDetection which is a point-in-time
+  // snapshot of what auto-detection found at creation.
+  currentTerritory: TerritoryOption | null;
+  opportunityDefaults: OpportunityDefaults;
 }
 
 // ── Phase 4: Logistics (invoice + dispatch tracking) ─────────────────────────

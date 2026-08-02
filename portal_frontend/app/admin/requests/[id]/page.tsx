@@ -5,13 +5,14 @@ import { useRouter, useParams } from 'next/navigation';
 import {
   getAdminRequestDetail, getEligibleSalespeople, assignRequestSalesperson,
   createDraftPI, createPIRevision, updatePIDraft, publishPI,
+  getTerritories, updateRequestTerritory, searchAdminProducts, addPILine, updatePILine, removePILine,
 } from '@/lib/api';
 import { fetchCurrentUser, isInBodyStaff, logout } from '@/lib/auth';
 import { PI_STATUS_LABELS, PI_STATUS_VARIANT, PO_STATUS_LABELS, PO_STATUS_VARIANT, STAGE_VARIANT } from '@/lib/stage-config';
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
 import AdminPoSection from '@/components/AdminPoSection';
-import type { AdminRequestDetail, EligibleSalesperson } from '@/types';
+import type { AdminRequestDetail, EligibleSalesperson, TerritoryOption, AdminProductOption } from '@/types';
 
 function fmtDate(d: string | null | undefined): string {
   if (!d) return '—';
@@ -42,6 +43,18 @@ export default function AdminRequestDetailPage() {
   const [validityInput, setValidityInput] = useState('');
   const [busy, setBusy] = useState(false);
 
+  const [territories, setTerritories] = useState<TerritoryOption[]>([]);
+  const [selectedTerritory, setSelectedTerritory] = useState('');
+  const [territoryBusy, setTerritoryBusy] = useState(false);
+
+  const [productQuery, setProductQuery] = useState('');
+  const [productResults, setProductResults] = useState<AdminProductOption[]>([]);
+  const [productSearching, setProductSearching] = useState(false);
+  const [newLineProduct, setNewLineProduct] = useState<AdminProductOption | null>(null);
+  const [newLineQty, setNewLineQty] = useState('1');
+  const [newLinePrice, setNewLinePrice] = useState('0');
+  const [lineEdits, setLineEdits] = useState<Record<number, { quantity: string; unitPrice: string }>>({});
+
   const load = useCallback(async () => {
     setLoading(true);
     setError('');
@@ -50,6 +63,10 @@ export default function AdminRequestDetailPage() {
       setRequest(detail);
       setPriceInput(detail.draftPI ? String(detail.draftPI.mainProductUnitPrice || '') : '');
       setValidityInput(detail.draftPI?.validityDate || '');
+      setSelectedTerritory(detail.currentTerritory ? String(detail.currentTerritory.id) : '');
+      const edits: Record<number, { quantity: string; unitPrice: string }> = {};
+      detail.draftPI?.lines.forEach(l => { edits[l.id] = { quantity: String(l.quantity), unitPrice: String(l.unitPrice) }; });
+      setLineEdits(edits);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to load request.');
     } finally {
@@ -67,6 +84,7 @@ export default function AdminRequestDetailPage() {
     // eslint-disable-next-line react-hooks/set-state-in-effect -- standard fetch-on-mount; loading already starts true
     load();
     getEligibleSalespeople().then(res => setSalespeople(res.salespeople)).catch(() => {});
+    getTerritories().then(res => setTerritories(res.territories)).catch(() => {});
   }, [requestId, router, load]);
 
   async function handleLogout() {
@@ -137,6 +155,92 @@ export default function AdminRequestDetailPage() {
       await load();
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : 'Failed to publish PI.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleUpdateTerritory() {
+    if (!selectedTerritory) return;
+    setTerritoryBusy(true);
+    setActionError('');
+    try {
+      await updateRequestTerritory(requestId, Number(selectedTerritory));
+      await load();
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update Territory.');
+    } finally {
+      setTerritoryBusy(false);
+    }
+  }
+
+  async function handleProductSearch(q: string) {
+    setProductQuery(q);
+    setNewLineProduct(null);
+    if (!q.trim()) { setProductResults([]); return; }
+    setProductSearching(true);
+    try {
+      const res = await searchAdminProducts(q);
+      setProductResults(res.products);
+    } catch {
+      setProductResults([]);
+    } finally {
+      setProductSearching(false);
+    }
+  }
+
+  async function handleAddLine() {
+    if (!request?.draftPI || !newLineProduct) return;
+    const qty = Number(newLineQty);
+    const price = Number(newLinePrice);
+    if (!Number.isInteger(qty) || qty < 1) { setActionError('Enter a valid quantity.'); return; }
+    if (!Number.isFinite(price) || price < 0) { setActionError('Enter a valid unit price.'); return; }
+    const alreadyOnPI = request.draftPI.lines.some(l => l.productId === newLineProduct.id);
+    if (alreadyOnPI && !confirm(`[${newLineProduct.code}] ${newLineProduct.name} is already a line on this PI. Add it again anyway?`)) return;
+
+    setBusy(true);
+    setActionError('');
+    try {
+      await addPILine(requestId, request.draftPI.id, newLineProduct.id, qty, price);
+      setNewLineProduct(null);
+      setProductQuery('');
+      setProductResults([]);
+      setNewLineQty('1');
+      setNewLinePrice('0');
+      await load();
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : 'Failed to add product line.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleSaveLine(lineId: number) {
+    if (!request?.draftPI) return;
+    const edit = lineEdits[lineId];
+    if (!edit) return;
+    setBusy(true);
+    setActionError('');
+    try {
+      await updatePILine(requestId, request.draftPI.id, lineId, { quantity: Number(edit.quantity), unitPrice: Number(edit.unitPrice) });
+      await load();
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : 'Failed to update line.');
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function handleRemoveLine(lineId: number) {
+    if (!request?.draftPI) return;
+    if (!confirm('Remove this product line from the PI?')) return;
+    setBusy(true);
+    setActionError('');
+    try {
+      await removePILine(requestId, request.draftPI.id, lineId);
+      await load();
+    } catch (err: unknown) {
+      setActionError(err instanceof Error ? err.message : 'Failed to remove line.');
     } finally {
       setBusy(false);
     }
@@ -307,22 +411,93 @@ export default function AdminRequestDetailPage() {
                           <th className="py-2 pr-3 text-right">Qty</th>
                           <th className="py-2 pr-3 text-right">Unit Price</th>
                           <th className="py-2 pr-3 text-right">Tax</th>
-                          <th className="py-2 text-right">Untaxed</th>
+                          <th className="py-2 pr-3 text-right">Untaxed</th>
+                          {canPublish && <th className="py-2"></th>}
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-50">
                         {request.draftPI.lines.map(l => (
                           <tr key={l.id}>
                             <td className="py-2 pr-3 text-slate-700">[{l.code}] {l.name}</td>
-                            <td className="py-2 pr-3 text-right text-slate-600">{l.quantity}</td>
-                            <td className="py-2 pr-3 text-right text-slate-600">{fmtInr(l.unitPrice)}</td>
+                            {canPublish ? (
+                              <>
+                                <td className="py-2 pr-3 text-right">
+                                  <input
+                                    type="number" min={1} value={lineEdits[l.id]?.quantity ?? String(l.quantity)}
+                                    onChange={e => setLineEdits(prev => ({ ...prev, [l.id]: { quantity: e.target.value, unitPrice: prev[l.id]?.unitPrice ?? String(l.unitPrice) } }))}
+                                    className="w-16 text-right text-sm border border-slate-200 rounded px-2 py-1"
+                                  />
+                                </td>
+                                <td className="py-2 pr-3 text-right">
+                                  <input
+                                    type="number" min={0} value={lineEdits[l.id]?.unitPrice ?? String(l.unitPrice)}
+                                    onChange={e => setLineEdits(prev => ({ ...prev, [l.id]: { quantity: prev[l.id]?.quantity ?? String(l.quantity), unitPrice: e.target.value } }))}
+                                    className="w-24 text-right text-sm border border-slate-200 rounded px-2 py-1"
+                                  />
+                                </td>
+                              </>
+                            ) : (
+                              <>
+                                <td className="py-2 pr-3 text-right text-slate-600">{l.quantity}</td>
+                                <td className="py-2 pr-3 text-right text-slate-600">{fmtInr(l.unitPrice)}</td>
+                              </>
+                            )}
                             <td className="py-2 pr-3 text-right text-slate-500 text-xs">{l.taxLabel}</td>
-                            <td className="py-2 text-right text-slate-700">{fmtInr(l.untaxedTotal)}</td>
+                            <td className="py-2 pr-3 text-right text-slate-700">{fmtInr(l.untaxedTotal)}</td>
+                            {canPublish && (
+                              <td className="py-2 text-right whitespace-nowrap">
+                                <button onClick={() => handleSaveLine(l.id)} disabled={busy} className="text-xs text-blue-600 hover:underline mr-2 disabled:opacity-50">Save</button>
+                                <button onClick={() => handleRemoveLine(l.id)} disabled={busy} className="text-xs text-red-600 hover:underline disabled:opacity-50">Remove</button>
+                              </td>
+                            )}
                           </tr>
                         ))}
                       </tbody>
                     </table>
                   </div>
+
+                  {canPublish && (
+                    <div className="border border-dashed border-slate-200 rounded-lg p-3 space-y-2">
+                      <p className="text-xs font-medium text-slate-600">Add Product</p>
+                      <div className="flex flex-wrap gap-2 items-start">
+                        <div className="relative flex-1 min-w-[200px]">
+                          <input
+                            type="text" value={productQuery} onChange={e => handleProductSearch(e.target.value)}
+                            placeholder="Search by product code or name..."
+                            className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
+                          />
+                          {productResults.length > 0 && (
+                            <div className="absolute z-10 mt-1 w-full bg-white border border-slate-200 rounded-lg shadow-lg max-h-56 overflow-y-auto">
+                              {productResults.map(p => (
+                                <button
+                                  key={p.id} type="button"
+                                  onClick={() => { setNewLineProduct(p); setProductQuery(`[${p.code}] ${p.name}`); setProductResults([]); }}
+                                  className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 border-b border-slate-50 last:border-0"
+                                >
+                                  [{p.code}] {p.name}
+                                </button>
+                              ))}
+                            </div>
+                          )}
+                          {productSearching && <p className="text-xs text-slate-400 mt-1">Searching...</p>}
+                        </div>
+                        <input
+                          type="number" min={1} value={newLineQty} onChange={e => setNewLineQty(e.target.value)}
+                          placeholder="Qty" className="w-20 text-sm border border-slate-300 rounded-lg px-3 py-2"
+                        />
+                        <input
+                          type="number" min={0} value={newLinePrice} onChange={e => setNewLinePrice(e.target.value)}
+                          placeholder="Unit Price" className="w-28 text-sm border border-slate-300 rounded-lg px-3 py-2"
+                        />
+                        <button
+                          onClick={handleAddLine} disabled={busy || !newLineProduct}
+                          className="bg-slate-800 hover:bg-slate-900 disabled:bg-slate-300 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors"
+                        >
+                          Add
+                        </button>
+                      </div>
+                    </div>
+                  )}
 
                   <div className="flex flex-wrap gap-6 text-sm border-t border-slate-100 pt-3">
                     <p className="text-slate-500">Untaxed: <span className="text-slate-800 font-medium">{fmtInr(request.draftPI.untaxedAmount)}</span></p>
@@ -426,6 +601,59 @@ export default function AdminRequestDetailPage() {
               >
                 {assigning ? 'Assigning...' : request.salesperson ? 'Reassign' : 'Assign'}
               </button>
+            </div>
+
+            <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+              <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Region</h2>
+              {request.currentTerritory ? (
+                <p className="text-sm text-slate-700 mb-3">{request.currentTerritory.name}</p>
+              ) : (
+                <p className="text-sm text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mb-3">
+                  Region requires Admin review.
+                </p>
+              )}
+              {d?.regionDetection && (
+                <p className="text-xs text-slate-400 mb-3">
+                  Auto-detected from &quot;{d.regionDetection.matchedToken ?? '—'}&quot;
+                  {d.regionDetection.confidence === 'unclear' ? ' — unclear, not auto-assigned.' : '.'}
+                </p>
+              )}
+              <select
+                value={selectedTerritory}
+                onChange={e => setSelectedTerritory(e.target.value)}
+                className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 bg-white focus:outline-none focus:ring-2 focus:ring-blue-500 mb-2"
+              >
+                <option value="">Select Territory...</option>
+                {territories.map(t => <option key={t.id} value={t.id}>{t.name}</option>)}
+              </select>
+              <button
+                onClick={handleUpdateTerritory}
+                disabled={!selectedTerritory || territoryBusy}
+                className="w-full bg-slate-800 hover:bg-slate-900 disabled:bg-slate-300 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors"
+              >
+                {territoryBusy ? 'Saving...' : 'Save Territory'}
+              </button>
+            </div>
+
+            <div className="bg-white border border-slate-200 rounded-xl p-5 shadow-sm">
+              <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Opportunity Defaults</h2>
+              <dl className="space-y-2 text-sm">
+                {([
+                  ['Key Account Manager', request.opportunityDefaults.keyAccountManager],
+                  ['Industry', request.opportunityDefaults.industry],
+                  ['Sub Industry', request.opportunityDefaults.subIndustry],
+                  ['Source', request.opportunityDefaults.source],
+                  ['Sub Lead Source', request.opportunityDefaults.subLeadSource],
+                  ['Ownership', request.opportunityDefaults.ownership],
+                  ['Channel', request.opportunityDefaults.channel],
+                  ['Account Type', request.opportunityDefaults.accountType],
+                ] as [string, string | null][]).map(([label, value]) => (
+                  <div key={label} className="flex justify-between gap-2">
+                    <dt className="text-slate-400">{label}</dt>
+                    <dd className="text-slate-700 font-medium text-right">{value ?? '—'}</dd>
+                  </div>
+                ))}
+              </dl>
             </div>
           </div>
         </div>
