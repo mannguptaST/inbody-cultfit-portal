@@ -1030,5 +1030,8 @@ devices for the shared login) until Phase 6.
   Odoo, every default/Territory/product-editor/native-PDF/customer-confirm
   step verified field-by-field directly against Odoo (not just the app's
   own responses), then the test `sale.order` cancelled and the test
-  `crm.lead` archived. No new environment variables introduced. Not yet
-  merged or deployed as of this commit.
+  `crm.lead` archived. No new environment variables introduced. Merged into
+  `main` and deployed to Production; verified via 22 read-only production
+  smoke tests (health, all 4 role logins, list/detail views, product
+  search, existing-PI download, role-boundary rejections, invalid-id
+  handling). Tagged `cultfit-defaults-region-native-pi-production`.
