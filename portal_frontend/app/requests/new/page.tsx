@@ -69,7 +69,6 @@ export default function NewOrderRequestPage() {
     if (!form.mainProductId) errs.mainProductId = 'Required';
     const qty = Number(form.quantity);
     if (!Number.isInteger(qty) || qty < 1 || qty > 999) errs.quantity = 'Enter a whole number between 1 and 999';
-    if (!form.deliveryAddress.trim()) errs.deliveryAddress = 'Required';
     return errs;
   }
 
@@ -199,7 +198,7 @@ export default function NewOrderRequestPage() {
 
           <div>
             <label className="text-xs font-medium text-slate-600 block mb-1">
-              Delivery Address <span className="text-red-500">*</span>
+              Delivery Address
             </label>
             <textarea
               rows={2}

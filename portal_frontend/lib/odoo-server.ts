@@ -847,7 +847,7 @@ function buildRequestDescriptionHtml(details: PortalRequestDetails): string {
     `<p><b>COCO/FOFO:</b> ${escapeHtml(details.cocoFofo)}</p>`,
     `<p><b>Main product:</b> ${escapeHtml(details.mainProduct.code)} ${escapeHtml(details.mainProduct.name)} × ${details.quantity}</p>`,
     `<p><b>Included (free):</b> ${includedLine}</p>`,
-    `<p><b>Delivery address:</b> ${escapeHtml(details.deliveryAddress)}</p>`,
+    details.deliveryAddress ? `<p><b>Delivery address:</b> ${escapeHtml(details.deliveryAddress)}</p>` : '',
     `<p><b>Contact (from existing Odoo record, source: ${escapeHtml(c?.source ?? 'none')}):</b> ${contactLine}</p>`,
     details.regionDetection
       ? `<p><b>Detected region:</b> ${details.regionDetection.territoryName
@@ -1256,7 +1256,18 @@ export async function createPortalOrderRequest(
   if (authz.role !== 'customer') throw new InvalidRequestError('Only a customer account can submit a request.');
 
   const requestName = requiredText(input.requestName, 'Request/location name', MAX_LEN.requestName);
-  const deliveryAddress = requiredText(input.deliveryAddress, 'Delivery address', MAX_LEN.deliveryAddress);
+
+  // Optional, not required — billing/shipping addresses are captured
+  // authoritatively later, at PO submission (PortalPoData.billingAddress/
+  // shippingAddress), so this is just an early hint for admin, same
+  // optionality as notes.
+  let deliveryAddress = '';
+  if (typeof input.deliveryAddress === 'string' && input.deliveryAddress.trim()) {
+    deliveryAddress = input.deliveryAddress.trim();
+    if (deliveryAddress.length > MAX_LEN.deliveryAddress) {
+      throw new InvalidRequestError(`Delivery address must be ${MAX_LEN.deliveryAddress} characters or fewer.`);
+    }
+  }
 
   if (input.cocoFofo !== 'COCO' && input.cocoFofo !== 'FOFO') {
     throw new InvalidRequestError('COCO/FOFO must be COCO or FOFO.');
