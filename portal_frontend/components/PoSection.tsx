@@ -56,7 +56,13 @@ function WarningBadge({ severity }: { severity: ComparisonResult['severity'] }) 
   return <span className="text-xs text-amber-700 bg-amber-50 border border-amber-200 px-2 py-0.5 rounded">Warning</span>;
 }
 
-export default function PoSection({ requestId }: { requestId: number }) {
+// piStatus is the parent's freshly-loaded PI status (e.g. 'confirmed') —
+// passed through purely so the effect below re-fetches PO status right
+// after a PI confirmation, instead of only on mount. Without it this
+// component never learns the parent's PI state changed, and a customer who
+// just confirmed a PI has to manually refresh the page to see PO upload
+// become available.
+export default function PoSection({ requestId, piStatus }: { requestId: number; piStatus?: string }) {
   const [po, setPo] = useState<PoCustomerView | null>(null);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState('');
@@ -79,7 +85,7 @@ export default function PoSection({ requestId }: { requestId: number }) {
   }
 
   // eslint-disable-next-line react-hooks/set-state-in-effect -- standard fetch-on-mount; loading already starts true
-  useEffect(load, [requestId]);
+  useEffect(load, [requestId, piStatus]);
 
   async function handleExtract() {
     if (!file) return;

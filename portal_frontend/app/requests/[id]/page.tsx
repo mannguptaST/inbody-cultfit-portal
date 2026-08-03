@@ -339,7 +339,7 @@ export default function RequestDetailPage() {
             </div>
 
             {/* Purchase Order (Phase 3) */}
-            <PoSection requestId={request.id} />
+            <PoSection requestId={request.id} piStatus={pi?.status} />
 
             {/* Logistics & Delivery (Phase 4) */}
             <CustomerLogisticsSection requestId={request.id} />
