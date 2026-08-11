@@ -28,7 +28,9 @@ export async function PATCH(
     const authz: Authz = { role: 'admin' };
     const draft = await updatePIDraftLine(requestId, soId, parsedLineId, {
       quantity: body?.quantity !== undefined ? Number(body.quantity) : undefined,
-      unitPrice: body?.unitPrice !== undefined ? Number(body.unitPrice) : undefined,
+      discCalculation: body?.discCalculation === 'fixed' ? 'fixed' : body?.discCalculation === 'percentage' ? 'percentage' : undefined,
+      discount: body?.discount !== undefined ? Number(body.discount) : undefined,
+      fixedAmount: body?.fixedAmount !== undefined ? Number(body.fixedAmount) : undefined,
     }, authz);
     return NextResponse.json(draft);
   } catch (e: unknown) {

@@ -39,7 +39,6 @@ export default function AdminRequestDetailPage() {
   const [assigning, setAssigning] = useState(false);
   const [actionError, setActionError] = useState('');
 
-  const [priceInput, setPriceInput] = useState('');
   const [validityInput, setValidityInput] = useState('');
   const [busy, setBusy] = useState(false);
 
@@ -52,8 +51,11 @@ export default function AdminRequestDetailPage() {
   const [productSearching, setProductSearching] = useState(false);
   const [newLineProduct, setNewLineProduct] = useState<AdminProductOption | null>(null);
   const [newLineQty, setNewLineQty] = useState('1');
-  const [newLinePrice, setNewLinePrice] = useState('0');
-  const [lineEdits, setLineEdits] = useState<Record<number, { quantity: string; unitPrice: string }>>({});
+  const [newLineDiscCalc, setNewLineDiscCalc] = useState<'percentage' | 'fixed'>('percentage');
+  const [newLineDiscount, setNewLineDiscount] = useState('0');
+  const [newLineFixedAmount, setNewLineFixedAmount] = useState('0');
+  type LineEdit = { quantity: string; discCalculation: 'percentage' | 'fixed'; discount: string; fixedAmount: string };
+  const [lineEdits, setLineEdits] = useState<Record<number, LineEdit>>({});
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -61,11 +63,15 @@ export default function AdminRequestDetailPage() {
     try {
       const detail = await getAdminRequestDetail(requestId);
       setRequest(detail);
-      setPriceInput(detail.draftPI ? String(detail.draftPI.mainProductUnitPrice || '') : '');
       setValidityInput(detail.draftPI?.validityDate || '');
       setSelectedTerritory(detail.currentTerritory ? String(detail.currentTerritory.id) : '');
-      const edits: Record<number, { quantity: string; unitPrice: string }> = {};
-      detail.draftPI?.lines.forEach(l => { edits[l.id] = { quantity: String(l.quantity), unitPrice: String(l.unitPrice) }; });
+      const edits: Record<number, LineEdit> = {};
+      detail.draftPI?.lines.forEach(l => {
+        edits[l.id] = {
+          quantity: String(l.quantity), discCalculation: l.discCalculation,
+          discount: String(l.discount), fixedAmount: String(l.fixedAmount),
+        };
+      });
       setLineEdits(edits);
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to load request.');
@@ -108,16 +114,11 @@ export default function AdminRequestDetailPage() {
   }
 
   async function handleCreateDraft(isRevision: boolean) {
-    const price = Number(priceInput);
-    if (!Number.isFinite(price) || price <= 0) {
-      setActionError('Enter a valid main product price.');
-      return;
-    }
     setBusy(true);
     setActionError('');
     try {
-      if (isRevision) await createPIRevision(requestId, price);
-      else await createDraftPI(requestId, price);
+      if (isRevision) await createPIRevision(requestId);
+      else await createDraftPI(requestId);
       await load();
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : 'Failed to create PI.');
@@ -128,15 +129,10 @@ export default function AdminRequestDetailPage() {
 
   async function handleSaveDraft() {
     if (!request?.draftPI) return;
-    const price = Number(priceInput);
-    if (!Number.isFinite(price) || price <= 0) {
-      setActionError('Enter a valid main product price.');
-      return;
-    }
     setBusy(true);
     setActionError('');
     try {
-      await updatePIDraft(requestId, request.draftPI.id, { mainProductPrice: price, validityDate: validityInput || undefined });
+      await updatePIDraft(requestId, request.draftPI.id, { validityDate: validityInput || undefined });
       await load();
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : 'Failed to save draft.');
@@ -192,21 +188,36 @@ export default function AdminRequestDetailPage() {
   async function handleAddLine() {
     if (!request?.draftPI || !newLineProduct) return;
     const qty = Number(newLineQty);
-    const price = Number(newLinePrice);
     if (!Number.isInteger(qty) || qty < 1) { setActionError('Enter a valid quantity.'); return; }
-    if (!Number.isFinite(price) || price < 0) { setActionError('Enter a valid unit price.'); return; }
+    if (newLineDiscCalc === 'percentage') {
+      const discount = Number(newLineDiscount);
+      if (!Number.isFinite(discount) || discount < 0 || discount > 100) { setActionError('Discount must be between 0 and 100.'); return; }
+    } else {
+      const fixedAmount = Number(newLineFixedAmount);
+      const maxAmount = newLineProduct.unitPrice * qty;
+      if (!Number.isFinite(fixedAmount) || fixedAmount < 0 || fixedAmount > maxAmount) {
+        setActionError(`Fixed discount amount must be between 0 and ${fmtInr(maxAmount)}.`);
+        return;
+      }
+    }
     const alreadyOnPI = request.draftPI.lines.some(l => l.productId === newLineProduct.id);
     if (alreadyOnPI && !confirm(`[${newLineProduct.code}] ${newLineProduct.name} is already a line on this PI. Add it again anyway?`)) return;
 
     setBusy(true);
     setActionError('');
     try {
-      await addPILine(requestId, request.draftPI.id, newLineProduct.id, qty, price);
+      await addPILine(requestId, request.draftPI.id, newLineProduct.id, qty, {
+        discCalculation: newLineDiscCalc,
+        discount: newLineDiscCalc === 'percentage' ? Number(newLineDiscount) : undefined,
+        fixedAmount: newLineDiscCalc === 'fixed' ? Number(newLineFixedAmount) : undefined,
+      });
       setNewLineProduct(null);
       setProductQuery('');
       setProductResults([]);
       setNewLineQty('1');
-      setNewLinePrice('0');
+      setNewLineDiscCalc('percentage');
+      setNewLineDiscount('0');
+      setNewLineFixedAmount('0');
       await load();
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : 'Failed to add product line.');
@@ -222,7 +233,12 @@ export default function AdminRequestDetailPage() {
     setBusy(true);
     setActionError('');
     try {
-      await updatePILine(requestId, request.draftPI.id, lineId, { quantity: Number(edit.quantity), unitPrice: Number(edit.unitPrice) });
+      await updatePILine(requestId, request.draftPI.id, lineId, {
+        quantity: Number(edit.quantity),
+        discCalculation: edit.discCalculation,
+        discount: edit.discCalculation === 'percentage' ? Number(edit.discount) : undefined,
+        fixedAmount: edit.discCalculation === 'fixed' ? Number(edit.fixedAmount) : undefined,
+      });
       await load();
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : 'Failed to update line.');
@@ -376,16 +392,9 @@ export default function AdminRequestDetailPage() {
 
               {canCreateDraft && (
                 <div className="space-y-3">
-                  <div>
-                    <label className="text-xs font-medium text-slate-600 block mb-1">
-                      Main Product Unit Price (₹) — {d?.mainProduct.name}
-                    </label>
-                    <input
-                      type="number" min={1} value={priceInput} onChange={e => setPriceInput(e.target.value)}
-                      className="w-full sm:w-64 text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                      placeholder="Enter unit price"
-                    />
-                  </div>
+                  <p className="text-xs text-slate-500">
+                    {d?.mainProduct.name} — unit price will be set automatically from this product&apos;s Sales Price in Odoo.
+                  </p>
                   <button
                     onClick={() => handleCreateDraft(false)}
                     disabled={busy}
@@ -408,87 +417,162 @@ export default function AdminRequestDetailPage() {
                       <thead>
                         <tr className="text-left text-xs text-slate-400 uppercase tracking-wide border-b border-slate-100">
                           <th className="py-2 pr-3">Product</th>
-                          <th className="py-2 pr-3 text-right">Qty</th>
+                          <th className="py-2 pr-3 text-right">Quantity</th>
+                          <th className="py-2 pr-3 text-right">Unit</th>
                           <th className="py-2 pr-3 text-right">Unit Price</th>
-                          <th className="py-2 pr-3 text-right">Tax</th>
-                          <th className="py-2 pr-3 text-right">Untaxed</th>
+                          <th className="py-2 pr-3 text-right">Taxes</th>
+                          <th className="py-2 pr-3 text-right">Disc. Calculation</th>
+                          <th className="py-2 pr-3 text-right">Fixed Amount</th>
+                          <th className="py-2 pr-3 text-right">Disc. %</th>
+                          <th className="py-2 pr-3 text-right">Amount</th>
                           {canPublish && <th className="py-2"></th>}
                         </tr>
                       </thead>
                       <tbody className="divide-y divide-slate-50">
-                        {request.draftPI.lines.map(l => (
-                          <tr key={l.id}>
-                            <td className="py-2 pr-3 text-slate-700">[{l.code}] {l.name}</td>
-                            {canPublish ? (
-                              <>
-                                <td className="py-2 pr-3 text-right">
-                                  <input
-                                    type="number" min={1} value={lineEdits[l.id]?.quantity ?? String(l.quantity)}
-                                    onChange={e => setLineEdits(prev => ({ ...prev, [l.id]: { quantity: e.target.value, unitPrice: prev[l.id]?.unitPrice ?? String(l.unitPrice) } }))}
-                                    className="w-16 text-right text-sm border border-slate-200 rounded px-2 py-1"
-                                  />
+                        {request.draftPI.lines.map(l => {
+                          const edit = lineEdits[l.id];
+                          const calc = edit?.discCalculation ?? l.discCalculation;
+                          const patchEdit = (patch: Partial<LineEdit>) => {
+                            setLineEdits(prev => ({
+                              ...prev,
+                              [l.id]: {
+                                quantity: prev[l.id]?.quantity ?? String(l.quantity),
+                                discCalculation: prev[l.id]?.discCalculation ?? l.discCalculation,
+                                discount: prev[l.id]?.discount ?? String(l.discount),
+                                fixedAmount: prev[l.id]?.fixedAmount ?? String(l.fixedAmount),
+                                ...patch,
+                              },
+                            }));
+                          };
+                          return (
+                            <tr key={l.id}>
+                              <td className="py-2 pr-3 text-slate-700">[{l.code}] {l.name}</td>
+                              {canPublish ? (
+                                <>
+                                  <td className="py-2 pr-3 text-right">
+                                    <input
+                                      type="number" min={1} value={edit?.quantity ?? String(l.quantity)}
+                                      onChange={e => patchEdit({ quantity: e.target.value })}
+                                      className="w-16 text-right text-sm border border-slate-200 rounded px-2 py-1"
+                                    />
+                                  </td>
+                                  <td className="py-2 pr-3 text-right text-slate-500 text-xs">{l.unit || '—'}</td>
+                                  <td className="py-2 pr-3 text-right text-slate-600">{fmtInr(l.unitPrice)}</td>
+                                  <td className="py-2 pr-3 text-right text-slate-500 text-xs">{l.taxLabel}</td>
+                                  <td className="py-2 pr-3 text-right">
+                                    <select
+                                      value={calc}
+                                      onChange={e => patchEdit({ discCalculation: e.target.value as 'percentage' | 'fixed' })}
+                                      className="text-sm border border-slate-200 rounded px-2 py-1 bg-white"
+                                    >
+                                      <option value="percentage">Percentage</option>
+                                      <option value="fixed">Fixed</option>
+                                    </select>
+                                  </td>
+                                  <td className="py-2 pr-3 text-right">
+                                    <input
+                                      type="number" min={0} disabled={calc !== 'fixed'}
+                                      value={calc === 'fixed' ? (edit?.fixedAmount ?? String(l.fixedAmount)) : ''}
+                                      placeholder={calc !== 'fixed' ? '—' : undefined}
+                                      onChange={e => patchEdit({ fixedAmount: e.target.value })}
+                                      className="w-24 text-right text-sm border border-slate-200 rounded px-2 py-1 disabled:bg-slate-50 disabled:text-slate-300"
+                                    />
+                                  </td>
+                                  <td className="py-2 pr-3 text-right">
+                                    <input
+                                      type="number" min={0} max={100} disabled={calc !== 'percentage'}
+                                      value={calc === 'percentage' ? (edit?.discount ?? String(l.discount)) : ''}
+                                      placeholder={calc !== 'percentage' ? '—' : undefined}
+                                      onChange={e => patchEdit({ discount: e.target.value })}
+                                      className="w-16 text-right text-sm border border-slate-200 rounded px-2 py-1 disabled:bg-slate-50 disabled:text-slate-300"
+                                    />
+                                  </td>
+                                </>
+                              ) : (
+                                <>
+                                  <td className="py-2 pr-3 text-right text-slate-600">{l.quantity}</td>
+                                  <td className="py-2 pr-3 text-right text-slate-500 text-xs">{l.unit || '—'}</td>
+                                  <td className="py-2 pr-3 text-right text-slate-600">{fmtInr(l.unitPrice)}</td>
+                                  <td className="py-2 pr-3 text-right text-slate-500 text-xs">{l.taxLabel}</td>
+                                  <td className="py-2 pr-3 text-right text-slate-600 text-xs capitalize">{l.discCalculation}</td>
+                                  <td className="py-2 pr-3 text-right text-slate-600">{l.discCalculation === 'fixed' ? fmtInr(l.fixedAmount) : '—'}</td>
+                                  <td className="py-2 pr-3 text-right text-slate-600">{l.discCalculation === 'percentage' ? `${l.discount}%` : '—'}</td>
+                                </>
+                              )}
+                              <td className="py-2 pr-3 text-right text-slate-700 font-medium">{fmtInr(l.lineTotal)}</td>
+                              {canPublish && (
+                                <td className="py-2 text-right whitespace-nowrap">
+                                  <button onClick={() => handleSaveLine(l.id)} disabled={busy} className="text-xs text-blue-600 hover:underline mr-2 disabled:opacity-50">Save</button>
+                                  <button onClick={() => handleRemoveLine(l.id)} disabled={busy} className="text-xs text-red-600 hover:underline disabled:opacity-50">Remove</button>
                                 </td>
-                                <td className="py-2 pr-3 text-right">
-                                  <input
-                                    type="number" min={0} value={lineEdits[l.id]?.unitPrice ?? String(l.unitPrice)}
-                                    onChange={e => setLineEdits(prev => ({ ...prev, [l.id]: { quantity: prev[l.id]?.quantity ?? String(l.quantity), unitPrice: e.target.value } }))}
-                                    className="w-24 text-right text-sm border border-slate-200 rounded px-2 py-1"
-                                  />
-                                </td>
-                              </>
-                            ) : (
-                              <>
-                                <td className="py-2 pr-3 text-right text-slate-600">{l.quantity}</td>
-                                <td className="py-2 pr-3 text-right text-slate-600">{fmtInr(l.unitPrice)}</td>
-                              </>
-                            )}
-                            <td className="py-2 pr-3 text-right text-slate-500 text-xs">{l.taxLabel}</td>
-                            <td className="py-2 pr-3 text-right text-slate-700">{fmtInr(l.untaxedTotal)}</td>
-                            {canPublish && (
-                              <td className="py-2 text-right whitespace-nowrap">
-                                <button onClick={() => handleSaveLine(l.id)} disabled={busy} className="text-xs text-blue-600 hover:underline mr-2 disabled:opacity-50">Save</button>
-                                <button onClick={() => handleRemoveLine(l.id)} disabled={busy} className="text-xs text-red-600 hover:underline disabled:opacity-50">Remove</button>
-                              </td>
-                            )}
-                          </tr>
-                        ))}
+                              )}
+                            </tr>
+                          );
+                        })}
                       </tbody>
                     </table>
                   </div>
 
                   {canPublish && (
                     <div className="border border-dashed border-slate-200 rounded-lg p-3 space-y-2">
-                      <p className="text-xs font-medium text-slate-600">Add Product</p>
+                      <p className="text-xs font-medium text-slate-600">Add a product</p>
+                      <p className="text-xs text-slate-400">
+                        Search the full Odoo sales catalog by product name, internal reference, or code — not limited to any predefined bundle.
+                      </p>
                       <div className="flex flex-wrap gap-2 items-start">
-                        <div className="relative flex-1 min-w-[200px]">
+                        <div className="relative flex-1 min-w-[260px]">
                           <input
                             type="text" value={productQuery} onChange={e => handleProductSearch(e.target.value)}
-                            placeholder="Search by product code or name..."
+                            placeholder="Search by product name, internal reference, or code..."
                             className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
                           />
                           {productResults.length > 0 && (
-                            <div className="absolute z-10 mt-1 w-full bg-white border border-slate-200 rounded-lg shadow-lg max-h-56 overflow-y-auto">
+                            <div className="absolute z-10 mt-1 w-full bg-white border border-slate-200 rounded-lg shadow-lg max-h-64 overflow-y-auto">
                               {productResults.map(p => (
                                 <button
                                   key={p.id} type="button"
                                   onClick={() => { setNewLineProduct(p); setProductQuery(`[${p.code}] ${p.name}`); setProductResults([]); }}
-                                  className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 border-b border-slate-50 last:border-0"
+                                  className="w-full text-left px-3 py-2 text-sm hover:bg-slate-50 border-b border-slate-50 last:border-0 flex flex-wrap justify-between gap-x-3 gap-y-0.5"
                                 >
-                                  [{p.code}] {p.name}
+                                  <span className="text-slate-700">[{p.code}] {p.name}</span>
+                                  <span className="text-slate-400 text-xs whitespace-nowrap">
+                                    {fmtInr(p.unitPrice)} · {p.unit || '—'} · {p.taxLabel}
+                                  </span>
                                 </button>
                               ))}
                             </div>
                           )}
                           {productSearching && <p className="text-xs text-slate-400 mt-1">Searching...</p>}
+                          {newLineProduct && (
+                            <p className="text-xs text-slate-500 mt-1">
+                              From Odoo (locked): <span className="font-medium text-slate-700">{fmtInr(newLineProduct.unitPrice)}</span>
+                              {' · '}{newLineProduct.unit || '—'}{' · '}{newLineProduct.taxLabel}
+                            </p>
+                          )}
                         </div>
                         <input
                           type="number" min={1} value={newLineQty} onChange={e => setNewLineQty(e.target.value)}
                           placeholder="Qty" className="w-20 text-sm border border-slate-300 rounded-lg px-3 py-2"
                         />
-                        <input
-                          type="number" min={0} value={newLinePrice} onChange={e => setNewLinePrice(e.target.value)}
-                          placeholder="Unit Price" className="w-28 text-sm border border-slate-300 rounded-lg px-3 py-2"
-                        />
+                        <select
+                          value={newLineDiscCalc}
+                          onChange={e => setNewLineDiscCalc(e.target.value as 'percentage' | 'fixed')}
+                          className="text-sm border border-slate-300 rounded-lg px-3 py-2 bg-white"
+                        >
+                          <option value="percentage">Percentage</option>
+                          <option value="fixed">Fixed</option>
+                        </select>
+                        {newLineDiscCalc === 'fixed' ? (
+                          <input
+                            type="number" min={0} value={newLineFixedAmount} onChange={e => setNewLineFixedAmount(e.target.value)}
+                            placeholder="Fixed Amount (₹)" className="w-32 text-sm border border-slate-300 rounded-lg px-3 py-2"
+                          />
+                        ) : (
+                          <input
+                            type="number" min={0} max={100} value={newLineDiscount} onChange={e => setNewLineDiscount(e.target.value)}
+                            placeholder="Disc. %" className="w-24 text-sm border border-slate-300 rounded-lg px-3 py-2"
+                          />
+                        )}
                         <button
                           onClick={handleAddLine} disabled={busy || !newLineProduct}
                           className="bg-slate-800 hover:bg-slate-900 disabled:bg-slate-300 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors"
@@ -507,13 +591,6 @@ export default function AdminRequestDetailPage() {
 
                   {canPublish ? (
                     <div className="grid grid-cols-1 sm:grid-cols-2 gap-4 pt-2">
-                      <div>
-                        <label className="text-xs font-medium text-slate-600 block mb-1">Main Product Unit Price (₹)</label>
-                        <input
-                          type="number" min={1} value={priceInput} onChange={e => setPriceInput(e.target.value)}
-                          className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500"
-                        />
-                      </div>
                       <div>
                         <label className="text-xs font-medium text-slate-600 block mb-1">Validity Date</label>
                         <input
