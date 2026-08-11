@@ -184,22 +184,22 @@ export async function assignRequestSalesperson(
   });
 }
 
-export async function createDraftPI(id: number, mainProductPrice: number): Promise<PIDraftInfo> {
+export async function createDraftPI(id: number): Promise<PIDraftInfo> {
   return apiFetch(`/admin/cultfit/requests/${id}/pi`, {
     method: 'POST',
-    body: JSON.stringify({ mainProductPrice }),
+    body: JSON.stringify({}),
   });
 }
 
-export async function createPIRevision(id: number, mainProductPrice: number): Promise<PIDraftInfo> {
+export async function createPIRevision(id: number): Promise<PIDraftInfo> {
   return apiFetch(`/admin/cultfit/requests/${id}/pi/revise`, {
     method: 'POST',
-    body: JSON.stringify({ mainProductPrice }),
+    body: JSON.stringify({}),
   });
 }
 
 export async function updatePIDraft(
-  id: number, soId: number, updates: { mainProductPrice?: number; validityDate?: string },
+  id: number, soId: number, updates: { validityDate?: string },
 ): Promise<PIDraftInfo> {
   return apiFetch(`/admin/cultfit/requests/${id}/pi`, {
     method: 'PATCH',
@@ -231,17 +231,23 @@ export async function searchAdminProducts(query: string): Promise<{ products: Ad
   return apiFetch(`/admin/cultfit/products/search?q=${encodeURIComponent(query)}`);
 }
 
+export interface PILineDiscountInput {
+  discCalculation?: 'percentage' | 'fixed';
+  discount?: number;
+  fixedAmount?: number;
+}
+
 export async function addPILine(
-  id: number, soId: number, productId: number, quantity: number, unitPrice: number,
+  id: number, soId: number, productId: number, quantity: number, discountInput?: PILineDiscountInput,
 ): Promise<PIDraftInfo> {
   return apiFetch(`/admin/cultfit/requests/${id}/pi/lines`, {
     method: 'POST',
-    body: JSON.stringify({ soId, productId, quantity, unitPrice }),
+    body: JSON.stringify({ soId, productId, quantity, ...discountInput }),
   });
 }
 
 export async function updatePILine(
-  id: number, soId: number, lineId: number, updates: { quantity?: number; unitPrice?: number },
+  id: number, soId: number, lineId: number, updates: { quantity?: number } & PILineDiscountInput,
 ): Promise<PIDraftInfo> {
   return apiFetch(`/admin/cultfit/requests/${id}/pi/lines/${lineId}`, {
     method: 'PATCH',

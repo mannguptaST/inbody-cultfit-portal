@@ -1610,10 +1610,15 @@ export interface PIDraftLine {
   code: string;
   name: string;
   quantity: number;
+  unit: string;
   unitPrice: number;
+  discCalculation: 'percentage' | 'fixed';
+  fixedAmount: number;
+  discount: number;
   taxLabel: string;
   untaxedTotal: number;
   taxTotal: number;
+  lineTotal: number;
 }
 
 export interface PIDraftInfo {
@@ -1629,7 +1634,15 @@ export interface PIDraftInfo {
 }
 
 const SO_DRAFT_FIELDS = ['id', 'name', 'state', 'validity_date', 'order_line', 'amount_untaxed', 'amount_tax', 'amount_total'];
-const SOL_DRAFT_FIELDS = ['id', 'product_id', 'product_uom_qty', 'price_unit', 'tax_ids', 'price_subtotal', 'price_tax'];
+// disc_calculation/fixed_amt are custom fields from the `inbody` Odoo module
+// (not stock Odoo, not Studio — confirmed live via ir.model.fields) that sit
+// alongside stock Odoo's discount(%) field: disc_calculation picks which of
+// {discount, fixed_amt} actually drives price_subtotal. Odoo computes
+// price_subtotal/price_tax/price_total itself from
+// price_unit/discount/disc_calculation/fixed_amt/product_uom_qty/tax_ids on
+// write, so reading them back after any write is all that's needed; no
+// pricing/tax math is reimplemented here.
+const SOL_DRAFT_FIELDS = ['id', 'product_id', 'product_uom_qty', 'product_uom_id', 'price_unit', 'discount', 'disc_calculation', 'fixed_amt', 'tax_ids', 'price_subtotal', 'price_tax', 'price_total'];
 
 async function buildDraftSOInfo(so: Record<string, unknown>): Promise<PIDraftInfo> {
   const lineIds = (so.order_line as number[]) || [];
@@ -1647,10 +1660,16 @@ async function buildDraftSOInfo(so: Record<string, unknown>): Promise<PIDraftInf
     const p = l.product_id as OdooTuple;
     const { code, name } = p ? parseProductLabel(p[1]) : { code: '', name: '' };
     const taxLabel = ((l.tax_ids as number[]) || []).map(id => taxMap.get(id)).filter(Boolean).join(', ') || 'No Tax';
+    const unitVal = l.product_uom_id as OdooTuple;
+    const discCalc = l.disc_calculation === 'fixed' ? 'fixed' : 'percentage';
     return {
       id: l.id as number, productId: p ? p[0] : 0, code, name,
-      quantity: (l.product_uom_qty as number) || 0, unitPrice: (l.price_unit as number) || 0, taxLabel,
+      quantity: (l.product_uom_qty as number) || 0, unit: unitVal ? unitVal[1] : '',
+      unitPrice: (l.price_unit as number) || 0,
+      discCalculation: discCalc as 'percentage' | 'fixed', fixedAmount: (l.fixed_amt as number) || 0,
+      discount: (l.discount as number) || 0, taxLabel,
       untaxedTotal: (l.price_subtotal as number) || 0, taxTotal: (l.price_tax as number) || 0,
+      lineTotal: (l.price_total as number) || 0,
     };
   });
   const mainLine = builtLines.find(l => l.unitPrice > 0) ?? builtLines[0] ?? null;
@@ -1698,9 +1717,15 @@ const COMPANY_ID = 1; // "InBody India Private Limited" — verified live: every
 const DEFAULT_VALIDITY_DAYS = 30; // matches the ~30-day windows seen on real historical CultFit quotations
 const MAX_PRICE = 100_000_000; // sanity ceiling against a fat-fingered price, not a business rule
 
-function requirePositivePrice(v: unknown): number {
+// Sanity-checks a price read from Odoo's own product.list_price (never
+// admin/client input — see the "no manual price editing" rule this whole
+// file follows now). Guards against a product with no Sales Price
+// configured in Odoo, not against a fat-fingered admin entry.
+function assertOdooPriceIsUsable(v: unknown, productLabel: string): number {
   const n = Number(v);
-  if (!Number.isFinite(n) || n <= 0 || n > MAX_PRICE) throw new PIWorkflowError('Enter a valid main product price.');
+  if (!Number.isFinite(n) || n <= 0 || n > MAX_PRICE) {
+    throw new PIWorkflowError(`${productLabel} has no valid Sales Price set in Odoo — set one in Odoo before creating a PI.`);
+  }
   return n;
 }
 
@@ -1709,13 +1734,27 @@ function requirePositivePrice(v: unknown): number {
 // the PI always matches exactly what the customer originally asked for) and
 // creates the sale.order. Does not check for an existing active draft —
 // callers are responsible for that (createDraftPI refuses if one exists,
-// createPIRevision cancels the old one first).
-async function buildAndCreateSO(
-  leadId: number, mainProductPrice: number, authz: Authz, adminEmail: string,
-): Promise<PIDraftInfo> {
-  const price = requirePositivePrice(mainProductPrice);
+// createPIRevision cancels the old one first). The main product's price is
+// always read from Odoo's own product.list_price (Sales Price) — never
+// admin-typed — so the PI's starting price always matches Odoo.
+// Classification fields that live on crm.lead (see §11a Opportunity
+// defaults) but are separate, independently-stored fields of the same name
+// on sale.order too — confirmed live via fields_get (store:true,
+// readonly:false, not related/computed). Odoo's own UI copies these onto a
+// new quotation via client-side onchange when a human creates one from an
+// Opportunity; a raw XML-RPC create() (what this app does) skips onchange
+// entirely, so without this explicit copy the quotation's own copies stay
+// blank even though the linked Opportunity has them set correctly.
+const SO_CLASSIFICATION_FIELDS = ['industry_id', 'sub_industry_id', 'territory_id', 'source_id', 'sub_lead_source_id', 'ownership_id', 'medium_id'] as const;
 
-  const leads = await executeKw('crm.lead', 'read', [[leadId]], { fields: ['description', 'user_id'] }) as Record<string, unknown>[];
+function tupleId(v: unknown): number | false {
+  return Array.isArray(v) ? (v as [number, string])[0] : false;
+}
+
+async function buildAndCreateSO(
+  leadId: number, authz: Authz, adminEmail: string,
+): Promise<PIDraftInfo> {
+  const leads = await executeKw('crm.lead', 'read', [[leadId]], { fields: ['description', 'user_id', ...SO_CLASSIFICATION_FIELDS] }) as Record<string, unknown>[];
   if (!leads.length) throw new LeadNotFoundError();
   const lead = leads[0];
 
@@ -1725,10 +1764,18 @@ async function buildAndCreateSO(
   const userVal = lead.user_id as OdooTuple;
   if (!userVal) throw new PIWorkflowError('Assign a salesperson before creating a PI.');
 
+  const classificationFields = Object.fromEntries(
+    SO_CLASSIFICATION_FIELDS.map(f => [f, tupleId(lead[f])]),
+  );
+
   const quantity = details.quantity;
   const productIds = [details.mainProduct.id, ...details.includedProducts.map(p => p.id)];
-  const products = await executeKw('product.product', 'read', [productIds], { fields: ['id', 'taxes_id', 'uom_id'] }) as { id: number; taxes_id: number[]; uom_id: OdooTuple }[];
+  const products = await executeKw('product.product', 'read', [productIds], { fields: ['id', 'list_price', 'taxes_id', 'uom_id'] }) as { id: number; list_price: number; taxes_id: number[]; uom_id: OdooTuple }[];
   const productMap = new Map(products.map(p => [p.id, p]));
+
+  const mainProduct = productMap.get(details.mainProduct.id);
+  if (!mainProduct) throw new PIWorkflowError(`Product [${details.mainProduct.code}] ${details.mainProduct.name} could not be found in Odoo — cannot build this PI.`);
+  const price = assertOdooPriceIsUsable(mainProduct.list_price, `[${details.mainProduct.code}] ${details.mainProduct.name}`);
 
   function lineCommand(id: number, code: string, name: string, unitPrice: number, includedLabel: boolean) {
     const p = productMap.get(id);
@@ -1765,6 +1812,7 @@ async function buildAndCreateSO(
     client_order_ref: `REQ-${leadId}`,
     validity_date: validityDate,
     order_line: orderLines,
+    ...classificationFields,
   }]) as number;
 
   try {
@@ -1781,7 +1829,7 @@ async function buildAndCreateSO(
 }
 
 export async function createDraftPI(
-  leadId: number, mainProductPrice: number, authz: Authz, adminEmail: string,
+  leadId: number, authz: Authz, adminEmail: string,
 ): Promise<PIDraftInfo> {
   if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can create a PI.');
   await assertCultFitLead(leadId);
@@ -1789,11 +1837,11 @@ export async function createDraftPI(
   const existing = await findActiveDraftSO(leadId);
   if (existing) throw new PIWorkflowError('An active draft PI already exists for this request. Use "Create Revision" to replace it.');
 
-  return buildAndCreateSO(leadId, mainProductPrice, authz, adminEmail);
+  return buildAndCreateSO(leadId, authz, adminEmail);
 }
 
 export async function createPIRevision(
-  leadId: number, mainProductPrice: number, authz: Authz, adminEmail: string,
+  leadId: number, authz: Authz, adminEmail: string,
 ): Promise<PIDraftInfo> {
   if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can create a PI revision.');
   await assertCultFitLead(leadId);
@@ -1811,14 +1859,18 @@ export async function createPIRevision(
     console.error('[pi] failed to post superseded note for lead', leadId, e instanceof Error ? e.message : e);
   }
 
-  return buildAndCreateSO(leadId, mainProductPrice, authz, adminEmail);
+  return buildAndCreateSO(leadId, authz, adminEmail);
 }
 
 export interface PIDraftUpdate {
-  mainProductPrice?: number;
   validityDate?: string;
 }
 
+// Unit price is never editable here (or anywhere in the PI editor) — it
+// always comes from Odoo's own product.list_price, resolved at line
+// creation time in buildAndCreateSO/addPIDraftLine. Only validity date is
+// editable through this function; per-line quantity/discount go through
+// updatePIDraftLine below.
 export async function updatePIDraft(
   leadId: number, soId: number, updates: PIDraftUpdate, authz: Authz,
 ): Promise<PIDraftInfo> {
@@ -1835,13 +1887,6 @@ export async function updatePIDraft(
     await executeKw('sale.order', 'write', [[soId], { validity_date: updates.validityDate }]);
   }
 
-  if (updates.mainProductPrice !== undefined) {
-    const price = requirePositivePrice(updates.mainProductPrice);
-    const mainLine = so.lines.find(l => l.unitPrice > 0) ?? so.lines[0];
-    if (!mainLine) throw new PIWorkflowError('This PI has no line items.');
-    await executeKw('sale.order.line', 'write', [[mainLine.id], { price_unit: price }]);
-  }
-
   const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
   return buildDraftSOInfo(sos[0]);
 }
@@ -1855,22 +1900,56 @@ export async function updatePIDraft(
 // of how they got there, so these are safe additive operations on the same
 // draft sale.order buildAndCreateSO already created.
 
-function requireNonNegativePrice(v: unknown): number {
-  const n = Number(v);
-  if (!Number.isFinite(n) || n < 0 || n > MAX_PRICE) throw new PIWorkflowError('Enter a valid unit price.');
-  return n;
-}
-
 function requireValidQuantity(v: unknown): number {
   const n = Number(v);
   if (!Number.isInteger(n) || n < 1 || n > 999) throw new PIWorkflowError('Quantity must be a whole number between 1 and 999.');
   return n;
 }
 
+// Odoo's own native Discount (%) field on sale.order.line — 0-100, same
+// range Odoo's own UI enforces. Defaults to 0 (no discount) when not
+// supplied. Never trusted blindly from the client beyond this range check.
+function requireValidDiscount(v: unknown): number {
+  if (v === undefined) return 0;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0 || n > 100) throw new PIWorkflowError('Discount must be a percentage between 0 and 100.');
+  return n;
+}
+
+// Odoo's `fixed_amt` field (from the inbody module, sibling to disc_calculation)
+// — a currency amount, only meaningful when disc_calculation='fixed'. Bounded
+// by the line's own pre-discount value (price_unit * qty) so a line can never
+// go negative, same ceiling Odoo's own price_subtotal compute implicitly enforces.
+function requireValidFixedAmount(v: unknown, maxAmount: number): number {
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 0 || n > maxAmount + 0.01) {
+    throw new PIWorkflowError(`Fixed discount amount must be between 0 and ${maxAmount.toFixed(2)} for this line.`);
+  }
+  return n;
+}
+
+// disc_calculation ('percentage' | 'fixed') plus whichever of discount/fixed_amt
+// is active — the other stays at Odoo's default rather than being computed
+// here, since price_subtotal only depends on the active mode's field (confirmed
+// against live production data) and mirroring the inactive field is a cosmetic
+// nicety Odoo's own UI does client-side, not something this app needs to redo.
+function resolveDiscountFields(
+  input: { discCalculation?: 'percentage' | 'fixed'; discount?: number; fixedAmount?: number },
+  lineBase: number,
+): Record<string, unknown> {
+  if (input.discCalculation === 'fixed') {
+    return { disc_calculation: 'fixed', fixed_amt: requireValidFixedAmount(input.fixedAmount, lineBase), discount: 0 };
+  }
+  return { disc_calculation: 'percentage', discount: requireValidDiscount(input.discount) };
+}
+
 export interface AdminProductOption {
   id: number;
   code: string;
   name: string;
+  unitPrice: number;
+  unit: string;
+  taxLabel: string;
 }
 
 // Broader than fetchCultFitProductCatalog (which only surfaces products
@@ -1880,6 +1959,10 @@ export interface AdminProductOption {
 // customer-facing picker, plus every product matching the real "Not Use"
 // naming convention discovered live (covers 5 more deprecated products than
 // the hardcoded id list alone) — never returns an inactive/non-sellable one.
+// unitPrice/unit/taxLabel are Odoo's own list_price/uom_id/taxes_id — shown
+// to admin so everything about the product is visible before it's added, but
+// all re-read fresh from Odoo again in addPIDraftLine rather than trusted
+// from this search result.
 export async function searchAdminProducts(query: string): Promise<AdminProductOption[]> {
   const q = query.trim().slice(0, 100);
   if (!q) return [];
@@ -1888,15 +1971,35 @@ export async function searchAdminProducts(query: string): Promise<AdminProductOp
     '|', ['name', 'ilike', q], ['default_code', 'ilike', q],
   ];
   const products = await executeKw('product.product', 'search_read', [domain], {
-    fields: ['id', 'display_name'], limit: 20,
-  }) as { id: number; display_name: string }[];
-  return products
-    .filter(p => !ADMIN_EDITOR_EXCLUDED_PRODUCT_IDS.has(p.id))
-    .map(p => ({ id: p.id, ...parseProductLabel(p.display_name) }));
+    fields: ['id', 'display_name', 'list_price', 'uom_id', 'taxes_id'], limit: 20,
+  }) as { id: number; display_name: string; list_price: number; uom_id: OdooTuple; taxes_id: number[] }[];
+  const visible = products.filter(p => !ADMIN_EDITOR_EXCLUDED_PRODUCT_IDS.has(p.id));
+
+  const taxIds = [...new Set(visible.flatMap(p => p.taxes_id || []))];
+  const taxes = taxIds.length
+    ? await executeKw('account.tax', 'read', [taxIds], { fields: ['id', 'name'] }) as { id: number; name: string }[]
+    : [];
+  const taxMap = new Map(taxes.map(t => [t.id, t.name]));
+
+  return visible.map(p => ({
+    id: p.id, ...parseProductLabel(p.display_name), unitPrice: p.list_price || 0,
+    unit: p.uom_id ? p.uom_id[1] : '',
+    taxLabel: (p.taxes_id || []).map(id => taxMap.get(id)).filter(Boolean).join(', ') || 'No Tax',
+  }));
 }
 
+export interface PIDraftLineDiscountInput {
+  discCalculation?: 'percentage' | 'fixed';
+  discount?: number;
+  fixedAmount?: number;
+}
+
+// Unit price always comes from Odoo's own product.list_price — never a
+// client-supplied value (see the "no manual price editing" rule this file
+// follows now). Admin controls quantity and the discount mode/value only.
 export async function addPIDraftLine(
-  leadId: number, soId: number, productId: number, quantity: number, unitPrice: number, authz: Authz, adminEmail: string,
+  leadId: number, soId: number, productId: number, quantity: number,
+  discountInput: PIDraftLineDiscountInput, authz: Authz, adminEmail: string,
 ): Promise<PIDraftInfo> {
   if (authz.role !== 'admin') throw new PIWorkflowError('Only an admin can edit a PI.');
   await assertCultFitLead(leadId);
@@ -1905,18 +2008,19 @@ export async function addPIDraftLine(
   if (so.state === 'cancel') throw new PIWorkflowError('This PI has been superseded and can no longer be edited.');
 
   const qty = requireValidQuantity(quantity);
-  const price = requireNonNegativePrice(unitPrice);
 
   // Never trust a client-supplied product id blindly — re-verify it's a
   // real, active, sellable, non-excluded/non-deprecated product before using
   // it in a line, same discipline as createPortalOrderRequest's catalog check.
   const products = await executeKw('product.product', 'read', [[Number(productId)]], {
-    fields: ['id', 'display_name', 'active', 'sale_ok', 'taxes_id', 'uom_id'],
-  }) as { id: number; display_name: string; active: boolean; sale_ok: boolean; taxes_id: number[]; uom_id: OdooTuple }[];
+    fields: ['id', 'display_name', 'active', 'sale_ok', 'list_price', 'taxes_id', 'uom_id'],
+  }) as { id: number; display_name: string; active: boolean; sale_ok: boolean; list_price: number; taxes_id: number[]; uom_id: OdooTuple }[];
   const product = products[0];
   if (!product || !product.active || !product.sale_ok || ADMIN_EDITOR_EXCLUDED_PRODUCT_IDS.has(product.id) || /not use/i.test(product.display_name)) {
     throw new PIWorkflowError('Selected product is not a valid, approved Odoo product.');
   }
+
+  const discFields = resolveDiscountFields(discountInput, (product.list_price || 0) * qty);
 
   const { code, name } = parseProductLabel(product.display_name);
   await executeKw('sale.order.line', 'create', [{
@@ -1924,7 +2028,8 @@ export async function addPIDraftLine(
     product_id: product.id,
     name: `[${code}] ${name}`,
     product_uom_qty: qty,
-    price_unit: price,
+    price_unit: product.list_price || 0,
+    ...discFields,
     tax_ids: [[6, 0, product.taxes_id || []]],
     product_uom_id: product.uom_id ? product.uom_id[0] : false,
   }]);
@@ -1969,11 +2074,14 @@ export async function removePIDraftLine(
   return buildDraftSOInfo(sos[0]);
 }
 
-export interface PIDraftLineUpdate {
+export interface PIDraftLineUpdate extends PIDraftLineDiscountInput {
   quantity?: number;
-  unitPrice?: number;
 }
 
+// Quantity and the discount mode/value are editable; unit price is never
+// accepted here — it stays whatever was resolved from Odoo's
+// product.list_price when the line was created, exactly like every other
+// read-only field on this line.
 export async function updatePIDraftLine(
   leadId: number, soId: number, lineId: number, updates: PIDraftLineUpdate, authz: Authz,
 ): Promise<PIDraftInfo> {
@@ -1988,7 +2096,15 @@ export async function updatePIDraftLine(
 
   const writeFields: Record<string, unknown> = {};
   if (updates.quantity !== undefined) writeFields.product_uom_qty = requireValidQuantity(updates.quantity);
-  if (updates.unitPrice !== undefined) writeFields.price_unit = requireNonNegativePrice(updates.unitPrice);
+  const touchesDiscount = updates.discCalculation !== undefined || updates.discount !== undefined || updates.fixedAmount !== undefined;
+  if (touchesDiscount) {
+    const qtyForBase = updates.quantity !== undefined ? Number(writeFields.product_uom_qty) : line.quantity;
+    Object.assign(writeFields, resolveDiscountFields({
+      discCalculation: updates.discCalculation ?? line.discCalculation,
+      discount: updates.discount ?? line.discount,
+      fixedAmount: updates.fixedAmount ?? line.fixedAmount,
+    }, line.unitPrice * qtyForBase));
+  }
   if (Object.keys(writeFields).length) {
     await executeKw('sale.order.line', 'write', [[line.id], writeFields]);
   }
@@ -3354,11 +3470,58 @@ export async function fetchCustomerLogisticsView(leadId: number, authz: Authz): 
   };
 }
 
+// Root cause of the "invoice download doesn't work" bug (found by checking
+// live production data, not guessed): this used to require a pre-existing
+// ir.attachment on the account.move record. Odoo only creates that
+// attachment if a staff member manually printed/emailed that specific
+// invoice from Odoo's own UI at some point — verified live that 0 of the 30
+// most recent real posted CultFit invoices have one. Every real download
+// was hitting the empty-attachment branch and 404ing.
+// Fixed the same way fetchNativeOdooPdf (above) already fixed the identical
+// problem for quotations: fetch Odoo's own native invoice report on demand
+// through its public customer-portal controller (part of stock Odoo's
+// `account`/`portal` modules — /my/invoices/<id>, sibling to /my/orders/<id>),
+// which validates via a per-invoice access_token instead of the backend
+// session login this portal's API account doesn't have. Verified live
+// (id 101660, INV/26-27/0467): returns a real 108,991-byte
+// application/pdf. account.move.access_token is the same lazily-generated
+// portal.mixin field sale.order.access_token already is — generated and
+// written here only when missing, exactly like fetchNativeOdooPdf does.
+async function fetchNativeOdooInvoicePdf(invoiceId: number): Promise<Buffer> {
+  const invs = await executeKw('account.move', 'read', [[invoiceId]], { fields: ['access_token'] }) as { access_token: string | false }[];
+  let token = invs[0]?.access_token || '';
+  if (!token) {
+    token = randomUUID();
+    await executeKw('account.move', 'write', [[invoiceId], { access_token: token }]);
+  }
+
+  const url = `${ODOO_URL}/my/invoices/${invoiceId}?report_type=pdf&access_token=${encodeURIComponent(token)}&download=true`;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), RPC_TIMEOUT_MS);
+  let resp: Response;
+  try {
+    resp = await fetch(url, { signal: controller.signal });
+  } catch (e) {
+    throw new OdooUnavailableError(e);
+  } finally {
+    clearTimeout(timeout);
+  }
+
+  const contentType = resp.headers.get('content-type') || '';
+  if (!resp.ok || !contentType.includes('application/pdf')) {
+    throw new PIWorkflowError('Could not generate the invoice PDF. Please try again later.');
+  }
+  return Buffer.from(await resp.arrayBuffer());
+}
+
 // Secure download for the customer — the invoice id comes only from the
 // server-resolved selection (never a client-supplied id), and is still
 // re-verified belongs to this lead's sale order(s) and the CultFit partner
-// before any bytes are read. Reuses the exact same ownership-check
-// discipline as fetchAttachmentData/fetchPIPdfData above.
+// before any bytes are read (fetchOrderInvoiceCandidates already filters to
+// move_type='out_invoice' + state='posted' + the CultFit commercial
+// partner — credit notes, drafts, and cancelled invoices never appear in
+// `candidates`, so they can never be selected/re-verified here). Same
+// ownership-check discipline as fetchAttachmentData/fetchPIPdfData above.
 export async function fetchInvoicePdfData(leadId: number, authz: Authz): Promise<{ data: Buffer; filename: string }> {
   const view = await fetchCustomerLogisticsView(leadId, authz);
   if (!view.invoice) throw new LeadNotFoundError();
@@ -3367,13 +3530,9 @@ export async function fetchInvoicePdfData(leadId: number, authz: Authz): Promise
   const candidates = await fetchOrderInvoiceCandidates(soIds, authz);
   if (!candidates.some(c => c.id === view.invoice!.id)) throw new LeadNotFoundError();
 
-  const atts = await executeKw('ir.attachment', 'search_read', [[
-    ['res_model', '=', 'account.move'], ['res_id', '=', view.invoice.id], ['mimetype', '=', 'application/pdf'],
-  ]], { fields: ['id', 'datas'], order: 'id desc', limit: 1 }) as { id: number; datas: string }[];
-  if (!atts.length || !atts[0].datas) throw new LeadNotFoundError();
-
+  const data = await fetchNativeOdooInvoicePdf(view.invoice.id);
   return {
-    data: Buffer.from(atts[0].datas, 'base64'),
+    data,
     filename: `Invoice-${view.invoice.name.replace(/[^A-Za-z0-9-]/g, '')}.pdf`,
   };
 }

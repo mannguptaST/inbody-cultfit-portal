@@ -26,7 +26,11 @@ export async function POST(
 
   try {
     const authz: Authz = { role: 'admin' };
-    const draft = await addPIDraftLine(requestId, soId, productId, body?.quantity, body?.unitPrice, authz, user.email);
+    const draft = await addPIDraftLine(requestId, soId, productId, body?.quantity, {
+      discCalculation: body?.discCalculation === 'fixed' ? 'fixed' : undefined,
+      discount: body?.discount,
+      fixedAmount: body?.fixedAmount,
+    }, authz, user.email);
     return NextResponse.json(draft, { status: 201 });
   } catch (e: unknown) {
     if (e instanceof LeadNotFoundError) return NextResponse.json({ detail: e.message }, { status: 404 });

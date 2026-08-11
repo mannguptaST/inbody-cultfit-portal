@@ -18,11 +18,9 @@ export async function POST(
   const requestId = parseInt(id, 10);
   if (isNaN(requestId)) return NextResponse.json({ detail: 'Invalid request ID' }, { status: 400 });
 
-  const body = await req.json().catch(() => null);
-
   try {
     const authz: Authz = { role: 'admin' };
-    const draft = await createPIRevision(requestId, body?.mainProductPrice, authz, user.email);
+    const draft = await createPIRevision(requestId, authz, user.email);
     return NextResponse.json(draft, { status: 201 });
   } catch (e: unknown) {
     if (e instanceof LeadNotFoundError) return NextResponse.json({ detail: e.message }, { status: 404 });

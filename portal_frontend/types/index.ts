@@ -183,6 +183,9 @@ export interface AdminProductOption {
   id: number;
   code: string;
   name: string;
+  unitPrice: number;
+  unit: string;
+  taxLabel: string;
 }
 
 export interface OpportunityDefaults {
@@ -202,10 +205,15 @@ export interface PIDraftLine {
   code: string;
   name: string;
   quantity: number;
+  unit: string;
   unitPrice: number;
+  discCalculation: 'percentage' | 'fixed';
+  fixedAmount: number;
+  discount: number;
   taxLabel: string;
   untaxedTotal: number;
   taxTotal: number;
+  lineTotal: number;
 }
 
 export interface PIDraftInfo {
