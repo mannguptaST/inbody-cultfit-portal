@@ -1648,7 +1648,19 @@ const SO_DRAFT_FIELDS = ['id', 'name', 'state', 'validity_date', 'order_line', '
 // pricing/tax math is reimplemented here.
 const SOL_DRAFT_FIELDS = ['id', 'product_id', 'product_uom_qty', 'product_uom_id', 'price_unit', 'discount', 'disc_calculation', 'fixed_amt', 'tax_ids', 'price_subtotal', 'price_tax', 'price_total'];
 
-async function buildDraftSOInfo(so: Record<string, unknown>): Promise<PIDraftInfo> {
+// The one deterministic way this app resolves "which line is the main
+// InBody product" — the exact product id the customer selected when
+// creating the request (crm.lead's own stored PortalRequestDetails,
+// decoded fresh here, not cached). Never inferred from price, discount, or
+// line order: now that included/bundle lines carry their own real Unit
+// Price too (see buildAndCreateSO), none of those signals distinguish
+// "main" from "included" any more.
+async function resolveMainProductId(leadId: number): Promise<number | null> {
+  const leads = await executeKw('crm.lead', 'read', [[leadId]], { fields: ['description'] }) as { description: unknown }[];
+  return decodeRequestDetails(leads[0]?.description)?.mainProduct.id ?? null;
+}
+
+async function buildDraftSOInfo(so: Record<string, unknown>, leadId: number): Promise<PIDraftInfo> {
   const lineIds = (so.order_line as number[]) || [];
   const lines = lineIds.length
     ? await executeKw('sale.order.line', 'read', [lineIds], { fields: SOL_DRAFT_FIELDS }) as Record<string, unknown>[]
@@ -1676,7 +1688,8 @@ async function buildDraftSOInfo(so: Record<string, unknown>): Promise<PIDraftInf
       lineTotal: (l.price_total as number) || 0,
     };
   });
-  const mainLine = builtLines.find(l => l.unitPrice > 0) ?? builtLines[0] ?? null;
+  const mainProductId = await resolveMainProductId(leadId);
+  const mainLine = (mainProductId != null ? builtLines.find(l => l.productId === mainProductId) : undefined) ?? builtLines[0] ?? null;
 
   return {
     id: so.id as number, name: so.name as string, state: so.state as string,
@@ -1701,7 +1714,7 @@ async function findActiveDraftSO(leadId: number): Promise<PIDraftInfo | null> {
 
   const sos = await executeKw('sale.order', 'read', [soIds], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
   const active = sos.filter(s => s.state !== 'cancel').sort((a, b) => (b.id as number) - (a.id as number))[0];
-  return active ? buildDraftSOInfo(active) : null;
+  return active ? buildDraftSOInfo(active, leadId) : null;
 }
 
 // Verifies a specific sale.order id genuinely belongs to this lead (via
@@ -1714,7 +1727,7 @@ async function verifySOBelongsToLead(leadId: number, soId: number): Promise<PIDr
   if (!(leads[0]?.order_ids || []).includes(soId)) throw new LeadNotFoundError();
   const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
   if (!sos.length) throw new LeadNotFoundError();
-  return buildDraftSOInfo(sos[0]);
+  return buildDraftSOInfo(sos[0], leadId);
 }
 
 const COMPANY_ID = 1; // "InBody India Private Limited" — verified live: every historical CultFit sale.order uses this company (this Odoo instance has a second, unrelated company, id 2)
@@ -1731,6 +1744,115 @@ function assertOdooPriceIsUsable(v: unknown, productLabel: string): number {
     throw new PIWorkflowError(`${productLabel} has no valid Sales Price set in Odoo — set one in Odoo before creating a PI.`);
   }
   return n;
+}
+
+// ──── Product-based Terms & Conditions (CultFit quotations) ───────────────
+// Odoo's native quotation report renders sale.order.note (HTML) directly —
+// both companies here have terms_type='plain' (confirmed live), which is
+// what makes Odoo inline the note's HTML into the PDF rather than linking
+// out to a web page. So writing the right text into `note` is the entire
+// mechanism: no custom PDF, no new Odoo model/field.
+//
+// A pre-existing base.automation ("Terms and Conditions(quotation)", id 92,
+// confirmed live) writes a generic, non-product-specific hardcoded block
+// into `note` on sale.order creation, but only for 4 specific CS-team users
+// and only if `note` doesn't already contain the literal substring
+// "Terms and Conditions". It is NOT touched by this code (other flows may
+// depend on it) — instead recalculateOrderTerms below is always called as
+// an explicit follow-up write() *after* create(), which runs after any
+// on_create automation and therefore always wins, regardless of which
+// salesperson triggered it or that automation's string-matching guard.
+//
+// Main-machine detection: every real InBody machine model has its own
+// dedicated product category "InBody / IBD_<Model>" (verified live —
+// InBody120/260S/etc. each have exactly 1-2 SKUs in their own category).
+// Every accessory lives in a different category entirely (Stand120 ->
+// IBD_Assy, a 46-product shared parts bucket; LookinBody -> Software/*;
+// printer -> Common/*) — matching on this existing category structure, not
+// on fragile product name/id/display-text matching.
+interface MachineTermsTemplate {
+  warrantyPeriod: string; // exact wording inserted into clause 3, e.g. "1 year", "5 years"
+}
+
+// Keyed by the product category's own short name (categ_id's display text
+// is "InBody / IBD_<Model>"; only the "IBD_<Model>" part is matched/keyed
+// here). Add one entry per machine model as its T&C is confirmed with the
+// business — detection logic above never needs to change for a new model.
+const MACHINE_TERMS_TEMPLATES: Record<string, MachineTermsTemplate> = {
+  IBD_InBody120: { warrantyPeriod: '1 year' },
+  IBD_InBody260S: { warrantyPeriod: '5 years' },
+};
+
+function machineCategoryKey(categoryDisplayName: string | undefined): string | null {
+  if (!categoryDisplayName) return null;
+  const m = categoryDisplayName.match(/IBD_InBody\S*/);
+  return m ? m[0] : null;
+}
+
+// Odoo's validity_date is stored/read as ISO (YYYY-MM-DD); the reference
+// quotations (and every human-typed one seen live) write it as DD-MM-YYYY.
+function fmtValidityDateForTerms(isoDate: string): string {
+  const [y, m, d] = isoDate.split('-');
+  return `${d}-${m}-${y}`;
+}
+
+// Matches the exact structure/wording confirmed live on reference
+// quotations S00984 (InBody 120) and S00852 (InBody 260S) — only the
+// warranty clause and the validity date vary by product/order. The bank
+// details block is identical to what sales staff have always typed
+// manually (confirmed live — it is not generated by any Odoo mechanism),
+// kept verbatim per the "keep the existing bank details" requirement.
+function buildTermsHtml(warrantyPeriod: string, validityDateIso: string): string {
+  const validity = fmtValidityDateForTerms(validityDateIso);
+  return (
+    '<div data-oe-version="2.0">Terms &amp; Conditions</div>'
+    + '<div>1. PRICES: The prices are firm, inclusive of air freight, insurance charges, customs duty, custom clearance expenses, secondary freight &amp; insurance charges, from Mumbai to any major port in India. </div>'
+    + '<div>2. PAYMENT TERMS: 100% payment along with the order.</div>'
+    + `<div>3. WARRANTY: ${escapeHtml(warrantyPeriod)} from the date of delivery/installation. </div>`
+    + '<div>4. DELIVERY PERIOD: Ex-stock or four weeks from the date of receipt of the confirmed order.</div>'
+    + `<div>5. VALIDITY: The prices will remain valid till ${validity}.<br><br></div>`
+    + '<div><br>InBody India Bank Details [FOR BANK TRANSFER]</div>'
+    + '<div>Name: INBODY INDIA PVT. LTD.</div>'
+    + '<div>Account No.:196205000495</div>'
+    + '<div>Bank Name: ICICI Bank Limited</div>'
+    + '<div>Branch: Kurla (West)</div>'
+    + '<div>IFSC: ICIC0001962</div>'
+    + '<div>Account Type: Current Account</div>'
+    + '<div>Currency: Indian Rupees</div>'
+  );
+}
+
+// Re-derives the applicable T&C from the SO's CURRENT lines every time a
+// line is added/removed or the SO is (re)created — cheap (a handful of
+// lines per PI) and stays correct no matter how the machine line got there
+// or was swapped, rather than special-casing every call site individually.
+// Deliberately never blanks an existing note when no templated machine line
+// is found (all machine lines removed, or a not-yet-templated model) — only
+// ever writes when a confident single match exists, per "do not guess
+// silently" — an untemplated machine simply keeps whatever note it had.
+async function recalculateOrderTerms(soId: number): Promise<void> {
+  const sos = await executeKw('sale.order', 'read', [[soId]], { fields: ['order_line', 'validity_date'] }) as { order_line: number[]; validity_date: string | false }[];
+  const so = sos[0];
+  if (!so || !so.order_line?.length || !so.validity_date) return;
+
+  const lines = await executeKw('sale.order.line', 'read', [so.order_line], { fields: ['product_id', 'sequence'] }) as { product_id: OdooTuple; sequence: number }[];
+  const productIds = [...new Set(lines.map(l => l.product_id && l.product_id[0]).filter((id): id is number => !!id))];
+  if (!productIds.length) return;
+
+  const products = await executeKw('product.product', 'read', [productIds], { fields: ['id', 'categ_id'] }) as { id: number; categ_id: OdooTuple }[];
+  const categNameByProduct = new Map(products.map(p => [p.id, p.categ_id ? p.categ_id[1] : undefined]));
+
+  const machineLine = lines
+    .slice()
+    .sort((a, b) => a.sequence - b.sequence)
+    .find(l => l.product_id && machineCategoryKey(categNameByProduct.get(l.product_id[0])));
+  if (!machineLine || !machineLine.product_id) return;
+
+  const key = machineCategoryKey(categNameByProduct.get(machineLine.product_id[0]));
+  const template = key ? MACHINE_TERMS_TEMPLATES[key] : undefined;
+  if (!template) return;
+
+  await executeKw('sale.order', 'write', [[soId], { note: buildTermsHtml(template.warrantyPeriod, so.validity_date) }]);
 }
 
 // Shared by createDraftPI and createPIRevision — builds order_line commands
@@ -1777,26 +1899,30 @@ async function buildAndCreateSO(
   const products = await executeKw('product.product', 'read', [productIds], { fields: ['id', 'list_price', 'taxes_id', 'uom_id'] }) as { id: number; list_price: number; taxes_id: number[]; uom_id: OdooTuple }[];
   const productMap = new Map(products.map(p => [p.id, p]));
 
-  const mainProduct = productMap.get(details.mainProduct.id);
-  if (!mainProduct) throw new PIWorkflowError(`Product [${details.mainProduct.code}] ${details.mainProduct.name} could not be found in Odoo — cannot build this PI.`);
-  const price = assertOdooPriceIsUsable(mainProduct.list_price, `[${details.mainProduct.code}] ${details.mainProduct.name}`);
-
-  function lineCommand(id: number, code: string, name: string, unitPrice: number, includedLabel: boolean) {
+  // Every line — the main product AND every included/free accessory —
+  // always uses Odoo's own product.list_price as price_unit. An included
+  // product is marked free via Odoo's native 100% discount, never by
+  // zeroing price_unit: that would hide the real Sales Price the native
+  // quotation PDF is supposed to show (see verification report, bundle
+  // pricing fix).
+  function lineCommand(id: number, code: string, name: string, discount: number, includedLabel: boolean) {
     const p = productMap.get(id);
     if (!p) throw new PIWorkflowError(`Product [${code}] ${name} could not be found in Odoo — cannot build this PI.`);
+    const unitPrice = assertOdooPriceIsUsable(p.list_price, `[${code}] ${name}`);
     return [0, 0, {
       product_id: id,
       name: includedLabel ? `[${code}] ${name} (included)` : `[${code}] ${name}`,
       product_uom_qty: quantity,
       price_unit: unitPrice,
+      discount,
       tax_ids: [[6, 0, p.taxes_id || []]],
       product_uom_id: p.uom_id ? p.uom_id[0] : false,
     }];
   }
 
   const orderLines = [
-    lineCommand(details.mainProduct.id, details.mainProduct.code, details.mainProduct.name, price, false),
-    ...details.includedProducts.map(incl => lineCommand(incl.id, incl.code, incl.name, 0, true)),
+    lineCommand(details.mainProduct.id, details.mainProduct.code, details.mainProduct.name, 0, false),
+    ...details.includedProducts.map(incl => lineCommand(incl.id, incl.code, incl.name, 100, true)),
   ];
 
   const partnerId = resolveCultFitPartnerId(authz);
@@ -1819,6 +1945,16 @@ async function buildAndCreateSO(
     ...classificationFields,
   }]) as number;
 
+  // Explicit follow-up write, after create() — see recalculateOrderTerms'
+  // comment for why this must happen as a separate write rather than a
+  // field passed into create() above (defeats the pre-existing on_create
+  // automation regardless of which salesperson triggered it).
+  try {
+    await recalculateOrderTerms(soId);
+  } catch (e) {
+    console.error('[pi] failed to apply product-based terms for lead', leadId, e instanceof Error ? e.message : e);
+  }
+
   try {
     await executeKw('crm.lead', 'message_post', [[leadId]], {
       body: `<p><b>PORTAL_PI_DRAFT_CREATED</b>: draft PI created by ${escapeHtml(adminEmail)}.</p>`,
@@ -1829,7 +1965,7 @@ async function buildAndCreateSO(
   }
 
   const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
-  return buildDraftSOInfo(sos[0]);
+  return buildDraftSOInfo(sos[0], leadId);
 }
 
 export async function createDraftPI(
@@ -1892,7 +2028,7 @@ export async function updatePIDraft(
   }
 
   const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
-  return buildDraftSOInfo(sos[0]);
+  return buildDraftSOInfo(sos[0], leadId);
 }
 
 // ──── Admin PI product editor ──────────────────────────────────────────────
@@ -2038,6 +2174,15 @@ export async function addPIDraftLine(
     product_uom_id: product.uom_id ? product.uom_id[0] : false,
   }]);
 
+  // Re-derive from ALL current lines, not just the one just added — a newly
+  // added machine may now be the applicable one, or may simply be an
+  // accessory that leaves the existing machine/terms untouched either way.
+  try {
+    await recalculateOrderTerms(soId);
+  } catch (e) {
+    console.error('[pi] failed to recalculate product-based terms for lead', leadId, e instanceof Error ? e.message : e);
+  }
+
   try {
     await executeKw('crm.lead', 'message_post', [[leadId]], {
       body: `<p><b>PORTAL_PI_LINE_ADDED</b>: [${escapeHtml(code)}] ${escapeHtml(name)} × ${qty} added by ${escapeHtml(adminEmail)}.</p>`,
@@ -2048,7 +2193,7 @@ export async function addPIDraftLine(
   }
 
   const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
-  return buildDraftSOInfo(sos[0]);
+  return buildDraftSOInfo(sos[0], leadId);
 }
 
 export async function removePIDraftLine(
@@ -2065,6 +2210,17 @@ export async function removePIDraftLine(
   if (so.lines.length <= 1) throw new PIWorkflowError('A PI must have at least one line item.');
 
   await executeKw('sale.order.line', 'unlink', [[line.id]]);
+
+  // If the removed line was the machine the current terms were based on, a
+  // different remaining machine line (if any) now becomes applicable. If no
+  // machine line remains at all, recalculateOrderTerms leaves the existing
+  // note untouched rather than blanking it — see its own comment.
+  try {
+    await recalculateOrderTerms(soId);
+  } catch (e) {
+    console.error('[pi] failed to recalculate product-based terms for lead', leadId, e instanceof Error ? e.message : e);
+  }
+
   try {
     await executeKw('crm.lead', 'message_post', [[leadId]], {
       body: `<p><b>PORTAL_PI_LINE_REMOVED</b>: [${escapeHtml(line.code)}] ${escapeHtml(line.name)} removed by ${escapeHtml(adminEmail)}.</p>`,
@@ -2075,7 +2231,7 @@ export async function removePIDraftLine(
   }
 
   const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
-  return buildDraftSOInfo(sos[0]);
+  return buildDraftSOInfo(sos[0], leadId);
 }
 
 export interface PIDraftLineUpdate extends PIDraftLineDiscountInput {
@@ -2114,7 +2270,7 @@ export async function updatePIDraftLine(
   }
 
   const sos = await executeKw('sale.order', 'read', [[soId]], { fields: SO_DRAFT_FIELDS }) as Record<string, unknown>[];
-  return buildDraftSOInfo(sos[0]);
+  return buildDraftSOInfo(sos[0], leadId);
 }
 
 interface PISnapshotLineItem {
@@ -2259,7 +2415,9 @@ export async function publishPI(leadId: number, soId: number, authz: Authz, admi
   const userVal = lead.user_id as OdooTuple;
   if (!userVal) throw new PIWorkflowError('Assign a salesperson before publishing.');
 
-  const mainLine = so.lines.find(l => l.unitPrice > 0);
+  // Same deterministic id-based rule as buildDraftSOInfo's resolveMainProductId
+  // — details is already decoded above, so no extra lookup is needed here.
+  const mainLine = so.lines.find(l => l.productId === details.mainProduct.id);
   if (!mainLine) throw new PIWorkflowError('Set the main product price before publishing.');
   if (!so.validityDate) throw new PIWorkflowError('Set a validity date before publishing.');
 
