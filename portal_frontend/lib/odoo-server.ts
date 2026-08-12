@@ -927,15 +927,19 @@ function resolveCultFitPartnerId(authz: Authz): number {
 
 let _newStageId: number | null = null;
 
-// The CRM pipeline's actual "New" stage (crm.stage), not the deal_status_id
+// The CRM pipeline's actual entry stage (crm.stage), not the deal_status_id
 // used elsewhere in this file for the order-fulfillment portal_stage. A
 // freshly submitted request is a raw opportunity that hasn't entered the
-// order-fulfillment flow yet — verified live: crm.stage id 1 is named
-// exactly "New", sequence 0 (the pipeline's own entry stage).
+// order-fulfillment flow yet. Resolved by lowest `sequence` rather than by
+// name — the stage used to be literally named "New" (id 1), but InBody's
+// Odoo team deleted/renumbered the whole pipeline in production
+// (found 2026-08-12), which broke a hardcoded name lookup and silently took
+// down new-request submission entirely. Sequence-based lookup self-heals if
+// stages get relabeled again.
 async function resolveNewStageId(): Promise<number> {
   if (_newStageId) return _newStageId;
-  const stages = await executeKw('crm.stage', 'search_read', [[['name', '=', 'New']]], { fields: ['id'], limit: 1 }) as { id: number }[];
-  if (!stages.length) throw new Error("Could not resolve the 'New' CRM stage in Odoo.");
+  const stages = await executeKw('crm.stage', 'search_read', [[]], { fields: ['id'], order: 'sequence asc', limit: 1 }) as { id: number }[];
+  if (!stages.length) throw new Error('Could not resolve the CRM pipeline entry stage in Odoo.');
   _newStageId = stages[0].id;
   return _newStageId;
 }
