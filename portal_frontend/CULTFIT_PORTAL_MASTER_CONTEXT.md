@@ -5,9 +5,12 @@ in-progress order-request workflow. Read this before making changes — it
 exists so a future session (human or AI) doesn't have to re-derive any of
 this from scratch. No secret values appear anywhere in this document.
 
-Last updated: 2026-08-03, alongside the CultFit Opportunity defaults /
-Territory detection / native PI PDF / admin product-editor build
-(`feature/cultfit-defaults-region-pi-products`) described in §11a.
+Last updated: 2026-08-13, alongside the product-based Terms & Conditions
+automation and the bundle-pricing fix described in §11b, and the
+production handover pass documented in `CULTFIT_PORTAL_HANDOVER.md`. The
+2026-08-03 update (CultFit Opportunity defaults / Territory detection /
+native PI PDF / admin product-editor, `feature/cultfit-defaults-region-pi-products`)
+is described in §11a.
 
 ---
 
@@ -880,6 +883,59 @@ matrix.
 
 ---
 
+## 11b. Product-based Terms & Conditions + bundle-pricing fix (2026-08-12/13)
+
+Two related changes, both in `lib/odoo-server.ts`, branched from `main`
+after §11a was merged/deployed, released together as
+`cultfit-bundle-pricing-terms-production`.
+
+**Terms & Conditions automation.** Odoo's native quotation report renders
+`sale.order.note` (HTML) directly — both companies in this instance have
+`terms_type='plain'` — so writing the right text into `note` is the entire
+mechanism, no custom PDF/model/field. `recalculateOrderTerms()` runs as an
+explicit follow-up `write()` after every line add/remove/create (always
+*after* `create()`, so it wins over the one pre-existing generic
+`base.automation` that also touches `note`, regardless of which
+salesperson triggered it). Main-machine detection for T&C purposes uses
+the product's own Odoo **category** (`InBody / IBD_<Model>` — every real
+InBody machine has a dedicated category, every accessory lives elsewhere),
+never price/discount/name — a structural signal, deliberately independent
+of the pricing bug below. `MACHINE_TERMS_TEMPLATES` currently covers
+InBody 120 (1-year warranty) and InBody 260/260S (5-year warranty); any
+other main product simply keeps whatever note it already had (never
+silently guesses a warranty for an untemplated model).
+
+**Bundle-pricing fix.** `buildAndCreateSO()` (the function behind "Create
+Draft PI"/"Create Revision") previously hardcoded `price_unit: 0` for
+every automatically-included bundle product (Stand 120, LookinBody120, HP
+1008A, LB WEB) with no discount set — a bug dating to the original Phase 2
+build, never touched by §11a's admin-product-editor work (that work fixed
+the *manual* add/edit-line path only). Fixed so every line — main product
+and every included accessory alike — always reads its Unit Price fresh
+from Odoo's own `product.list_price` and marks a free item via Odoo's
+native 100% discount instead of a faked ₹0 price. A second, coupled bug:
+"which line is the main product" was inferred by `lines.find(l =>
+l.unitPrice > 0)` — which only worked *because* included lines were
+wrongly zeroed. Replaced with a deterministic id match against the
+request's own stored `mainProduct.id` (`resolveMainProductId()`,
+`buildDraftSOInfo`/`publishPI`) — the one place this app now resolves
+"Sale Order → Main InBody Product."
+
+**Controlled-test discipline followed:** verified locally against
+production Odoo (read-only queries confirmed the historical bug in real
+quotations S01304/S01305), fixed, then a full create→publish→PDF→cleanup
+cycle for both InBody 120 and InBody 260S was run twice — once via a
+Preview deployment (its own URL, same production Odoo), once more via
+direct Production smoke-testing after merge — every test lead archived
+and every test quotation cancelled afterward. Native Odoo PDF text
+extracted and diffed against the expected layout (Unit Price / Disc.% /
+Amount columns, correct GST, correct warranty clause) for both products on
+both passes. See `CULTFIT_PORTAL_HANDOVER.md` §12–13 for the
+handover-level summary and §23 for the one related known limitation
+(Fixed Amount discount mode's PDF display).
+
+---
+
 **Phase 6 — Per-user accounts:** Replace the single shared
 `cultfit@curefit.com` login with per-individual CultFit accounts,
 location-based permissions, cross-device portal notifications with unread
@@ -1043,3 +1099,13 @@ devices for the shared login) until Phase 6.
   smoke tests (health, all 4 role logins, list/detail views, product
   search, existing-PI download, role-boundary rejections, invalid-id
   handling). Tagged `cultfit-defaults-region-native-pi-production`.
+- §11b (T&C automation + bundle-pricing fix) work happened on
+  `release/cultfit-terms-bundle-pricing` (branched from `main` after §11a
+  was merged/deployed). Same controlled-test discipline: tested on a
+  Preview deployment first (two clearly-labeled TEST Opportunities,
+  InBody 120 and InBody 260S, full create→publish→PDF cycle, cancelled/
+  archived afterward), merged to `main` and deployed to Production only
+  after Preview passed, then re-verified via read-only Production smoke
+  tests. Tagged `cultfit-bundle-pricing-terms-production`, then bundled
+  into the `cultfit-portal-v1.0-production` final-handover tag (see
+  `CULTFIT_PORTAL_HANDOVER.md`).

@@ -2,6 +2,8 @@
 
 Last updated: 2026-07-14, as part of a security hardening pass covering customer data isolation, auth, and stage-update integrity. No secrets are included in this file.
 
+**2026-08-13 note:** §3 below ("exactly two accounts") predates the `logistics` and `cs` roles added in Phase 4/5 — see `CULTFIT_PORTAL_MASTER_CONTEXT.md` §2 for the current, accurate 4-role table, and `CULTFIT_PORTAL_HANDOVER.md` §5 for the handover-level summary. The rest of this file's architecture/auth-flow/CSRF-hardening content is still accurate and current as of the `cultfit-bundle-pricing-terms-production` release.
+
 ---
 
 ## 1. Architecture
@@ -34,12 +36,14 @@ Next.js pages (app/**), gated server-side by proxy.ts
 
 ## 3. Admin vs. customer permission rules
 
-There are exactly two accounts, defined in `lib/auth-server.ts` → `PORTAL_USERS`:
+**Updated 2026-08-13:** there are now four roles/accounts, defined in `lib/auth-server.ts` → `PORTAL_USERS` — `logistics` and `cs` were added in Phase 4/5 after this section was originally written. See `CULTFIT_PORTAL_MASTER_CONTEXT.md` §2 for the full current table; the two rows below (admin/customer) remain accurate as written, they're just no longer the complete list:
 
 | Role | Email | Data access |
 |---|---|---|
 | `admin` | admin@inbody.com | All CultFit/Curefit orders (same domain as below), plus stage-write endpoints |
 | `customer` | cultfit@curefit.com | CultFit/Curefit orders only, via `scope: { kind: 'cultfit_domain' }` |
+| `logistics` | `PORTAL_LOGISTICS_EMAIL` (optional, fails closed) | Same CultFit domain as admin for reads; invoice-select + dispatch writes only |
+| `cs` | `PORTAL_CS_EMAIL` (optional, fails closed) | Same CultFit domain as admin for reads; installation writes only |
 
 **Every** CultFit read (list and single-order) and **every** admin write resolves its Odoo domain through `authzDomain()` / `assertCultFitLead()` in `lib/odoo-server.ts` — there is no code path that skips this, including for admin. Two structural guarantees:
 
