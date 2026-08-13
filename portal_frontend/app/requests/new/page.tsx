@@ -10,19 +10,19 @@ import type { CultFitProductOption } from '@/types';
 // Contact details (name/phone/email) are deliberately NOT collected here —
 // the CultFit customer/contact already exists in Odoo, resolved server-side
 // on submit. See CULTFIT_PORTAL_MASTER_CONTEXT.md §9.
+// Delivery Address / Preferred Delivery Date are also deliberately NOT
+// collected here (removed) — that information comes from the customer's PO
+// during Phase 3 review instead, so it's never asked for twice.
 interface FormState {
   requestName: string;
   cocoFofo: '' | 'COCO' | 'FOFO';
   mainProductId: string;
   quantity: string;
-  deliveryAddress: string;
-  preferredDeliveryDate: string;
   notes: string;
 }
 
 const EMPTY_FORM: FormState = {
-  requestName: '', cocoFofo: '', mainProductId: '', quantity: '1',
-  deliveryAddress: '', preferredDeliveryDate: '', notes: '',
+  requestName: '', cocoFofo: '', mainProductId: '', quantity: '1', notes: '',
 };
 
 export default function NewOrderRequestPage() {
@@ -87,8 +87,6 @@ export default function NewOrderRequestPage() {
         cocoFofo: form.cocoFofo as 'COCO' | 'FOFO',
         mainProductId: Number(form.mainProductId),
         quantity: Number(form.quantity),
-        deliveryAddress: form.deliveryAddress.trim(),
-        preferredDeliveryDate: form.preferredDeliveryDate || undefined,
         notes: form.notes.trim() || undefined,
       });
       router.push(`/requests/${result.id}`);
@@ -194,30 +192,6 @@ export default function NewOrderRequestPage() {
             {bundleNote && (
               <p className="text-xs text-blue-700 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 mt-2">{bundleNote}</p>
             )}
-          </div>
-
-          <div>
-            <label className="text-xs font-medium text-slate-600 block mb-1">
-              Delivery Address
-            </label>
-            <textarea
-              rows={2}
-              value={form.deliveryAddress}
-              onChange={e => set('deliveryAddress', e.target.value)}
-              maxLength={300}
-              className={inputCls(!!fieldErrors.deliveryAddress) + ' resize-none'}
-            />
-            {fieldErrors.deliveryAddress && <p className="text-xs text-red-600 mt-1">{fieldErrors.deliveryAddress}</p>}
-          </div>
-
-          <div>
-            <label className="text-xs font-medium text-slate-600 block mb-1">Preferred Delivery Date</label>
-            <input
-              type="date"
-              value={form.preferredDeliveryDate}
-              onChange={e => set('preferredDeliveryDate', e.target.value)}
-              className={inputCls(false) + ' sm:w-1/2'}
-            />
           </div>
 
           <div>
