@@ -785,8 +785,6 @@ export interface PortalRequestDetails {
   mainProduct: PortalRequestProduct;
   quantity: number;
   includedProducts: PortalRequestProduct[];
-  deliveryAddress: string;
-  preferredDeliveryDate: string | null;
   notes: string;
   portalAccount: string;
   submittedDate: string;
@@ -815,6 +813,13 @@ export interface PortalRequestDetails {
   contactName?: string;
   contactPhone?: string;
   contactEmail?: string | null;
+  // Legacy — only present on records created before the New Request form
+  // stopped collecting these (2026-08). Delivery/expected-delivery info now
+  // comes from the customer's PO during Phase 3 review instead, so it's
+  // never asked for twice. New records never set these; kept only so
+  // decodeRequestDetails and the UI can still render old records safely.
+  deliveryAddress?: string;
+  preferredDeliveryDate?: string | null;
 }
 
 function encodeRequestDetails(details: PortalRequestDetails): string {
@@ -1207,7 +1212,7 @@ function normalizeForCompare(s: string): string {
 // CultFit partner (never cross-customer), same marker, and an exact
 // normalized match on the fields that define "the same request".
 async function findRecentDuplicateRequest(
-  partnerId: number, requestName: string, mainProductId: number, quantity: number, deliveryAddress: string,
+  partnerId: number, requestName: string, mainProductId: number, quantity: number,
 ): Promise<boolean> {
   const sinceIso = new Date(Date.now() - DUPLICATE_WINDOW_MS).toISOString().replace('T', ' ').slice(0, 19);
   const domain = [
@@ -1218,14 +1223,12 @@ async function findRecentDuplicateRequest(
   const leads = await executeKw('crm.lead', 'search_read', [domain], { fields: ['description'] }) as Record<string, unknown>[];
 
   const normName = normalizeForCompare(requestName);
-  const normAddr = normalizeForCompare(deliveryAddress);
   return leads.some(l => {
     const details = decodeRequestDetails(l.description);
     if (!details) return false;
     return normalizeForCompare(details.requestName) === normName
       && details.mainProduct.id === mainProductId
-      && details.quantity === quantity
-      && normalizeForCompare(details.deliveryAddress) === normAddr;
+      && details.quantity === quantity;
   });
 }
 
@@ -1234,12 +1237,10 @@ export interface NewOrderRequestInput {
   cocoFofo: unknown;
   mainProductId: unknown;
   quantity: unknown;
-  deliveryAddress: unknown;
-  preferredDeliveryDate: unknown;
   notes: unknown;
 }
 
-const MAX_LEN = { requestName: 120, deliveryAddress: 300, notes: 1000 };
+const MAX_LEN = { requestName: 120, notes: 1000 };
 
 function requiredText(v: unknown, field: string, max: number): string {
   if (typeof v !== 'string' || !v.trim()) throw new InvalidRequestError(`${field} is required.`);
@@ -1261,18 +1262,6 @@ export async function createPortalOrderRequest(
 
   const requestName = requiredText(input.requestName, 'Request/location name', MAX_LEN.requestName);
 
-  // Optional, not required — billing/shipping addresses are captured
-  // authoritatively later, at PO submission (PortalPoData.billingAddress/
-  // shippingAddress), so this is just an early hint for admin, same
-  // optionality as notes.
-  let deliveryAddress = '';
-  if (typeof input.deliveryAddress === 'string' && input.deliveryAddress.trim()) {
-    deliveryAddress = input.deliveryAddress.trim();
-    if (deliveryAddress.length > MAX_LEN.deliveryAddress) {
-      throw new InvalidRequestError(`Delivery address must be ${MAX_LEN.deliveryAddress} characters or fewer.`);
-    }
-  }
-
   if (input.cocoFofo !== 'COCO' && input.cocoFofo !== 'FOFO') {
     throw new InvalidRequestError('COCO/FOFO must be COCO or FOFO.');
   }
@@ -1281,13 +1270,6 @@ export async function createPortalOrderRequest(
   const quantity = Number(input.quantity);
   if (!Number.isInteger(quantity) || quantity < 1 || quantity > 999) {
     throw new InvalidRequestError('Quantity must be a whole number between 1 and 999.');
-  }
-
-  let preferredDeliveryDate: string | null = null;
-  if (typeof input.preferredDeliveryDate === 'string' && input.preferredDeliveryDate.trim()) {
-    const d = input.preferredDeliveryDate.trim();
-    if (!/^\d{4}-\d{2}-\d{2}$/.test(d)) throw new InvalidRequestError('Preferred delivery date must be a valid date.');
-    preferredDeliveryDate = d;
   }
 
   let notes = '';
@@ -1325,7 +1307,7 @@ export async function createPortalOrderRequest(
     ? await resolveTerritoryIdForState(regionMatch.state)
     : null;
 
-  if (await findRecentDuplicateRequest(partnerId, requestName, mainProduct.id, quantity, deliveryAddress)) {
+  if (await findRecentDuplicateRequest(partnerId, requestName, mainProduct.id, quantity)) {
     throw new DuplicateRequestError();
   }
 
@@ -1335,8 +1317,6 @@ export async function createPortalOrderRequest(
     mainProduct: { id: mainProduct.id, code: mainProduct.code, name: mainProduct.name },
     quantity,
     includedProducts,
-    deliveryAddress,
-    preferredDeliveryDate,
     notes,
     portalAccount: portalAccountEmail,
     submittedDate: new Date().toISOString().slice(0, 10),
@@ -2445,8 +2425,12 @@ export async function publishPI(leadId: number, soId: number, authz: Authz, admi
     version, quotationId: soId, quotationNumber: so.name,
     publishedDate, publishedBy: adminEmail, attachmentId,
     requestReference: `REQ-${leadId}`, cultfitCompanyName: companyName,
-    deliveryAddress: details.deliveryAddress, cocoFofo: details.cocoFofo,
-    preferredDeliveryDate: details.preferredDeliveryDate, salespersonName: userVal[1],
+    // details.deliveryAddress/preferredDeliveryDate are legacy-only fields
+    // (see PortalRequestDetails) — never set on requests created after the
+    // New Request form stopped collecting them; fall back to empty/null so
+    // this snapshot's own (still-required) shape is unaffected either way.
+    deliveryAddress: details.deliveryAddress ?? '', cocoFofo: details.cocoFofo,
+    preferredDeliveryDate: details.preferredDeliveryDate ?? null, salespersonName: userVal[1],
     lineItems: so.lines.map(l => ({
       code: l.code, name: l.name, quantity: l.quantity, unitPrice: l.unitPrice,
       taxLabel: l.taxLabel, taxTotal: l.taxTotal, untaxedTotal: l.untaxedTotal,

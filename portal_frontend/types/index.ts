@@ -109,8 +109,6 @@ export interface PortalRequestDetails {
   mainProduct: PortalRequestProduct;
   quantity: number;
   includedProducts: PortalRequestProduct[];
-  deliveryAddress: string;
-  preferredDeliveryDate: string | null;
   notes: string;
   portalAccount: string;
   submittedDate: string;
@@ -131,6 +129,13 @@ export interface PortalRequestDetails {
   contactName?: string;
   contactPhone?: string;
   contactEmail?: string | null;
+  // Legacy — only present on records created before the New Request form
+  // stopped collecting these (2026-08). Delivery/expected-delivery info now
+  // comes from the customer's PO during Phase 3 review instead, so it's
+  // never asked for twice. New records never set these; kept so old records
+  // still decode/render safely.
+  deliveryAddress?: string;
+  preferredDeliveryDate?: string | null;
 }
 
 export interface PortalRequestSummary {
@@ -160,8 +165,6 @@ export interface NewOrderRequestPayload {
   cocoFofo: 'COCO' | 'FOFO';
   mainProductId: number;
   quantity: number;
-  deliveryAddress: string;
-  preferredDeliveryDate?: string;
   notes?: string;
 }
 

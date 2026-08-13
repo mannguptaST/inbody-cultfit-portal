@@ -50,8 +50,6 @@ export async function POST(req: NextRequest) {
         cocoFofo: body.cocoFofo,
         mainProductId: body.mainProductId,
         quantity: body.quantity,
-        deliveryAddress: body.deliveryAddress,
-        preferredDeliveryDate: body.preferredDeliveryDate,
         notes: body.notes,
       },
       authz,
