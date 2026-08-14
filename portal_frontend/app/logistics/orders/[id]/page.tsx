@@ -2,12 +2,13 @@
 
 import { useEffect, useState, useCallback } from 'react';
 import { useRouter, useParams } from 'next/navigation';
-import { getLogisticsOrderDetail, selectLogisticsInvoice, updateLogisticsDispatch } from '@/lib/api';
+import { getLogisticsOrderDetail, selectLogisticsInvoice } from '@/lib/api';
 import { fetchCurrentUser, logout } from '@/lib/auth';
 import { DELIVERY_STATUS_LABELS, DELIVERY_STATUS_VARIANT, PO_STATUS_LABELS, PO_STATUS_VARIANT } from '@/lib/stage-config';
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
-import type { LogisticsOrderDetail, DeliveryStatus, User } from '@/types';
+import DeliveryTrackingSection from '@/components/DeliveryTrackingSection';
+import type { LogisticsOrderDetail, User } from '@/types';
 
 function fmtDate(d: string | null | undefined): string {
   if (!d) return '—';
@@ -26,12 +27,7 @@ function poDisplay(order: LogisticsOrderDetail): { label: string; variant: 'neut
   return { label: PO_STATUS_LABELS[order.poStatus], variant: PO_STATUS_VARIANT[order.poStatus] };
 }
 
-const DELIVERY_STATUS_OPTIONS: DeliveryStatus[] = [
-  'not_started', 'logistics_processing', 'ready_to_dispatch', 'dispatched', 'in_transit', 'delivered', 'delivery_issue',
-];
-
 const inputCls = 'w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500';
-const labelCls = 'text-xs font-medium text-slate-600 block mb-1';
 
 export default function LogisticsOrderDetailPage() {
   const router = useRouter();
@@ -47,30 +43,12 @@ export default function LogisticsOrderDetailPage() {
   const [invoiceBusy, setInvoiceBusy] = useState(false);
   const [invoiceError, setInvoiceError] = useState('');
 
-  const [dispatchForm, setDispatchForm] = useState({
-    dispatchDate: '', courier: '', awb: '', trackingUrl: '',
-    expectedDeliveryDate: '', actualDeliveryDate: '', deliveryStatus: 'not_started' as DeliveryStatus, logisticsNote: '',
-  });
-  const [dispatchBusy, setDispatchBusy] = useState(false);
-  const [dispatchError, setDispatchError] = useState('');
-  const [dispatchSaved, setDispatchSaved] = useState(false);
-
   const load = useCallback(async () => {
     setLoading(true);
     setError('');
     try {
       const detail = await getLogisticsOrderDetail(orderId);
       setOrder(detail);
-      setDispatchForm({
-        dispatchDate: detail.dispatch.dispatchDate ?? '',
-        courier: detail.dispatch.courier ?? '',
-        awb: detail.dispatch.awb ?? '',
-        trackingUrl: detail.dispatch.trackingUrl ?? '',
-        expectedDeliveryDate: detail.dispatch.expectedDeliveryDate ?? '',
-        actualDeliveryDate: detail.dispatch.actualDeliveryDate ?? '',
-        deliveryStatus: detail.dispatch.deliveryStatus,
-        logisticsNote: detail.dispatch.logisticsNote ?? '',
-      });
     } catch (err: unknown) {
       setError(err instanceof Error ? err.message : 'Failed to load order.');
     } finally {
@@ -105,30 +83,6 @@ export default function LogisticsOrderDetailPage() {
       setInvoiceError(err instanceof Error ? err.message : 'Failed to select invoice.');
     } finally {
       setInvoiceBusy(false);
-    }
-  }
-
-  async function handleSaveDispatch() {
-    setDispatchBusy(true);
-    setDispatchError('');
-    setDispatchSaved(false);
-    try {
-      await updateLogisticsDispatch(orderId, {
-        dispatchDate: dispatchForm.dispatchDate || null,
-        courier: dispatchForm.courier || null,
-        awb: dispatchForm.awb || null,
-        trackingUrl: dispatchForm.trackingUrl || null,
-        expectedDeliveryDate: dispatchForm.expectedDeliveryDate || null,
-        actualDeliveryDate: dispatchForm.actualDeliveryDate || null,
-        deliveryStatus: dispatchForm.deliveryStatus,
-        logisticsNote: dispatchForm.logisticsNote || null,
-      });
-      setDispatchSaved(true);
-      await load();
-    } catch (err: unknown) {
-      setDispatchError(err instanceof Error ? err.message : 'Failed to save dispatch info.');
-    } finally {
-      setDispatchBusy(false);
     }
   }
 
@@ -259,43 +213,8 @@ export default function LogisticsOrderDetailPage() {
               )}
             </div>
 
-            {/* Dispatch */}
-            <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
-              <div className="flex items-center justify-between mb-4">
-                <h2 className="text-sm font-semibold text-slate-500 uppercase tracking-wide">Dispatch</h2>
-                {order.dispatch.pickingId && (
-                  <span className="text-xs text-slate-400">Linked picking: <span className="font-mono">{order.dispatch.pickingName}</span> ({order.dispatch.pickingState})</span>
-                )}
-              </div>
-              <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                <div><label className={labelCls}>Dispatch Date</label><input type="date" className={inputCls} value={dispatchForm.dispatchDate} onChange={e => setDispatchForm(f => ({ ...f, dispatchDate: e.target.value }))} /></div>
-                <div><label className={labelCls}>Courier / Transporter</label><input type="text" maxLength={120} className={inputCls} value={dispatchForm.courier} onChange={e => setDispatchForm(f => ({ ...f, courier: e.target.value }))} /></div>
-                <div><label className={labelCls}>AWB / Tracking Number</label><input type="text" maxLength={60} className={inputCls} value={dispatchForm.awb} onChange={e => setDispatchForm(f => ({ ...f, awb: e.target.value }))} /></div>
-                <div><label className={labelCls}>Tracking URL</label><input type="url" placeholder="https://..." className={inputCls} value={dispatchForm.trackingUrl} onChange={e => setDispatchForm(f => ({ ...f, trackingUrl: e.target.value }))} /></div>
-                <div><label className={labelCls}>Expected Delivery Date</label><input type="date" className={inputCls} value={dispatchForm.expectedDeliveryDate} onChange={e => setDispatchForm(f => ({ ...f, expectedDeliveryDate: e.target.value }))} /></div>
-                <div><label className={labelCls}>Actual Delivery Date</label><input type="date" className={inputCls} value={dispatchForm.actualDeliveryDate} onChange={e => setDispatchForm(f => ({ ...f, actualDeliveryDate: e.target.value }))} /></div>
-                <div>
-                  <label className={labelCls}>Delivery Status</label>
-                  <select className={inputCls + ' bg-white'} value={dispatchForm.deliveryStatus} onChange={e => setDispatchForm(f => ({ ...f, deliveryStatus: e.target.value as DeliveryStatus }))}>
-                    {DELIVERY_STATUS_OPTIONS.map(s => <option key={s} value={s}>{DELIVERY_STATUS_LABELS[s]}</option>)}
-                  </select>
-                </div>
-              </div>
-              <div className="mt-4">
-                <label className={labelCls}>Logistics Note (visible to customer)</label>
-                <textarea rows={3} maxLength={1000} className={inputCls + ' resize-none'} value={dispatchForm.logisticsNote} onChange={e => setDispatchForm(f => ({ ...f, logisticsNote: e.target.value }))} />
-              </div>
-              <div className="flex items-center gap-3 mt-4">
-                <button onClick={handleSaveDispatch} disabled={dispatchBusy} className="bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors">
-                  {dispatchBusy ? 'Saving...' : 'Save Dispatch Info'}
-                </button>
-                {dispatchSaved && <span className="text-sm text-green-700">Saved.</span>}
-              </div>
-              {dispatchError && <p className="text-sm text-red-700 mt-2">{dispatchError}</p>}
-              {!order.dispatch.pickingId && (
-                <p className="text-xs text-slate-400 mt-3">No linked Odoo delivery yet — these details are stored as portal logistics data and will be preferred alongside native fields once a delivery exists.</p>
-              )}
-            </div>
+            {/* Delivery Tracking */}
+            <DeliveryTrackingSection orderId={order.id} dispatch={order.dispatch} editable onSaved={load} />
 
             {order.timeline.length > 0 && (
               <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
