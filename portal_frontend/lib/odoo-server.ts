@@ -3812,7 +3812,10 @@ async function fetchOutgoingPickingForInstallation(soIds: number[]): Promise<Rec
   if (!soIds.length) return null;
   const pickings = await executeKw('stock.picking', 'search_read', [[
     ['sale_id', 'in', soIds], ['picking_type_id.code', '=', 'outgoing'],
-  ]], { fields: ['id', 'name', 'state', 'is_installation_required'], order: 'id desc', limit: 1 }) as Record<string, unknown>[];
+  ]], {
+    fields: ['id', 'name', 'state', 'scheduled_date', 'date_done', 'carrier_tracking_ref', 'carrier_tracking_url', 'is_installation_required'],
+    order: 'id desc', limit: 1,
+  }) as Record<string, unknown>[];
   return pickings[0] ?? null;
 }
 
