@@ -6,13 +6,15 @@ import {
   getAdminRequestDetail, getEligibleSalespeople, assignRequestSalesperson,
   createDraftPI, createPIRevision, updatePIDraft, publishPI,
   getTerritories, updateRequestTerritory, searchAdminProducts, addPILine, updatePILine, removePILine,
+  getLogisticsDispatch,
 } from '@/lib/api';
 import { fetchCurrentUser, isInBodyStaff, logout } from '@/lib/auth';
 import { PI_STATUS_LABELS, PI_STATUS_VARIANT, PO_STATUS_LABELS, PO_STATUS_VARIANT, STAGE_VARIANT } from '@/lib/stage-config';
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
 import AdminPoSection from '@/components/AdminPoSection';
-import type { AdminRequestDetail, EligibleSalesperson, TerritoryOption, AdminProductOption } from '@/types';
+import DeliveryTrackingSection from '@/components/DeliveryTrackingSection';
+import type { AdminRequestDetail, EligibleSalesperson, TerritoryOption, AdminProductOption, DispatchInfo } from '@/types';
 
 function fmtDate(d: string | null | undefined): string {
   if (!d) return '—';
@@ -31,6 +33,7 @@ export default function AdminRequestDetailPage() {
 
   const [userName, setUserName] = useState('');
   const [request, setRequest] = useState<AdminRequestDetail | null>(null);
+  const [dispatch, setDispatch] = useState<DispatchInfo | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
@@ -80,6 +83,11 @@ export default function AdminRequestDetailPage() {
     }
   }, [requestId]);
 
+  const loadDispatch = useCallback(() => {
+    if (!requestId) return;
+    getLogisticsDispatch(requestId).then(setDispatch).catch(() => setDispatch(null));
+  }, [requestId]);
+
   useEffect(() => {
     fetchCurrentUser().then(u => {
       if (!u) { router.replace('/login'); return; }
@@ -89,9 +97,10 @@ export default function AdminRequestDetailPage() {
     if (!requestId) return;
     // eslint-disable-next-line react-hooks/set-state-in-effect -- standard fetch-on-mount; loading already starts true
     load();
+    loadDispatch();
     getEligibleSalespeople().then(res => setSalespeople(res.salespeople)).catch(() => {});
     getTerritories().then(res => setTerritories(res.territories)).catch(() => {});
-  }, [requestId, router, load]);
+  }, [requestId, router, load, loadDispatch]);
 
   async function handleLogout() {
     await logout();
@@ -637,6 +646,11 @@ export default function AdminRequestDetailPage() {
 
             {/* PO review (Phase 3) */}
             <AdminPoSection requestId={request.id} po={request.po} onChange={load} />
+
+            {/* Delivery Tracking (Phase 4, shared with /logistics) */}
+            {dispatch && (
+              <DeliveryTrackingSection orderId={request.id} dispatch={dispatch} editable onSaved={loadDispatch} />
+            )}
 
             {request.timeline.length > 0 && (
               <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">

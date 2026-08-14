@@ -7,6 +7,7 @@ import { fetchCurrentUser, logout } from '@/lib/auth';
 import { DELIVERY_STATUS_LABELS, DELIVERY_STATUS_VARIANT, INSTALLATION_STATUS_LABELS, INSTALLATION_STATUS_VARIANT } from '@/lib/stage-config';
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
+import DeliveryTrackingSection from '@/components/DeliveryTrackingSection';
 import type { CsOrderDetail, InstallationStatus, User } from '@/types';
 
 function fmtDate(d: string | null | undefined): string {
@@ -158,13 +159,14 @@ export default function CsOrderDetailPage() {
                     </p>
                   </div>
                 )}
-                <div><p className="text-xs text-slate-400 uppercase tracking-wide">Delivery Status</p><p className="text-slate-700 mt-0.5">{DELIVERY_STATUS_LABELS[order.dispatch.deliveryStatus]}</p></div>
-                <div><p className="text-xs text-slate-400 uppercase tracking-wide">Actual Delivery Date</p><p className="text-slate-700 mt-0.5">{fmtDate(order.dispatch.actualDeliveryDate)}</p></div>
                 {order.installation.installationRequired !== null && (
                   <div><p className="text-xs text-slate-400 uppercase tracking-wide">Odoo Installation Flag</p><p className="text-slate-700 mt-0.5">{order.installation.installationRequired ? 'Required' : 'Not required'}</p></div>
                 )}
               </div>
             </div>
+
+            {/* Delivery Tracking — read-only for CS, no edit controls or mutation access */}
+            <DeliveryTrackingSection orderId={order.id} dispatch={order.dispatch} editable={false} />
 
             {/* Installation panel */}
             <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">

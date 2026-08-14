@@ -1,20 +1,21 @@
 'use client';
 
-import { useEffect, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useRouter, useParams } from 'next/navigation';
 import {
-  getCultFitOrderDetail, getOdooAttachments, setCultFitPortalStage,
+  getCultFitOrderDetail, getOdooAttachments, setCultFitPortalStage, getLogisticsDispatch,
   type OdooAttachment,
 } from '@/lib/api';
 import { fetchCurrentUser, isInBodyStaff, logout } from '@/lib/auth';
 import { STAGE_LABELS, STAGE_DEFS, CULTFIT_STAGE_MAP, DELIVERY_VARIANT, INVOICE_VARIANT } from '@/lib/stage-config';
 import CustomerInstallationSection from '@/components/CustomerInstallationSection';
 import CustomerLogisticsSection from '@/components/CustomerLogisticsSection';
+import DeliveryTrackingSection from '@/components/DeliveryTrackingSection';
 import OrderTimeline from '@/components/OrderTimeline';
 import PaymentCountdown from '@/components/PaymentCountdown';
 import PortalHeader from '@/components/PortalHeader';
 import StatusChip from '@/components/StatusChip';
-import type { CultFitOrder, TimelineStage } from '@/types';
+import type { CultFitOrder, DispatchInfo, TimelineStage } from '@/types';
 
 const API_BASE = process.env.NEXT_PUBLIC_API_URL ?? '/api';
 
@@ -99,11 +100,17 @@ export default function OrderDetailPage() {
 
   const [order, setOrder]       = useState<CultFitOrder | null>(null);
   const [odooDocs, setOdooDocs] = useState<OdooAttachment[]>([]);
+  const [dispatch, setDispatch] = useState<DispatchInfo | null>(null);
   const [loading, setLoading]   = useState(true);
   const [error, setError]       = useState('');
   const [downloading, setDownloading] = useState<number | null>(null);
   const [isStaff, setIsStaff]   = useState(false);
   const [userName, setUserName] = useState('');
+
+  const loadDispatch = useCallback(() => {
+    if (!orderId) return;
+    getLogisticsDispatch(orderId).then(setDispatch).catch(() => setDispatch(null));
+  }, [orderId]);
 
   // Portal stage update (staff only)
   const [stageKey, setStageKey]         = useState('');
@@ -116,8 +123,10 @@ export default function OrderDetailPage() {
     // to get the user's name/role for display.
     fetchCurrentUser().then(u => {
       if (!u) { router.replace('/login'); return; }
-      setIsStaff(isInBodyStaff(u.role));
+      const staff = isInBodyStaff(u.role);
+      setIsStaff(staff);
       setUserName(u.name ?? '');
+      if (staff) loadDispatch();
     });
     if (!orderId) return;
 
@@ -132,7 +141,7 @@ export default function OrderDetailPage() {
       })
       .catch(err => setError(err.message ?? 'Failed to load order.'))
       .finally(() => setLoading(false));
-  }, [orderId, router]);
+  }, [orderId, router, loadDispatch]);
 
   async function handleOdooDownload(attachmentId: number, filename: string) {
     setDownloading(attachmentId);
@@ -471,6 +480,13 @@ export default function OrderDetailPage() {
         {!isStaff && (
           <div className="mt-6">
             <CustomerLogisticsSection requestId={order.id} />
+          </div>
+        )}
+
+        {/* ── Delivery Tracking (staff-editable — Admin only reaches isStaff here) ── */}
+        {isStaff && dispatch && (
+          <div className="mt-6">
+            <DeliveryTrackingSection orderId={order.id} dispatch={dispatch} editable onSaved={loadDispatch} />
           </div>
         )}
 

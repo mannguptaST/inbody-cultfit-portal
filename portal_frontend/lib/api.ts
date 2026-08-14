@@ -330,6 +330,13 @@ export async function updateLogisticsDispatch(id: number, payload: DispatchUpdat
   });
 }
 
+// Same dispatch route as above, GET only — used by pages that need just the
+// DispatchInfo (not the full LogisticsOrderDetail) to render the shared
+// Delivery Tracking section, e.g. the admin order pages.
+export async function getLogisticsDispatch(id: number): Promise<DispatchInfo> {
+  return apiFetch(`/logistics/cultfit/orders/${id}/dispatch`);
+}
+
 export async function getCustomerLogisticsView(id: number): Promise<CustomerLogisticsView> {
   return apiFetch(`/portal/cultfit/requests/${id}/logistics`);
 }

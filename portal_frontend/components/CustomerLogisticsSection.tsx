@@ -80,13 +80,11 @@ export default function CustomerLogisticsSection({ requestId }: { requestId: num
           )}
         </div>
 
-        {/* Dispatch */}
+        {/* Delivery Tracking */}
         <div className="border-t border-slate-100 pt-5">
-          <p className="text-xs font-semibold text-slate-500 uppercase mb-2">Dispatch</p>
+          <p className="text-xs font-semibold text-slate-500 uppercase mb-2">Delivery Tracking</p>
           {!hasDispatchInfo ? (
-            <p className="text-sm text-slate-500">
-              {dispatch.deliveryStatus === 'not_started' ? 'Your order is currently in logistics processing.' : 'Dispatch details are not available yet.'}
-            </p>
+            <p className="text-sm text-slate-500">Tracking details are not available yet.</p>
           ) : (
             <div className="space-y-3">
               <StatusChip label={DELIVERY_STATUS_LABELS[dispatch.deliveryStatus]} variant={DELIVERY_STATUS_VARIANT[dispatch.deliveryStatus]} />
@@ -107,7 +105,7 @@ export default function CustomerLogisticsSection({ requestId }: { requestId: num
               )}
               {dispatch.logisticsNote && (
                 <div>
-                  <p className="text-xs text-slate-400 uppercase tracking-wide">Note</p>
+                  <p className="text-xs text-slate-400 uppercase tracking-wide">Delivery Notes</p>
                   <p className="text-sm text-slate-700 mt-0.5 whitespace-pre-wrap">{dispatch.logisticsNote}</p>
                 </div>
               )}
