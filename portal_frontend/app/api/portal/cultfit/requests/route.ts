@@ -51,6 +51,7 @@ export async function POST(req: NextRequest) {
         mainProductId: body.mainProductId,
         quantity: body.quantity,
         notes: body.notes,
+        requestedDeliveryDate: body.requestedDeliveryDate,
       },
       authz,
       user.email,

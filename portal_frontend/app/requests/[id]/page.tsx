@@ -161,8 +161,8 @@ export default function RequestDetailPage() {
                     <p className="text-sm font-semibold text-slate-700 mt-0.5">{d.cocoFofo}</p>
                   </div>
                   <div>
-                    <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">Preferred Delivery Date</p>
-                    <p className="text-sm font-semibold text-slate-700 mt-0.5">{fmtDate(d.preferredDeliveryDate)}</p>
+                    <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">Delivery Date</p>
+                    <p className="text-sm font-semibold text-slate-700 mt-0.5">{fmtDate(d.requestedDeliveryDate ?? d.preferredDeliveryDate)}</p>
                   </div>
                   <div className="sm:col-span-2">
                     <p className="text-xs text-slate-400 font-medium uppercase tracking-wide">Main Product</p>

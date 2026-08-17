@@ -49,6 +49,11 @@ export default function DeliveryTrackingSection({
     actualDeliveryDate: dispatch.actualDeliveryDate ?? '',
     deliveryStatus: dispatch.deliveryStatus,
     logisticsNote: dispatch.logisticsNote ?? '',
+    // Pre-filled from the fallback (PO Shipping Address) when nothing has
+    // been explicitly saved yet — saving as-is is what turns the fallback
+    // into an explicit value; it never silently overwrites the PO's own
+    // Shipping Address record, only this separate dispatch-address field.
+    dispatchAddress: dispatch.dispatchAddress ?? '',
   });
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState('');
@@ -68,6 +73,7 @@ export default function DeliveryTrackingSection({
         actualDeliveryDate: form.actualDeliveryDate || null,
         deliveryStatus: form.deliveryStatus,
         logisticsNote: form.logisticsNote || null,
+        dispatchAddress: form.dispatchAddress || null,
       });
       setSaved(true);
       onSaved?.();
@@ -111,6 +117,19 @@ export default function DeliveryTrackingSection({
             )}
           </div>
         )}
+        <div className="border-t border-slate-100 mt-4 pt-4">
+          <p className="text-xs font-semibold text-slate-500 uppercase mb-1">Dispatch / Final Delivery Address</p>
+          {dispatch.dispatchAddress ? (
+            <>
+              <p className="text-sm text-slate-700 whitespace-pre-wrap">{dispatch.dispatchAddress}</p>
+              {dispatch.dispatchAddressSource === 'po_shipping_fallback' && (
+                <p className="text-xs text-slate-400 mt-1">Defaulted from the PO Shipping Address — no explicit dispatch address has been set yet.</p>
+              )}
+            </>
+          ) : (
+            <p className="text-sm text-slate-500">Not available yet.</p>
+          )}
+        </div>
       </div>
     );
   }
@@ -140,6 +159,16 @@ export default function DeliveryTrackingSection({
       <div className="mt-4">
         <label className={labelCls}>Delivery Notes</label>
         <textarea rows={3} maxLength={1000} className={inputCls + ' resize-none'} value={form.logisticsNote} onChange={e => setForm(f => ({ ...f, logisticsNote: e.target.value }))} />
+      </div>
+      <div className="mt-4 border-t border-slate-100 pt-4">
+        <label className={labelCls}>Dispatch / Final Delivery Address</label>
+        <textarea
+          rows={3} maxLength={500} className={inputCls + ' resize-none'}
+          value={form.dispatchAddress} onChange={e => setForm(f => ({ ...f, dispatchAddress: e.target.value }))}
+        />
+        {dispatch.dispatchAddressSource === 'po_shipping_fallback' && (
+          <p className="text-xs text-slate-400 mt-1">Currently defaulting from the PO Shipping Address — no explicit dispatch address has been saved yet. Edit and save to set one.</p>
+        )}
       </div>
       <div className="flex items-center gap-3 mt-4">
         <button onClick={handleSave} disabled={busy} className="bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors">

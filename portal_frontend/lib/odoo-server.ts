@@ -820,6 +820,14 @@ export interface PortalRequestDetails {
   // decodeRequestDetails and the UI can still render old records safely.
   deliveryAddress?: string;
   preferredDeliveryDate?: string | null;
+  // The customer's requested delivery date at request-creation time —
+  // distinct from preferredDeliveryDate above (dead/legacy, unvalidated) and
+  // from the PO's own expectedDeliveryDate/sale.order.commitment_date
+  // (Phase 3, set later at PO-approval time from what the customer's actual
+  // PO document says). Mandatory server-side for every request submitted
+  // from 2026-08 onward (see validateRequestedDeliveryDate) — absent on
+  // every record created before that; decode safely as undefined for those.
+  requestedDeliveryDate?: string;
 }
 
 function encodeRequestDetails(details: PortalRequestDetails): string {
@@ -852,6 +860,7 @@ function buildRequestDescriptionHtml(details: PortalRequestDetails): string {
     `<p><b>COCO/FOFO:</b> ${escapeHtml(details.cocoFofo)}</p>`,
     `<p><b>Main product:</b> ${escapeHtml(details.mainProduct.code)} ${escapeHtml(details.mainProduct.name)} × ${details.quantity}</p>`,
     `<p><b>Included (free):</b> ${includedLine}</p>`,
+    details.requestedDeliveryDate ? `<p><b>Requested delivery date:</b> ${escapeHtml(details.requestedDeliveryDate)}</p>` : '',
     details.deliveryAddress ? `<p><b>Delivery address:</b> ${escapeHtml(details.deliveryAddress)}</p>` : '',
     `<p><b>Contact (from existing Odoo record, source: ${escapeHtml(c?.source ?? 'none')}):</b> ${contactLine}</p>`,
     details.regionDetection
@@ -1238,6 +1247,7 @@ export interface NewOrderRequestInput {
   mainProductId: unknown;
   quantity: unknown;
   notes: unknown;
+  requestedDeliveryDate: unknown;
 }
 
 const MAX_LEN = { requestName: 120, notes: 1000 };
@@ -1247,6 +1257,46 @@ function requiredText(v: unknown, field: string, max: number): string {
   const trimmed = v.trim();
   if (trimmed.length > max) throw new InvalidRequestError(`${field} must be ${max} characters or fewer.`);
   return trimmed;
+}
+
+// India-only business — a fixed IST offset (no DST in India) gives a single,
+// server-consistent definition of "today" regardless of the Vercel region's
+// own local clock or whatever timezone the customer's browser happens to be
+// in. Never derived from client input.
+const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+const MIN_DELIVERY_LEAD_DAYS = 10;
+const ISO_DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+
+function todayIstDateStr(): string {
+  return new Date(Date.now() + IST_OFFSET_MS).toISOString().slice(0, 10);
+}
+
+function addDaysToDateStr(dateStr: string, days: number): string {
+  const [y, m, d] = dateStr.split('-').map(Number);
+  const dt = new Date(Date.UTC(y, m - 1, d));
+  dt.setUTCDate(dt.getUTCDate() + days);
+  return dt.toISOString().slice(0, 10);
+}
+
+// The only place a customer-supplied delivery date is trusted — re-validates
+// the exact same +10-day rule the frontend date picker already enforces, so
+// a forged/bypassed earlier date can never reach Odoo. ISO string comparison
+// is valid here because YYYY-MM-DD is zero-padded (lexicographic order ==
+// chronological order).
+function validateRequestedDeliveryDate(v: unknown): string {
+  if (typeof v !== 'string' || !ISO_DATE_RE.test(v)) {
+    throw new InvalidRequestError('Delivery Date is required and must be a valid date (YYYY-MM-DD).');
+  }
+  const [y, m, d] = v.split('-').map(Number);
+  const parsed = new Date(Date.UTC(y, m - 1, d));
+  if (parsed.getUTCFullYear() !== y || parsed.getUTCMonth() !== m - 1 || parsed.getUTCDate() !== d) {
+    throw new InvalidRequestError('Delivery Date is not a valid calendar date.');
+  }
+  const earliest = addDaysToDateStr(todayIstDateStr(), MIN_DELIVERY_LEAD_DAYS);
+  if (v < earliest) {
+    throw new InvalidRequestError(`Delivery Date must be on or after ${earliest} (at least ${MIN_DELIVERY_LEAD_DAYS} days from today).`);
+  }
+  return v;
 }
 
 // Every field here is re-validated from scratch — this function is the only
@@ -1277,6 +1327,8 @@ export async function createPortalOrderRequest(
     notes = input.notes.trim();
     if (notes.length > MAX_LEN.notes) throw new InvalidRequestError(`Notes must be ${MAX_LEN.notes} characters or fewer.`);
   }
+
+  const requestedDeliveryDate = validateRequestedDeliveryDate(input.requestedDeliveryDate);
 
   // Never trust a client-supplied product id blindly — re-verify it against
   // the same live "already used by CultFit" catalog the picker itself came
@@ -1318,6 +1370,7 @@ export async function createPortalOrderRequest(
     quantity,
     includedProducts,
     notes,
+    requestedDeliveryDate,
     portalAccount: portalAccountEmail,
     submittedDate: new Date().toISOString().slice(0, 10),
     cultfitCompany: companyName,
@@ -3122,6 +3175,19 @@ export interface DispatchInfo {
   logisticsNote: string | null;
   updatedAt: string | null;
   updatedBy: string | null;
+  // The actual machine delivery location — separate from the PO's own
+  // Billing/Shipping Address (never overwritten by this). No safe native
+  // Odoo text field exists for an arbitrary per-order dispatch address
+  // (crm.lead.shipping_address_id, sale.order.partner_shipping_id,
+  // stock.picking.partner_id/warehouse_address_id/customer_id/
+  // customer_billing_id are all many2one to res.partner — investigated
+  // live; using them would require creating/reusing a partner record,
+  // which this app never does), so it's portal metadata, same as the rest
+  // of DispatchInfo. 'po_shipping_fallback' means nothing has been
+  // explicitly saved yet and this is only a display default from the PO's
+  // Shipping Address — an explicit save always wins from then on.
+  dispatchAddress: string | null;
+  dispatchAddressSource: 'explicit' | 'po_shipping_fallback' | 'none';
 }
 
 interface DispatchMetadataRecord {
@@ -3133,6 +3199,7 @@ interface DispatchMetadataRecord {
   actualDeliveryDate: string | null;
   deliveryStatus: DeliveryStatus;
   logisticsNote: string | null;
+  dispatchAddress: string | null;
   updatedAt: string;
   updatedBy: string;
 }
@@ -3229,7 +3296,11 @@ async function fetchDispatchMetadata(leadId: number): Promise<DispatchMetadataRe
 // the logistics note). Metadata always wins for the fields Odoo doesn't
 // have; the picking always wins for the fields it does, since Odoo staff
 // may also edit a picking directly outside the portal.
-function buildDispatchInfo(picking: Record<string, unknown> | null, meta: DispatchMetadataRecord | null): DispatchInfo {
+function buildDispatchInfo(
+  picking: Record<string, unknown> | null, meta: DispatchMetadataRecord | null,
+  poShippingAddressFallback: string | null = null,
+): DispatchInfo {
+  const explicitDispatchAddress = meta?.dispatchAddress ?? null;
   return {
     pickingId: picking ? (picking.id as number) : null,
     pickingName: picking ? (picking.name as string) : null,
@@ -3249,7 +3320,23 @@ function buildDispatchInfo(picking: Record<string, unknown> | null, meta: Dispat
     logisticsNote: meta?.logisticsNote ?? null,
     updatedAt: meta?.updatedAt ?? null,
     updatedBy: meta?.updatedBy ?? null,
+    // Explicit saved value always wins; only falls back to the PO Shipping
+    // Address (informational default, never written back anywhere) when
+    // nothing has been explicitly saved yet.
+    dispatchAddress: explicitDispatchAddress ?? poShippingAddressFallback ?? null,
+    dispatchAddressSource: explicitDispatchAddress ? 'explicit' : poShippingAddressFallback ? 'po_shipping_fallback' : 'none',
   };
+}
+
+// Pure helper — given the same PO submission records every PO UI already
+// reduces to "the current one" (poStatusFrom), returns just the Shipping
+// Address for the dispatch-address fallback. Never the source of truth for
+// PO status itself; callers that already computed poStatusFrom should reuse
+// its latestSubmission directly instead of calling this a second time.
+function latestPoShippingAddress(
+  submissions: PoSubmissionRecord[], corrections: PoCorrectionRecord[], approvals: PoApprovalRecord[],
+): string | null {
+  return poStatusFrom(submissions, corrections, approvals).latestSubmission?.data.shippingAddress ?? null;
 }
 
 async function fetchInvoiceLink(leadId: number): Promise<InvoiceLinkRecord | null> {
@@ -3435,7 +3522,7 @@ export async function fetchLogisticsOrderDetail(id: number, authz: Authz): Promi
     approvedPoSummary: poCtx,
     invoiceCandidates,
     selectedInvoice: resolveSelectedInvoice(invoiceCandidates, invoiceLink),
-    dispatch: buildDispatchInfo(picking, meta),
+    dispatch: buildDispatchInfo(picking, meta, poStatusResult.latestSubmission?.data.shippingAddress ?? null),
     timeline,
   };
 }
@@ -3468,9 +3555,10 @@ export interface DispatchUpdateInput {
   actualDeliveryDate?: unknown;
   deliveryStatus?: unknown;
   logisticsNote?: unknown;
+  dispatchAddress?: unknown;
 }
 
-const MAX_LOGISTICS_TEXT = { courier: 120, awb: 60, note: 1000 };
+const MAX_LOGISTICS_TEXT = { courier: 120, awb: 60, note: 1000, address: 500 };
 const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
 
 function optDateField(v: unknown, field: string): string | null {
@@ -3550,6 +3638,7 @@ export async function updateDispatchInfo(
     actualDeliveryDate: mergeField(input.actualDeliveryDate, existing?.actualDeliveryDate ?? null, () => optDateField(input.actualDeliveryDate, 'Actual delivery date')),
     deliveryStatus,
     logisticsNote: mergeField(input.logisticsNote, existing?.logisticsNote ?? null, () => optTextField(input.logisticsNote, MAX_LOGISTICS_TEXT.note, 'Logistics note')),
+    dispatchAddress: mergeField(input.dispatchAddress, existing?.dispatchAddress ?? null, () => optTextField(input.dispatchAddress, MAX_LOGISTICS_TEXT.address, 'Dispatch / Final Delivery Address')),
     updatedAt: new Date().toISOString(), updatedBy: userEmail,
   };
 
@@ -3579,7 +3668,8 @@ export async function updateDispatchInfo(
     subtype_xmlid: 'mail.mt_note',
   });
 
-  return buildDispatchInfo(picking, record);
+  const { submissions, corrections, approvals } = await fetchPoMarkers(leadId);
+  return buildDispatchInfo(picking, record, latestPoShippingAddress(submissions, corrections, approvals));
 }
 
 export interface CustomerLogisticsView {
@@ -3601,18 +3691,19 @@ export async function fetchCustomerLogisticsView(leadId: number, authz: Authz): 
   if (!leads.length) throw new LeadNotFoundError();
   const soIds = leads[0].order_ids || [];
 
-  const [candidates, link, picking, meta] = await Promise.all([
+  const [candidates, link, picking, meta, poMarkers] = await Promise.all([
     fetchOrderInvoiceCandidates(soIds, authz),
     fetchInvoiceLink(leadId),
     fetchOutgoingPicking(soIds),
     fetchDispatchMetadata(leadId),
+    fetchPoMarkers(leadId),
   ]);
 
   const selected = resolveSelectedInvoice(candidates, link);
   return {
     invoice: selected,
     invoiceStatus: selected ? 'available' : candidates.length > 1 ? 'needs_selection' : 'not_created',
-    dispatch: buildDispatchInfo(picking, meta),
+    dispatch: buildDispatchInfo(picking, meta, latestPoShippingAddress(poMarkers.submissions, poMarkers.corrections, poMarkers.approvals)),
   };
 }
 
@@ -3902,11 +3993,12 @@ export async function fetchCsOrderDetail(id: number, authz: Authz): Promise<CsOr
   const lead = leads[0];
   const soIds = (lead.order_ids as number[]) || [];
 
-  const [picking, dispatchMeta, installMeta, timelineMessages] = await Promise.all([
+  const [picking, dispatchMeta, installMeta, timelineMessages, poMarkers] = await Promise.all([
     fetchOutgoingPickingForInstallation(soIds),
     fetchDispatchMetadata(id),
     fetchInstallationMetadata(id),
     executeKw('mail.message', 'search_read', [[['res_id', '=', id], ['model', '=', 'crm.lead']]], { fields: ['date', 'author_id', 'body'], order: 'date desc', limit: 30 }) as Promise<Record<string, unknown>[]>,
+    fetchPoMarkers(id),
   ]);
 
   const stageVal = lead.stage_id as OdooTuple;
@@ -3924,7 +4016,7 @@ export async function fetchCsOrderDetail(id: number, authz: Authz): Promise<CsOr
     requestDetails: decodeRequestDetails(lead.description),
     salesperson: (lead.user_id as OdooTuple) ? (lead.user_id as [number, string])[1] : null,
     crmStage: stageVal ? stageVal[1] : null,
-    dispatch: buildDispatchInfo(picking, dispatchMeta),
+    dispatch: buildDispatchInfo(picking, dispatchMeta, latestPoShippingAddress(poMarkers.submissions, poMarkers.corrections, poMarkers.approvals)),
     installation: buildInstallationInfo(picking, installMeta),
     timeline,
   };

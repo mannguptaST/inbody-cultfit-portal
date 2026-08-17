@@ -13,17 +13,35 @@ import type { CultFitProductOption } from '@/types';
 // Delivery Address / Preferred Delivery Date are also deliberately NOT
 // collected here (removed) — that information comes from the customer's PO
 // during Phase 3 review instead, so it's never asked for twice.
+// Delivery Date (added 2026-08) is a separate, mandatory field — the
+// customer's requested delivery date at request-creation time, distinct
+// from the above. Must be at least 10 calendar days from today; validated
+// again server-side regardless of what this picker allows.
 interface FormState {
   requestName: string;
   cocoFofo: '' | 'COCO' | 'FOFO';
   mainProductId: string;
   quantity: string;
   notes: string;
+  requestedDeliveryDate: string;
 }
 
 const EMPTY_FORM: FormState = {
-  requestName: '', cocoFofo: '', mainProductId: '', quantity: '1', notes: '',
+  requestName: '', cocoFofo: '', mainProductId: '', quantity: '1', notes: '', requestedDeliveryDate: '',
 };
+
+const MIN_DELIVERY_LEAD_DAYS = 10;
+
+// Client-side mirror of the server's IST-based +10-day rule, used only to
+// disable/label the picker — the server never trusts this, it re-derives
+// the same earliest date from its own clock (see validateRequestedDeliveryDate
+// in lib/odoo-server.ts).
+function earliestDeliveryDateStr(): string {
+  const IST_OFFSET_MS = 5.5 * 60 * 60 * 1000;
+  const nowIst = new Date(Date.now() + IST_OFFSET_MS);
+  nowIst.setUTCDate(nowIst.getUTCDate() + MIN_DELIVERY_LEAD_DAYS);
+  return nowIst.toISOString().slice(0, 10);
+}
 
 export default function NewOrderRequestPage() {
   const router = useRouter();
@@ -69,6 +87,11 @@ export default function NewOrderRequestPage() {
     if (!form.mainProductId) errs.mainProductId = 'Required';
     const qty = Number(form.quantity);
     if (!Number.isInteger(qty) || qty < 1 || qty > 999) errs.quantity = 'Enter a whole number between 1 and 999';
+    const earliest = earliestDeliveryDateStr();
+    if (!form.requestedDeliveryDate) errs.requestedDeliveryDate = 'Required';
+    else if (form.requestedDeliveryDate < earliest) {
+      errs.requestedDeliveryDate = `Earliest selectable date is ${new Date(earliest).toLocaleDateString('en-IN', { day: 'numeric', month: 'long', year: 'numeric' })} (at least ${MIN_DELIVERY_LEAD_DAYS} days from today).`;
+    }
     return errs;
   }
 
@@ -88,6 +111,7 @@ export default function NewOrderRequestPage() {
         mainProductId: Number(form.mainProductId),
         quantity: Number(form.quantity),
         notes: form.notes.trim() || undefined,
+        requestedDeliveryDate: form.requestedDeliveryDate,
       });
       router.push(`/requests/${result.id}`);
     } catch (err: unknown) {
@@ -192,6 +216,23 @@ export default function NewOrderRequestPage() {
             {bundleNote && (
               <p className="text-xs text-blue-700 bg-blue-50 border border-blue-100 rounded-lg px-3 py-2 mt-2">{bundleNote}</p>
             )}
+          </div>
+
+          <div>
+            <label className="text-xs font-medium text-slate-600 block mb-1">
+              Delivery Date <span className="text-red-500">*</span>
+            </label>
+            <input
+              type="date"
+              value={form.requestedDeliveryDate}
+              min={earliestDeliveryDateStr()}
+              onChange={e => set('requestedDeliveryDate', e.target.value)}
+              className={inputCls(!!fieldErrors.requestedDeliveryDate)}
+            />
+            <p className="text-xs text-slate-400 mt-1">
+              Earliest selectable date is {MIN_DELIVERY_LEAD_DAYS} days from today.
+            </p>
+            {fieldErrors.requestedDeliveryDate && <p className="text-xs text-red-600 mt-1">{fieldErrors.requestedDeliveryDate}</p>}
           </div>
 
           <div>
