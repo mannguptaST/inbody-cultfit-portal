@@ -136,6 +136,10 @@ export interface PortalRequestDetails {
   // still decode/render safely.
   deliveryAddress?: string;
   preferredDeliveryDate?: string | null;
+  // Mandatory for every request submitted from 2026-08 onward — see
+  // lib/odoo-server.ts validateRequestedDeliveryDate. Absent on older
+  // records (decode safely as undefined).
+  requestedDeliveryDate?: string;
 }
 
 export interface PortalRequestSummary {
@@ -166,6 +170,7 @@ export interface NewOrderRequestPayload {
   mainProductId: number;
   quantity: number;
   notes?: string;
+  requestedDeliveryDate: string;
 }
 
 // ── Phase 2: PI workflow (admin creates/publishes, customer confirms) ────────
@@ -481,6 +486,13 @@ export interface DispatchInfo {
   logisticsNote: string | null;
   updatedAt: string | null;
   updatedBy: string | null;
+  // The actual machine delivery location, which can differ from the PO's
+  // Billing/Shipping Address. 'po_shipping_fallback' means no explicit value
+  // has been saved yet and this is just defaulting to the PO Shipping
+  // Address for display — not an override. Once Admin/Logistics saves an
+  // explicit value, source becomes 'explicit' and it wins over the fallback.
+  dispatchAddress: string | null;
+  dispatchAddressSource: 'explicit' | 'po_shipping_fallback' | 'none';
 }
 
 export type InvoiceStatus = 'not_created' | 'needs_selection' | 'available';
@@ -526,6 +538,7 @@ export interface DispatchUpdatePayload {
   actualDeliveryDate?: string | null;
   deliveryStatus: DeliveryStatus;
   logisticsNote?: string | null;
+  dispatchAddress?: string | null;
 }
 
 export interface CustomerLogisticsView {

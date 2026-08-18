@@ -68,6 +68,7 @@ export async function PATCH(
       actualDeliveryDate: body.actualDeliveryDate,
       deliveryStatus: body.deliveryStatus,
       logisticsNote: body.logisticsNote,
+      dispatchAddress: body.dispatchAddress,
     }, authz, user.email);
     return NextResponse.json(dispatch);
   } catch (e: unknown) {

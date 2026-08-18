@@ -112,6 +112,21 @@ export default function CustomerLogisticsSection({ requestId }: { requestId: num
             </div>
           )}
         </div>
+
+        {/* Dispatch / Final Delivery Address — read-only for customer */}
+        <div className="border-t border-slate-100 pt-5">
+          <p className="text-xs font-semibold text-slate-500 uppercase mb-2">Dispatch / Final Delivery Address</p>
+          {dispatch.dispatchAddress ? (
+            <>
+              <p className="text-sm text-slate-700 whitespace-pre-wrap">{dispatch.dispatchAddress}</p>
+              {dispatch.dispatchAddressSource === 'po_shipping_fallback' && (
+                <p className="text-xs text-slate-400 mt-1">Defaulted from the PO Shipping Address.</p>
+              )}
+            </>
+          ) : (
+            <p className="text-sm text-slate-500">Not available yet.</p>
+          )}
+        </div>
       </div>
     </div>
   );
