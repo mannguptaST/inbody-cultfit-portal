@@ -41,7 +41,8 @@ export default function AdminPoSection({ requestId, po, onChange }: { requestId:
     setActionError('');
     setActionWarning('');
     try {
-      await approvePo(requestId);
+      const result = await approvePo(requestId);
+      if (result.stageWarning) setActionWarning(result.stageWarning);
       onChange();
     } catch (err: unknown) {
       setActionError(err instanceof Error ? err.message : 'Failed to approve PO.');

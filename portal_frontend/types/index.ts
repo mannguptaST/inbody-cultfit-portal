@@ -428,6 +428,8 @@ export interface PoApproveResult {
   status: PoStatus;
   poNumberSaved: boolean;
   expectedDeliveryDateSaved: boolean;
+  stageMoved: boolean;
+  stageWarning: string | null;
 }
 
 export interface PoCorrectionResult {

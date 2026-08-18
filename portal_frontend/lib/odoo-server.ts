@@ -958,6 +958,62 @@ async function resolveNewStageId(): Promise<number> {
   return _newStageId;
 }
 
+interface CrmStageRef { id: number; sequence: number; }
+let _installationStage: CrmStageRef | null = null;
+
+// Resolved by exact name, never a hardcoded id — verified live that this
+// Odoo instance's crm.stage ids are NOT in display-name order (e.g.
+// "6. Installation" has id=4, "5. Confirmed (Partial Paid)" has id=7). The
+// leading digit in the stage name is cosmetic only; `sequence` ("Used to
+// order stages. Lower is better.") is the one reliable native ordering
+// field, and is what advanceToInstallationStage() below compares against
+// to decide forward/backward — never the id, never the name string.
+async function resolveInstallationStage(): Promise<CrmStageRef> {
+  if (_installationStage) return _installationStage;
+  const stages = await executeKw('crm.stage', 'search_read', [[['name', '=', '6. Installation']]], { fields: ['id', 'sequence'], limit: 1 }) as CrmStageRef[];
+  if (!stages.length) throw new Error('Could not resolve the "6. Installation" CRM stage in Odoo.');
+  _installationStage = { id: stages[0].id, sequence: stages[0].sequence };
+  return _installationStage;
+}
+
+// Called only after a PO approval has already fully succeeded (its own
+// chatter marker already posted) — a failure in here must never look like
+// PO approval itself failed, and must never roll back or touch the
+// already-recorded approval. Moves crm.lead.stage_id forward to
+// "6. Installation" only; never backward (compares live `sequence`, not
+// id or name), and is idempotent (already-at-or-past-Installation leads are
+// left untouched, no duplicate chatter). No email, no other field touched —
+// see the Odoo investigation note above updateDispatchInfo-style functions
+// in this file for the same "one native write, one audit note" pattern.
+async function advanceToInstallationStage(
+  leadId: number, adminEmail: string,
+): Promise<{ stageMoved: boolean; stageWarning: string | null }> {
+  try {
+    const target = await resolveInstallationStage();
+    const leads = await executeKw('crm.lead', 'read', [[leadId]], { fields: ['stage_id'] }) as { stage_id: OdooTuple }[];
+    const currentStageVal = leads[0]?.stage_id;
+    if (!currentStageVal) return { stageMoved: false, stageWarning: 'PO approved, but the current CRM stage could not be read — please check the stage manually in Odoo.' };
+
+    const currentStageId = currentStageVal[0];
+    if (currentStageId === target.id) return { stageMoved: false, stageWarning: null }; // already at Installation — idempotent, no-op
+
+    const currentStages = await executeKw('crm.stage', 'read', [[currentStageId]], { fields: ['sequence'] }) as { sequence: number }[];
+    const currentSequence = currentStages[0]?.sequence;
+    if (currentSequence === undefined) return { stageMoved: false, stageWarning: 'PO approved, but the current CRM stage sequence could not be read — please check the stage manually in Odoo.' };
+    if (currentSequence >= target.sequence) return { stageMoved: false, stageWarning: null }; // already past Installation — never move backward, not an error
+
+    await executeKw('crm.lead', 'write', [[leadId], { stage_id: target.id }]);
+    await executeKw('crm.lead', 'message_post', [[leadId]], {
+      body: `<p><b>PORTAL_STAGE_AUTO_ADVANCED</b>: CRM stage automatically moved to "6. Installation" after PO approval in the CultFit Portal by ${escapeHtml(adminEmail)}.</p>`,
+      subtype_xmlid: 'mail.mt_note',
+    });
+    return { stageMoved: true, stageWarning: null };
+  } catch (e) {
+    console.error('[po-approve] failed to advance CRM stage to Installation for lead', leadId, e instanceof Error ? e.message : e);
+    return { stageMoved: false, stageWarning: 'PO approved, but the CRM stage could not be automatically updated to Installation. Please update it manually in Odoo.' };
+  }
+}
+
 let _fitnessIndustryId: number | null = null;
 
 // crm.lead.industry_id is mandatory in this Odoo instance (a customization,
@@ -3009,6 +3065,8 @@ export interface PoApproveResult {
   status: PoStatus;
   poNumberSaved: boolean;
   expectedDeliveryDateSaved: boolean;
+  stageMoved: boolean;
+  stageWarning: string | null;
 }
 
 // Never confirms the sale order, never creates an invoice/picking/delivery —
@@ -3053,7 +3111,13 @@ export async function approvePoData(leadId: number, authz: Authz, adminEmail: st
     subtype_xmlid: 'mail.mt_note',
   });
 
-  return { status: 'approved', poNumberSaved, expectedDeliveryDateSaved };
+  // The PO approval above is already fully recorded at this point — the CRM
+  // stage advance is a separate, best-effort follow-up step that can never
+  // roll back or cast doubt on the approval itself; see
+  // advanceToInstallationStage() for why it can only ever move forward.
+  const { stageMoved, stageWarning } = await advanceToInstallationStage(leadId, adminEmail);
+
+  return { status: 'approved', poNumberSaved, expectedDeliveryDateSaved, stageMoved, stageWarning };
 }
 
 export interface PoCorrectionResult {
