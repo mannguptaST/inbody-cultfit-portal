@@ -3266,6 +3266,12 @@ interface DispatchMetadataRecord {
   dispatchAddress: string | null;
   updatedAt: string;
   updatedBy: string;
+  // Present only on an entry that actually changed the address (omitted
+  // otherwise) — so the audit trail for "what changed" is self-contained in
+  // the one chatter entry describing the change, rather than requiring
+  // whoever's auditing it to separately locate and decode the immediately
+  // preceding entry to learn what the address changed from.
+  previousDispatchAddress?: string | null;
 }
 
 interface InvoiceLinkRecord {
@@ -3278,6 +3284,22 @@ const LOGISTICS_UPDATED_MARKER = 'PORTAL_LOGISTICS_UPDATED';
 const INVOICE_LINKED_MARKER = 'PORTAL_INVOICE_LINKED';
 const DISPATCHED_MARKER = 'PORTAL_DISPATCHED';
 const DELIVERED_MARKER = 'PORTAL_DELIVERED';
+// Posted only by updateCustomerDispatchAddress (Customer-driven address-only
+// saves), and referenced as a plain audit label — never a second encoded
+// blob — by updateDispatchInfo when an Admin/Logistics save happens to
+// change the address too. Decodes via the exact same DispatchMetadataRecord
+// shape as the three markers above, so fetchDispatchMetadata treats all four
+// as one shared history stream and always resolves the single latest state
+// regardless of which role or marker produced it.
+const DISPATCH_ADDRESS_UPDATED_MARKER = 'PORTAL_DISPATCH_ADDRESS_UPDATED';
+
+// §7/§8 of the Customer Dispatch Address brief: once an order has visibly
+// entered the delivery process, the Customer must not be able to redirect
+// the shipment via the portal — only Admin/Logistics can from that point.
+// Deliberately includes 'delivery_issue' too (explicit product decision,
+// not inferred): a shipment problem is not evidence it's safe to let the
+// Customer change the destination out from under Logistics.
+const CUSTOMER_ADDRESS_LOCK_STATUSES = new Set<DeliveryStatus>(['dispatched', 'in_transit', 'delivered', 'delivery_issue']);
 
 // Resolves the sale.order ids reachable from an authorized lead — the same
 // ownership root every invoice/picking lookup below starts from, so a
@@ -3339,7 +3361,9 @@ async function fetchOutgoingPicking(soIds: number[]): Promise<Record<string, unk
 async function fetchDispatchMetadata(leadId: number): Promise<DispatchMetadataRecord | null> {
   const messages = await executeKw('mail.message', 'search_read', [[
     ['res_id', '=', leadId], ['model', '=', 'crm.lead'],
-    '|', '|', ['body', 'ilike', LOGISTICS_UPDATED_MARKER], ['body', 'ilike', DISPATCHED_MARKER], ['body', 'ilike', DELIVERED_MARKER],
+    '|', '|', '|',
+    ['body', 'ilike', LOGISTICS_UPDATED_MARKER], ['body', 'ilike', DISPATCHED_MARKER],
+    ['body', 'ilike', DELIVERED_MARKER], ['body', 'ilike', DISPATCH_ADDRESS_UPDATED_MARKER],
   ]], { fields: ['body', 'date'] }) as { body: string; date: string }[];
 
   let latest: DispatchMetadataRecord | null = null;
@@ -3347,7 +3371,8 @@ async function fetchDispatchMetadata(leadId: number): Promise<DispatchMetadataRe
   for (const m of messages) {
     const rec = decodeMarkerData<DispatchMetadataRecord>(LOGISTICS_UPDATED_MARKER, m.body)
       ?? decodeMarkerData<DispatchMetadataRecord>(DISPATCHED_MARKER, m.body)
-      ?? decodeMarkerData<DispatchMetadataRecord>(DELIVERED_MARKER, m.body);
+      ?? decodeMarkerData<DispatchMetadataRecord>(DELIVERED_MARKER, m.body)
+      ?? decodeMarkerData<DispatchMetadataRecord>(DISPATCH_ADDRESS_UPDATED_MARKER, m.body);
     if (rec && m.date > latestDate) { latest = rec; latestDate = m.date; }
   }
   return latest;
@@ -3644,6 +3669,19 @@ function optTextField(v: unknown, max: number, field: string): string | null {
   return trimmed;
 }
 
+// Same rules as optTextField but rejects an absent/empty/whitespace-only
+// value instead of treating it as "leave unchanged" — used only by the
+// Customer address-update entry point, which (unlike the Admin/Logistics
+// partial-update route) has exactly one field and no "leave unchanged"
+// concept: the Customer is always submitting a specific new address.
+function requiredTextField(v: unknown, max: number, field: string): string {
+  if (typeof v !== 'string') throw new LogisticsWorkflowError(`${field} is required.`);
+  const trimmed = v.trim();
+  if (!trimmed) throw new LogisticsWorkflowError(`${field} is required.`);
+  if (trimmed.length > max) throw new LogisticsWorkflowError(`${field} must be ${max} characters or fewer.`);
+  return trimmed;
+}
+
 // Only http(s) allowed — rejects javascript:, data:, and any other scheme a
 // malicious tracking URL could use, since this value is later rendered as a
 // clickable link in both the logistics and customer UI.
@@ -3667,6 +3705,15 @@ function safeTrackingUrl(v: unknown): string | null {
 // would silently blank out every field the caller didn't happen to send.
 function mergeField<T>(v: unknown, existing: T | null, compute: () => T | null): T | null {
   return v === undefined ? existing : compute();
+}
+
+// Comparison-only normalization (never applied to the value actually
+// stored) — collapses whitespace/newline differences so a re-save with only
+// formatting changes, or a Save press with no edit at all, is correctly
+// treated as no meaningful change. The stored address itself keeps the
+// customer's original line breaks (multi-line addresses are allowed).
+function normalizeAddressForCompare(s: string | null): string {
+  return (s ?? '').trim().replace(/\s+/g, ' ');
 }
 
 // The only server-side entry point for any dispatch write — every field is
@@ -3727,13 +3774,93 @@ export async function updateDispatchInfo(
     : (deliveryStatus === 'dispatched' || deliveryStatus === 'in_transit') ? DISPATCHED_MARKER
     : LOGISTICS_UPDATED_MARKER;
   const label = deliveryStatus === 'delivered' ? 'Delivered' : deliveryStatus === 'dispatched' ? 'Dispatched' : 'Logistics info updated';
+  // Purely additive: when this same save also changed the dispatch address,
+  // append one extra plain-text audit line naming that specifically (no
+  // second encoded blob — the JSON above already carries the new value, and
+  // fetchDispatchMetadata never needs to decode this line). Every other
+  // field's handling above is untouched.
+  const addressChanged = normalizeAddressForCompare(existing?.dispatchAddress ?? null) !== normalizeAddressForCompare(record.dispatchAddress);
+  const addressNote = addressChanged
+    ? `<p><b>${DISPATCH_ADDRESS_UPDATED_MARKER}</b>: Dispatch Address updated by ${authz.role === 'admin' ? 'Admin' : 'Logistics'}.</p>`
+    : '';
+  // Recorded in the JSON blob (never the visible text) only when the
+  // address specifically changed, so this one entry is self-contained for
+  // "what changed" without needing to decode an earlier chatter entry.
+  if (addressChanged) record.previousDispatchAddress = existing?.dispatchAddress ?? null;
   await executeKw('crm.lead', 'message_post', [[leadId]], {
-    body: `<p><b>${marker}</b>: ${escapeHtml(label)} by ${escapeHtml(userEmail)}.</p>` + encodeMarkerData(marker, record),
+    body: `<p><b>${marker}</b>: ${escapeHtml(label)} by ${escapeHtml(userEmail)}.</p>` + addressNote + encodeMarkerData(marker, record),
     subtype_xmlid: 'mail.mt_note',
   });
 
   const { submissions, corrections, approvals } = await fetchPoMarkers(leadId);
   return buildDispatchInfo(picking, record, latestPoShippingAddress(submissions, corrections, approvals));
+}
+
+// The only server-side entry point for a Customer-driven dispatch-address
+// change. Deliberately NOT a thin wrapper around updateDispatchInfo above:
+// that function accepts the full Delivery Tracking payload (courier/AWB/
+// tracking/status/dates/notes) and is gated admin/logistics-only by design,
+// so reusing it here would either have to trust a client-suppliable field
+// whitelist (risking exactly the "customer edits courier" bug this must
+// prevent) or bypass its role gate. This function instead has exactly one
+// possible effect — replacing dispatchAddress — no matter what a caller
+// sends, and is the only place a 'customer' Authz is ever allowed to write
+// dispatch metadata at all.
+export async function updateCustomerDispatchAddress(
+  leadId: number, dispatchAddressInput: unknown, authz: Authz, userEmail: string,
+): Promise<DispatchInfo> {
+  if (authz.role !== 'customer') throw new LogisticsWorkflowError('Customer access required.');
+
+  const soIds = await resolveOrderSoIds(leadId, authz);
+  const [picking, existing, poMarkers] = await Promise.all([
+    fetchOutgoingPicking(soIds),
+    fetchDispatchMetadata(leadId),
+    fetchPoMarkers(leadId),
+  ]);
+  const poShippingFallback = latestPoShippingAddress(poMarkers.submissions, poMarkers.corrections, poMarkers.approvals);
+
+  // Locks against the same *effective* status the Customer (and everyone
+  // else) actually sees — reads through buildDispatchInfo's own picking-state
+  // fallback rather than the raw metadata field, so an order whose native
+  // Odoo picking is already done, but whose portal metadata was never
+  // touched by Logistics, is correctly locked too.
+  const current = buildDispatchInfo(picking, existing, poShippingFallback);
+  if (CUSTOMER_ADDRESS_LOCK_STATUSES.has(current.deliveryStatus)) {
+    throw new LogisticsWorkflowError('The order has already entered the delivery process. Please contact InBody if the delivery address needs to be changed.');
+  }
+
+  const newAddress = requiredTextField(dispatchAddressInput, MAX_LOGISTICS_TEXT.address, 'Dispatch / Final Delivery Address');
+  const previousExplicit = existing?.dispatchAddress ?? null;
+
+  // No-op save (identical address, or only a whitespace/formatting diff) —
+  // return the current state without writing anything or posting chatter.
+  if (normalizeAddressForCompare(previousExplicit) === normalizeAddressForCompare(newAddress)) {
+    return current;
+  }
+
+  const record: DispatchMetadataRecord = {
+    dispatchDate: existing?.dispatchDate ?? null,
+    courier: existing?.courier ?? null,
+    awb: existing?.awb ?? null,
+    trackingUrl: existing?.trackingUrl ?? null,
+    expectedDeliveryDate: existing?.expectedDeliveryDate ?? null,
+    actualDeliveryDate: existing?.actualDeliveryDate ?? null,
+    deliveryStatus: existing?.deliveryStatus ?? 'not_started',
+    logisticsNote: existing?.logisticsNote ?? null,
+    dispatchAddress: newAddress,
+    // This write only ever happens when the address is actually changing
+    // (the no-op branch above already returned), so it's always recorded.
+    previousDispatchAddress: previousExplicit,
+    updatedAt: new Date().toISOString(), updatedBy: userEmail,
+  };
+
+  await executeKw('crm.lead', 'message_post', [[leadId]], {
+    body: `<p><b>${DISPATCH_ADDRESS_UPDATED_MARKER}</b>: Dispatch Address updated by CultFit Customer.</p>`
+      + encodeMarkerData(DISPATCH_ADDRESS_UPDATED_MARKER, record),
+    subtype_xmlid: 'mail.mt_note',
+  });
+
+  return buildDispatchInfo(picking, record, poShippingFallback);
 }
 
 export interface CustomerLogisticsView {

@@ -341,6 +341,15 @@ export async function getCustomerLogisticsView(id: number): Promise<CustomerLogi
   return apiFetch(`/portal/cultfit/requests/${id}/logistics`);
 }
 
+// Narrow Customer-only mutation — the server accepts nothing but this one
+// field, regardless of what shape is sent.
+export async function updateCustomerDispatchAddress(id: number, dispatchAddress: string): Promise<DispatchInfo> {
+  return apiFetch(`/portal/cultfit/requests/${id}/dispatch-address`, {
+    method: 'PATCH',
+    body: JSON.stringify({ dispatchAddress }),
+  });
+}
+
 export function getInvoiceDownloadUrl(id: number): string {
   return `${API_BASE}/portal/cultfit/requests/${id}/invoice/pdf`;
 }

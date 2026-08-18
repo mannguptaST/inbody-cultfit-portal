@@ -1,10 +1,16 @@
 'use client';
 
 import { useEffect, useState } from 'react';
-import { getCustomerLogisticsView, getInvoiceDownloadUrl } from '@/lib/api';
+import { getCustomerLogisticsView, getInvoiceDownloadUrl, updateCustomerDispatchAddress } from '@/lib/api';
 import { DELIVERY_STATUS_LABELS, DELIVERY_STATUS_VARIANT } from '@/lib/stage-config';
 import StatusChip from '@/components/StatusChip';
-import type { CustomerLogisticsView } from '@/types';
+import type { CustomerLogisticsView, DeliveryStatus } from '@/types';
+
+// Mirrors CUSTOMER_ADDRESS_LOCK_STATUSES in lib/odoo-server.ts — that server
+// check is the actual enforcement; this is only used to decide whether to
+// show the edit form or the locked read-only view, so a mismatch here is a
+// display nit, never a security gap.
+const CUSTOMER_DISPATCH_LOCK_STATUSES = new Set<DeliveryStatus>(['dispatched', 'in_transit', 'delivered', 'delivery_issue']);
 
 function fmtInr(n: number | null): string {
   if (n == null) return '—';
@@ -30,12 +36,30 @@ export default function CustomerLogisticsSection({ requestId }: { requestId: num
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState('');
 
+  const [addressDraft, setAddressDraft] = useState('');
+  const [addressBusy, setAddressBusy] = useState(false);
+  const [addressError, setAddressError] = useState('');
+
   useEffect(() => {
     getCustomerLogisticsView(requestId)
-      .then(setView)
+      .then(v => { setView(v); setAddressDraft(v.dispatch.dispatchAddress ?? ''); })
       .catch(err => setError(err instanceof Error ? err.message : 'Failed to load logistics info.'))
       .finally(() => setLoading(false));
   }, [requestId]);
+
+  async function handleUpdateAddress() {
+    setAddressBusy(true);
+    setAddressError('');
+    try {
+      const dispatch = await updateCustomerDispatchAddress(requestId, addressDraft.trim());
+      setView(v => (v ? { ...v, dispatch } : v));
+      setAddressDraft(dispatch.dispatchAddress ?? '');
+    } catch (err: unknown) {
+      setAddressError(err instanceof Error ? err.message : 'Failed to update delivery address.');
+    } finally {
+      setAddressBusy(false);
+    }
+  }
 
   if (loading) return null;
   if (error) return null; // non-critical section — fails quietly rather than breaking the whole request detail page
@@ -43,6 +67,7 @@ export default function CustomerLogisticsSection({ requestId }: { requestId: num
 
   const { invoice, invoiceStatus, dispatch } = view;
   const hasDispatchInfo = dispatch.deliveryStatus !== 'not_started' || dispatch.courier || dispatch.awb || dispatch.trackingUrl;
+  const addressLocked = CUSTOMER_DISPATCH_LOCK_STATUSES.has(dispatch.deliveryStatus);
 
   return (
     <div className="bg-white border border-slate-200 rounded-xl p-6 shadow-sm">
@@ -113,18 +138,36 @@ export default function CustomerLogisticsSection({ requestId }: { requestId: num
           )}
         </div>
 
-        {/* Dispatch / Final Delivery Address — read-only for customer */}
+        {/* Dispatch / Final Delivery Address — customer-editable before dispatch */}
         <div className="border-t border-slate-100 pt-5">
           <p className="text-xs font-semibold text-slate-500 uppercase mb-2">Dispatch / Final Delivery Address</p>
-          {dispatch.dispatchAddress ? (
+          {addressLocked ? (
             <>
-              <p className="text-sm text-slate-700 whitespace-pre-wrap">{dispatch.dispatchAddress}</p>
-              {dispatch.dispatchAddressSource === 'po_shipping_fallback' && (
-                <p className="text-xs text-slate-400 mt-1">Defaulted from the PO Shipping Address.</p>
-              )}
+              <p className="text-sm text-slate-700 whitespace-pre-wrap">{dispatch.dispatchAddress || 'Not available.'}</p>
+              <p className="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded-lg px-3 py-2 mt-2">
+                The order has already entered the delivery process. Please contact InBody if the delivery address needs to be changed.
+              </p>
             </>
           ) : (
-            <p className="text-sm text-slate-500">Not available yet.</p>
+            <div className="space-y-2">
+              <textarea
+                rows={3} maxLength={500} value={addressDraft} onChange={e => setAddressDraft(e.target.value)}
+                className="w-full text-sm border border-slate-300 rounded-lg px-3 py-2 focus:outline-none focus:ring-2 focus:ring-blue-500 resize-none"
+              />
+              {dispatch.dispatchAddressSource === 'po_shipping_fallback' && (
+                <p className="text-xs text-slate-400">Currently using the Shipping Address from the approved PO.</p>
+              )}
+              {dispatch.dispatchAddressSource === 'explicit' && (
+                <p className="text-xs text-slate-400">This delivery address has been updated after PO submission.</p>
+              )}
+              {addressError && <p className="text-sm text-red-700 bg-red-50 border border-red-200 rounded-lg px-3 py-2">{addressError}</p>}
+              <button
+                onClick={handleUpdateAddress} disabled={addressBusy || !addressDraft.trim()}
+                className="bg-blue-600 hover:bg-blue-700 disabled:bg-blue-300 text-white text-sm font-semibold px-4 py-2 rounded-lg transition-colors"
+              >
+                {addressBusy ? 'Updating...' : 'Update Delivery Address'}
+              </button>
+            </div>
           )}
         </div>
       </div>
